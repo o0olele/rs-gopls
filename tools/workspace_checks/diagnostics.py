@@ -154,8 +154,19 @@ def check_pull_diagnostics(executable, root, timeout):
     with capability_session(executable, project, timeout, PULL, environment=gate.environment) as (client, _):
         gate.fail_next()
         client.open_document(path, "package sample\nvar Value = (1 + )\n")
-        fallback = full_report(pull(client, path), ["syntax.error"])
-        full_report(pull(client, path, fallback), ["syntax.error"])
+        report = pull(client, path)
+        failed = full_report(report, ["package.load", "syntax.error"])
+        error = next(item for item in report["items"] if item["code"] == "package.load")
+        if (error["range"] != site(path, "[[package sample]]").selection()
+                or not error["message"].endswith("): injected go list failure")):
+            raise RuntimeError(f"incorrect package load diagnostic {error!r}")
+        if pull(client, path, failed) != {"kind": "unchanged", "resultId": failed}:
+            raise RuntimeError("repeat pull lost its group failure resultId")
+
+        recovered = write(project / "recovered.go", "package sample\n")
+        notify_changes(client, (recovered, 1))
+        if full_report(pull(client, path, failed), ["syntax.error"]) == failed:
+            raise RuntimeError("successful package reload kept the group failure resultId")
 
 
 CASES = [

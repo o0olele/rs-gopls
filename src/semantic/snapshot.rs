@@ -7,7 +7,8 @@ use tree_sitter::{Node, Parser};
 
 use super::completion::{InferredMemo, prefilter::FileNames};
 use super::index::{
-    CompletionRead, DiskIndex, IndexReader, IndexedSource, active_package, draft_files,
+    CompletionRead, DiskIndex, IndexReader, IndexedSource, NavigationText, active_package,
+    draft_files,
 };
 use super::query::QueryProgress;
 use super::resolver::{Resolver, TypeIdentity};
@@ -26,6 +27,7 @@ pub(crate) struct EngineSnapshot<'a> {
     documents: &'a HashMap<PathBuf, IndexedSource>,
     new_documents: &'a HashSet<PathBuf>,
     disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
+    navigation_texts: &'a mut HashMap<PathBuf, NavigationText>,
     disk_names: &'a mut HashMap<PathBuf, FileNames>,
     inferred_weights: &'a mut HashMap<InferredMemo, i32>,
     parser: &'a mut Parser,
@@ -60,6 +62,7 @@ impl EngineState {
             documents: &self.documents,
             new_documents: &self.new_documents,
             disk_index: &mut self.disk_index,
+            navigation_texts: &mut self.navigation_texts,
             disk_names: &mut self.completion_names,
             inferred_weights: &mut self.completion_weights,
             parser: &mut self.parser,
@@ -91,6 +94,15 @@ impl<'a> EngineSnapshot<'a> {
     }
 
     pub(crate) fn active_graph(&self, require_tests: bool) -> QueryProgress<&'a Workspace> {
+        match self.diagnostics_graph(require_tests) {
+            QueryProgress::Ready(graph) if graph.total_load_failure().is_some() => {
+                QueryProgress::Pending(self.load_for(require_tests))
+            }
+            graph => graph,
+        }
+    }
+
+    pub(super) fn diagnostics_graph(&self, require_tests: bool) -> QueryProgress<&'a Workspace> {
         match self.workspace {
             Some(workspace)
                 if matches!(self.graph_changes, GraphChanges::Clean)
@@ -110,7 +122,8 @@ impl<'a> EngineSnapshot<'a> {
         let Some(workspace) = self.workspace else {
             return QueryProgress::Pending(self.load_for(require_tests));
         };
-        if require_tests && !workspace.includes_tests() {
+        if workspace.total_load_failure().is_some() || require_tests && !workspace.includes_tests()
+        {
             return QueryProgress::Pending(self.load_for(require_tests));
         }
         let source = document.indexed();
@@ -198,6 +211,8 @@ impl<'a> EngineSnapshot<'a> {
             parser: self.parser,
             documents: self.documents,
             disk_index: self.disk_index,
+            navigation_texts: self.navigation_texts,
+            implementation_parse_time: None,
             drafts: draft_files(workspace, self.documents, self.new_documents),
             disk_names: self.disk_names,
             completion,

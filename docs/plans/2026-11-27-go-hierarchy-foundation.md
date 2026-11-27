@@ -36,7 +36,7 @@
 ### 明确不在本阶段范围
 
 - 跨进程持久化磁盘索引缓存（本阶段保持纯内存增量索引，复用现有包图代次与文件指纹失效）。
-- 函数字面量/闭包作为独立 Call Hierarchy 顶层节点展开（闭包内调用归属其外层命名函数/方法，与 GoLand `getEnclosingElement` 一致）。
+- 函数字面量/闭包作为独立 Call Hierarchy 顶层节点展开。为便于 LSP 客户端展示，rs-gopls 将闭包内调用归属其外层命名函数或方法。GoLand 的 `GoCallHierarchyTreeStructure.getEnclosingElement` 将函数字面量视为独立的 `GoSignatureOwner`，`GoCalleeHierarchyTreeStructure` 的被调方遍历跳过函数字面量体。[第二阶段计划的 A1 决策](2026-11-27-go-hierarchy-foundation-hardening.md)
 - 外部依赖（`GOMODCACHE` / `GOROOT`）全量反向 `incomingCalls` 扫描（默认对齐项目活动包图范围，记录有意差异）。
 
 ### 并行协作与写入边界
@@ -68,7 +68,7 @@
 | GoLand 类 / 注册 | 已确认的处理流程 |
 | --- | --- |
 | `intellij.go.impl.xml` | 注册 `<callHierarchyProvider language="go" implementationClass="com.goide.hierarchy.GoCallHierarchyProvider"/>` 与 `<typeHierarchyProvider language="go" implementationClass="com.goide.hierarchy.GoTypeHierarchyProvider"/>`。 |
-| `com.goide.hierarchy.GoCallHierarchyProvider` & `GoCallHierarchyBrowser` & `GoCallHierarchyTreeStructure` | `getTarget` 定位 `GoNamedSignatureOwner`（函数/方法声明）；`GoCallHierarchyTreeStructure#buildChildren` 通过 `search` 查找调用点或被调目标，并用 `getEnclosingElement` 将函数体/闭包内的调用点归属到外层命名函数或方法。 |
+| `com.goide.hierarchy.GoCallHierarchyProvider` & `GoCallHierarchyBrowser` & `GoCallHierarchyTreeStructure` | `getTarget` 定位 `GoNamedSignatureOwner`（函数/方法声明）。`GoCallHierarchyTreeStructure#buildChildren` 通过 `search` 查找调用点或被调目标。`getEnclosingElement` 返回最近的 `GoSignatureOwner`，包括函数字面量。`GoCalleeHierarchyTreeStructure` 的被调方遍历跳过函数字面量体。 |
 | `com.goide.hierarchy.GoTypeHierarchyProvider` & `GoTypeHierarchyBrowser` | `isInterface` / `isInterfaceType` 区分接口与具体类型；超类型复用 `GoGotoSuperHandler.SUPER_SEARCH`，子类型复用 `GoInheritorsSearch.INHERITORS_SEARCH`。 |
 | `com.goide.vgo.GoListOutputParser` & `GoInheritorsSearch` | `go list` 元数据提供包结构与模块归属；接口与实现搜索按方法签名索引先筛选候选，再校验完整方法集满足关系。 |
 
@@ -123,4 +123,4 @@ python -B .\tools\compare_hierarchy.py $server --workspace .\tools\fixtures\hier
 - 2026-11-27 完成 GoLand `GO-263.7307.354` 层级与基座相关类静态核查，确定与 Track B / Track D 的 `F → B → D` 协同架构，创建待确认计划。
 - 2026-11-27 验证 Wave 0 层级夹具与采集脚本。夹具通过 `go test ./...`，GoLand `GO-263.7307.354` 的 20 个查询各完成 30 次重复计时，结果一致。采集使用 GoLand 的 All 搜索范围，输出夹具内的相对路径。GoLand 略去递归自调用边，`Base` 的子类型结果为空。[层级夹具](../../tools/fixtures/hierarchy/) · [采集脚本](../../tools/capture_goland_hierarchy.groovy)
 - [x] 2026-11-27 验证 Wave 3 统一基准工具。GoLand `GO-263.7307.354` 和 Go `1.26.3` 的层级对照通过 20 项严格校验，其中 10 项可直接对照首查与热查耗时。rs-gopls 完成 600 次插入注释后的查询及回滚校验。三条线的 `--capture-goland` 均通过现场采集和工作集采样验证。共用辅助模块与 LSP harness 的 22 项单测通过。[共用辅助模块](../../tools/bench_common.py) · [层级校验](../../tools/check_goland_hierarchy.py) · [层级基准](../../tools/compare_hierarchy.py)
-- 2026-11-27 完成 F-WP1（`a17df2b`，多 Workspace Folder + `Workspace::package_errors`）、F-WP2（`32f0c8a`，Call/Type Hierarchy）、F-WP3（`97fc13d`，具体类型冷反查跨类型切换 P50 降 88.7% / P95 降 90.8%，99 包合成切换 59→24 ms，不相交方法集新增探测 0 次）与 Wave 3 统一 LSP 接线（`a5a8e45`）。最终发布版 SHA-256 `0A0532A807D96E98D0301E527CA2E082F6D08A356B43AC58A64690B98768C362`，通过 `cargo check/test --workspace --locked`（120/120，零告警）、32/32 Python 单测、29/29 工作区回归、20/20 层级严格对照及既有历史回归。归档基线文档 [GoLand 层级基线](../goland-hierarchy-baseline.md)，状态更新为「已完成」。
+- 2026-11-27 完成 F-WP1（`9ec6891`，多 Workspace Folder + `Workspace::package_errors`）、F-WP2（`4cdf87b`，Call/Type Hierarchy）、F-WP3（`1fc91d2`，具体类型冷反查跨类型切换 P50 降 88.7% / P95 降 90.8%，99 包合成切换 59→24 ms，不相交方法集新增探测 0 次）与 Wave 3 统一 LSP 接线（`5c2dd50`）。最终发布版 SHA-256 `0A0532A807D96E98D0301E527CA2E082F6D08A356B43AC58A64690B98768C362`，通过 `cargo check/test --workspace --locked`（120/120，零告警）、32/32 Python 单测、29/29 工作区回归、20/20 层级严格对照及既有历史回归。归档基线文档 [GoLand 层级基线](../goland-hierarchy-baseline.md)，状态更新为「已完成」。

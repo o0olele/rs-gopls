@@ -82,6 +82,17 @@ pub(super) struct InterfaceMethods {
 }
 
 impl InterfaceMethods {
+    fn insert(&mut self, key: MethodKey, method: Method) {
+        match self.methods.entry(key) {
+            std::collections::btree_map::Entry::Occupied(previous) => {
+                self.complete &= previous.get().signature == method.signature;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(method);
+            }
+        }
+    }
+
     pub(super) fn method_names(&self) -> impl Iterator<Item = &str> {
         self.methods.keys().map(|key| key.name.as_str())
     }
@@ -98,13 +109,26 @@ impl InterfaceMethods {
     pub(super) fn location(&self, key: &MethodKey) -> Option<MethodLocation> {
         self.methods.get(key).map(|method| method.location.clone())
     }
+
+    pub(super) fn has_predeclared_error_method(&self) -> bool {
+        self.complete
+            && self
+                .methods
+                .iter()
+                .any(|(key, method)| key.name == "Error" && method.signature.is_predeclared_error())
+    }
 }
 
 pub(super) struct MatchingMethods {
     pub(super) location: Option<MethodLocation>,
 }
 
-struct InterfaceContext<'w> {
+enum InterfaceContext<'w> {
+    Declared(DeclaredInterface<'w>),
+    PredeclaredError(&'w Package),
+}
+
+struct DeclaredInterface<'w> {
     ty: TypeIdentity<'w>,
     file: PathBuf,
     details: TypeDetails,
@@ -114,7 +138,15 @@ struct InterfaceContext<'w> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MethodQuery {
     Navigation,
+    Hierarchy,
     Rename,
+}
+
+// Call after type lookup has excluded a package declaration with this name.
+fn unresolved_error<'w>(ty: &TypeIdentity<'w>, query: MethodQuery) -> Option<&'w Package> {
+    (query == MethodQuery::Hierarchy
+        && matches!(&ty.kind, TypeKind::Named { name, arguments } if name == "error" && arguments.is_empty()))
+    .then_some(ty.package)
 }
 
 impl<'w> Resolver<'w, '_> {
@@ -144,10 +176,7 @@ impl<'w> Resolver<'w, '_> {
         let Some(method) = method else {
             return Ok(None);
         };
-        let signature = &method.signature;
-        let is_predeclared_error = name == "Error"
-            && signature.parameters.is_empty()
-            && matches!(signature.results.as_slice(), [TypeShape::Builtin(s)] if s == "string");
+        let is_predeclared_error = name == "Error" && method.signature.is_predeclared_error();
         Ok(Some(RenameMethod {
             location: method.location.clone(),
             is_predeclared_error,
@@ -260,8 +289,23 @@ impl<'w> Resolver<'w, '_> {
         &mut self,
         ty: &TypeIdentity<'w>,
     ) -> Result<Option<InterfaceMethods>> {
+        self.interface_methods_for(ty, MethodQuery::Navigation)
+    }
+
+    pub(super) fn hierarchy_interface_methods(
+        &mut self,
+        ty: &TypeIdentity<'w>,
+    ) -> Result<Option<InterfaceMethods>> {
+        self.interface_methods_for(ty, MethodQuery::Hierarchy)
+    }
+
+    fn interface_methods_for(
+        &mut self,
+        ty: &TypeIdentity<'w>,
+        query: MethodQuery,
+    ) -> Result<Option<InterfaceMethods>> {
         let ty = self.with_receiver_parameters(ty.clone())?;
-        let Some(mut result) = self.interface_methods_at(ty.clone(), 0)? else {
+        let Some(mut result) = self.interface_methods_at(ty.clone(), 0, query)? else {
             return Ok(None);
         };
         result.parameter_bounds = self.parameter_bounds(&ty)?;
@@ -272,15 +316,16 @@ impl<'w> Resolver<'w, '_> {
         &mut self,
         ty: TypeIdentity<'w>,
         depth: usize,
+        query: MethodQuery,
     ) -> Result<Option<InterfaceMethods>> {
-        let Some(context) = self.interface_context(ty)? else {
+        let Some(context) = self.interface_context(ty, query)? else {
             return Ok(None);
         };
         let mut result = InterfaceMethods {
             complete: true,
             ..InterfaceMethods::default()
         };
-        self.collect_interface_methods(context, &mut result, &mut Vec::new(), depth)?;
+        self.collect_interface_methods(context, &mut result, &mut Vec::new(), depth, query)?;
         Ok(Some(result))
     }
 
@@ -299,21 +344,22 @@ impl<'w> Resolver<'w, '_> {
     fn interface_context(
         &mut self,
         mut ty: TypeIdentity<'w>,
+        query: MethodQuery,
     ) -> Result<Option<InterfaceContext<'w>>> {
         for _ in 0..MAX_TYPE_DEPTH {
             if ty.pointers != 0 {
                 return Ok(None);
             }
             let Some((file, details, substitutions)) = self.type_context(&ty)? else {
-                return Ok(None);
+                return Ok(unresolved_error(&ty, query).map(InterfaceContext::PredeclaredError));
             };
             if details.interface {
-                return Ok(Some(InterfaceContext {
+                return Ok(Some(InterfaceContext::Declared(DeclaredInterface {
                     ty,
                     file,
                     details,
                     substitutions,
-                }));
+                })));
             }
             let Some(base) = details.alias.or(details.underlying) else {
                 return Ok(None);
@@ -333,15 +379,26 @@ impl<'w> Resolver<'w, '_> {
         result: &mut InterfaceMethods,
         visiting: &mut Vec<TypeKey>,
         depth: usize,
+        query: MethodQuery,
     ) -> Result<()> {
-        let Some(key) = context.ty.key().filter(|key| !visiting.contains(key)) else {
-            result.complete = false;
-            return Ok(());
-        };
         if depth >= MAX_TYPE_DEPTH {
             result.complete = false;
             return Ok(());
         }
+        let context = match context {
+            InterfaceContext::Declared(context) => context,
+            InterfaceContext::PredeclaredError(package) => {
+                result.insert(
+                    MethodKey::new("Error", package),
+                    self.builtin_error_method(package)?,
+                );
+                return Ok(());
+            }
+        };
+        let Some(key) = context.ty.key().filter(|key| !visiting.contains(key)) else {
+            result.complete = false;
+            return Ok(());
+        };
         visiting.push(key);
         result.has_type_terms |= context.details.has_type_terms;
         if let TypeKind::Inline { shape, .. } = &context.ty.kind {
@@ -353,17 +410,7 @@ impl<'w> Resolver<'w, '_> {
                 result.complete = false;
                 continue;
             };
-            match result
-                .methods
-                .entry(MethodKey::new(&name, context.ty.package))
-            {
-                std::collections::btree_map::Entry::Occupied(previous) => {
-                    result.complete &= previous.get().signature == method.signature;
-                }
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(method);
-                }
-            }
+            result.insert(MethodKey::new(&name, context.ty.package), method);
         }
         for embedded in context.details.embedded {
             let Some(embedded) = self.implementation_type(
@@ -376,14 +423,34 @@ impl<'w> Resolver<'w, '_> {
                 result.complete = false;
                 continue;
             };
-            if let Some(context) = self.interface_context(embedded.clone())? {
-                self.collect_interface_methods(context, result, visiting, depth + 1)?;
+            if let Some(context) = self.interface_context(embedded.clone(), query)? {
+                self.collect_interface_methods(context, result, visiting, depth + 1, query)?;
             } else if !self.is_predeclared_named(&embedded, "any")? {
                 result.has_type_terms = true;
             }
         }
         visiting.pop();
         Ok(())
+    }
+
+    fn builtin_error_method(&mut self, package: &Package) -> Result<Method> {
+        let file = self
+            .workspace
+            .builtin_source(package.directory_and_name().0)?;
+        let member = self
+            .indexes
+            .file_index(file)?
+            .symbols
+            .member("error", "Error")
+            .context("expected Error method in Go builtin source")?;
+        Ok(Method {
+            signature: Signature {
+                parameters: Vec::new(),
+                results: vec![TypeShape::Builtin("string".to_owned())],
+                variadic: false,
+            },
+            location: (file.to_owned(), member.range),
+        })
     }
 
     pub(super) fn satisfies_interface(
@@ -402,6 +469,23 @@ impl<'w> Resolver<'w, '_> {
         )
     }
 
+    pub(super) fn satisfies_hierarchy_interface(
+        &mut self,
+        required: &InterfaceMethods,
+        candidate: &TypeIdentity<'w>,
+        allow_pointer: bool,
+    ) -> Result<bool> {
+        Ok(self
+            .match_method_set(
+                required,
+                candidate,
+                None,
+                allow_pointer,
+                MethodQuery::Hierarchy,
+            )?
+            .is_some())
+    }
+
     fn match_method_set(
         &mut self,
         required: &InterfaceMethods,
@@ -417,7 +501,7 @@ impl<'w> Resolver<'w, '_> {
             return Ok(None);
         }
         let candidate = self.with_receiver_parameters(candidate.clone())?;
-        let candidate_interface = self.interface_methods_at(candidate.clone(), 0)?;
+        let candidate_interface = self.interface_methods_at(candidate.clone(), 0, query)?;
         if candidate_interface
             .as_ref()
             .is_some_and(|interface| !interface.complete)
@@ -470,7 +554,9 @@ impl<'w> Resolver<'w, '_> {
                 };
                 // A named interface here supplies constraints of its own.
                 // Simple terms describe the permitted substituted types.
-                if self.interface_context(term_ty.clone())?.is_some()
+                if self
+                    .interface_context(term_ty.clone(), MethodQuery::Navigation)?
+                    .is_some()
                     || self.is_predeclared_named(&term_ty, "any")?
                     || self.is_predeclared_named(&term_ty, "comparable")?
                     || self.is_predeclared_named(&term_ty, "error")?
@@ -596,6 +682,14 @@ impl<'w> Resolver<'w, '_> {
                     }
                     visited.push(owner_key);
                     let Some((file, details, substitutions)) = self.type_context(&owner)? else {
+                        if key.name == "Error"
+                            && let Some(package) = unresolved_error(&owner, query)
+                        {
+                            if found.is_some() || depth == 0 && candidate.pointers != 0 {
+                                return Ok(None);
+                            }
+                            found = Some(self.builtin_error_method(package)?);
+                        }
                         if query == MethodQuery::Rename
                             && let TypeKind::Named { name, .. } = &owner.kind
                             && !is_predeclared_type(name)
@@ -614,17 +708,23 @@ impl<'w> Resolver<'w, '_> {
                         if depth == 0 && candidate.pointers != 0 {
                             return Ok(None);
                         }
-                        let context = InterfaceContext {
+                        let context = InterfaceContext::Declared(DeclaredInterface {
                             ty: owner,
                             file,
                             details,
                             substitutions,
-                        };
+                        });
                         let mut methods = InterfaceMethods {
                             complete: true,
                             ..InterfaceMethods::default()
                         };
-                        self.collect_interface_methods(context, &mut methods, &mut Vec::new(), 0)?;
+                        self.collect_interface_methods(
+                            context,
+                            &mut methods,
+                            &mut Vec::new(),
+                            0,
+                            query,
+                        )?;
                         anyhow::ensure!(
                             query != MethodQuery::Rename || methods.complete,
                             "incomplete embedded interface when resolving method {}",
@@ -1002,7 +1102,9 @@ impl<'w> Resolver<'w, '_> {
             TypeKind::Inline { ref shape, .. } if shape.interface => {
                 let mut base = ty.clone();
                 base.pointers = 0;
-                let Some(methods) = self.interface_methods_at(base, depth + 1)? else {
+                let Some(methods) =
+                    self.interface_methods_at(base, depth + 1, MethodQuery::Navigation)?
+                else {
                     return Ok(None);
                 };
                 if !methods.complete || methods.has_type_terms {
@@ -1063,6 +1165,13 @@ struct Signature {
     parameters: Vec<TypeShape>,
     results: Vec<TypeShape>,
     variadic: bool,
+}
+
+impl Signature {
+    fn is_predeclared_error(&self) -> bool {
+        self.parameters.is_empty()
+            && matches!(self.results.as_slice(), [TypeShape::Builtin(name)] if name == "string")
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]

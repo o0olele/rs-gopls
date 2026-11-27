@@ -8,7 +8,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 
-use crate::workspace_roots::{folder_groups, list_roots_for_folders};
+use crate::workspace_roots::folder_groups;
 
 mod inputs;
 use inputs::PackageInputs;
@@ -23,12 +23,17 @@ pub struct WorkspaceLoad {
 pub(crate) enum PackageErrorKind {
     Direct,
     Dependency,
+    Group,
 }
 
 /// Source positions use Go's one-based lines and byte columns.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PackageLoadError {
-    pub package_id: String,
+    pub group_id: usize,
+    pub import_path: String,
+    pub package_id: Option<String>,
+    pub package_dir: Option<PathBuf>,
+    pub package_name: String,
     pub for_test: String,
     pub kind: PackageErrorKind,
     pub message: String,
@@ -44,10 +49,10 @@ pub struct Package {
     pub files: Vec<PathBuf>,
     pub(crate) load_error: bool,
     directory: PathBuf,
-    import_map: HashMap<String, String>,
+    import_map: HashMap<String, Option<String>>,
     for_test: String,
     external: bool,
-    group: Option<usize>,
+    groups: Vec<usize>,
     standard: bool,
     module_path: Option<String>,
     direct_dependency: bool,
@@ -58,6 +63,7 @@ pub struct Workspace {
     roots: Vec<PathBuf>,
     module_paths: Vec<String>,
     package_errors: Vec<PackageLoadError>,
+    group_scopes: Vec<GroupScope>,
     group_imports: Vec<HashMap<String, String>>,
     packages: BTreeMap<String, Package>,
     file_packages: HashMap<PathBuf, String>,
@@ -65,6 +71,11 @@ pub struct Workspace {
     includes_tests: bool,
     sdk_root: OnceCell<PathBuf>,
     builtin_source: OnceCell<Result<PathBuf, String>>,
+}
+
+struct GroupScope {
+    folders: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -83,49 +94,64 @@ impl Workspace {
 
     fn load_graph(folders: &[PathBuf], include_tests: bool, track_inputs: bool) -> Result<Self> {
         let configuration = track_inputs.then(|| PackageInputs::configuration(folders));
-        let mut roots = BTreeSet::new();
-        let mut listing = PackageListing::default();
-        let groups = folder_groups(folders)?;
-        let mut queries = Vec::with_capacity(groups.len());
-        for group in &groups {
-            let directories = list_roots_for_folders(group)?;
-            roots.extend(
-                directories
-                    .iter()
-                    .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone()))),
-            );
-            queries.push((&group[0], directories));
-        }
-        let roots: Vec<_> = roots.into_iter().collect();
+        let groups = folder_groups(folders);
         let inputs = configuration.map(|config| {
+            let roots: Vec<_> = groups
+                .iter()
+                .filter_map(|group| group.roots.as_ref().ok())
+                .flatten()
+                .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone())))
+                .collect();
             config
                 .and_then(|inputs| inputs.with_sources(&roots))
                 .map_err(|err| err.to_string())
         });
-        for (index, (folder, directories)) in queries.iter().enumerate() {
-            list_packages(
-                folder,
-                directories,
-                include_tests,
-                (groups.len() > 1).then_some(index),
-                &mut listing,
-            )?;
-        }
-        if groups.len() > 1 {
-            for importers in listing.importers.values_mut() {
-                importers.sort_unstable();
-                importers.dedup();
+        let mut roots = BTreeSet::new();
+        let mut scopes = Vec::with_capacity(groups.len());
+        let mut listing = PackageListing::default();
+        for group in groups {
+            let folder = &group.folders[0];
+            let mut scope = GroupScope {
+                folders: group.folders.iter().map(|dir| path_key(dir)).collect(),
+                roots: group
+                    .member_scopes
+                    .iter()
+                    .map(|dir| path_key(dir))
+                    .collect(),
+            };
+            let packages = group.roots.and_then(|directories| {
+                let keys: Vec<_> = directories
+                    .iter()
+                    .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone())))
+                    .collect();
+                scope.roots.extend(keys.iter().cloned());
+                let packages = list_packages(folder, &directories, include_tests)?;
+                roots.extend(keys);
+                Ok(packages)
+            });
+            match packages {
+                Ok(packages) => listing.add_group(folder, packages),
+                Err(error) => listing.add_failed_group(error),
             }
+            scope.roots.sort_unstable();
+            scope.roots.dedup();
+            scopes.push(scope);
         }
-        let mut workspace = Self::from_listing(roots, listing, include_tests);
+        let mut workspace =
+            Self::from_listing(roots.into_iter().collect(), scopes, listing, include_tests);
         workspace.rename_inputs = inputs;
         Ok(workspace)
     }
 
-    fn from_listing(roots: Vec<PathBuf>, listing: PackageListing, includes_tests: bool) -> Self {
+    fn from_listing(
+        roots: Vec<PathBuf>,
+        group_scopes: Vec<GroupScope>,
+        listing: PackageListing,
+        includes_tests: bool,
+    ) -> Self {
         let PackageListing {
             packages,
-            importers,
+            mut importers,
             sdk_root,
             module_paths,
             mut errors,
@@ -134,7 +160,11 @@ impl Workspace {
         } = listing;
         errors.sort_unstable();
         errors.dedup();
-        let mut file_packages = HashMap::new();
+        for importers in importers.values_mut() {
+            importers.sort_unstable();
+            importers.dedup();
+        }
+        let mut file_packages = HashMap::<PathBuf, String>::new();
         // Ordinary files belong to their normal package, even when the Go
         // command also reports an in-package test compilation of those files.
         let ordinary = packages
@@ -145,9 +175,23 @@ impl Workspace {
             .filter(|(_, package)| !package.for_test.is_empty());
         for (id, package) in ordinary.chain(testing) {
             for file in &package.files {
-                file_packages
-                    .entry(path_key(file))
-                    .or_insert_with(|| id.clone());
+                let key = path_key(file);
+                match file_packages.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(id.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let previous = &packages[slot.get()];
+                        if package.is_production() == previous.is_production()
+                            && package.groups != previous.groups
+                            && scoped_group(&group_scopes, slot.key(), None).is_some_and(|group| {
+                                package.groups.contains(&group) && !previous.groups.contains(&group)
+                            })
+                        {
+                            slot.insert(id.clone());
+                        }
+                    }
+                }
             }
         }
         Self {
@@ -155,6 +199,7 @@ impl Workspace {
             roots,
             module_paths: module_paths.into_iter().collect(),
             package_errors: errors,
+            group_scopes,
             group_imports,
             packages,
             file_packages,
@@ -172,18 +217,16 @@ impl Workspace {
         includes_tests: bool,
     ) -> Self {
         let mut packages = PackageListing::default();
-        packages
-            .read(
-                listing.as_bytes(),
-                roots.first().map_or(Path::new("."), PathBuf::as_path),
-                None,
-            )
-            .unwrap();
-        let mut workspace = Self::from_listing(
-            roots.iter().map(|root| path_key(root)).collect(),
-            packages,
-            includes_tests,
+        packages.add_group(
+            roots.first().map_or(Path::new("."), PathBuf::as_path),
+            read_packages(listing.as_bytes()).unwrap(),
         );
+        let keys: Vec<_> = roots.iter().map(|root| path_key(root)).collect();
+        let scopes = vec![GroupScope {
+            folders: keys.clone(),
+            roots: Vec::new(),
+        }];
+        let mut workspace = Self::from_listing(keys, scopes, packages, includes_tests);
         workspace.rename_inputs = Some(
             PackageInputs::configuration(roots)
                 .and_then(|inputs| inputs.with_sources(roots))
@@ -193,6 +236,13 @@ impl Workspace {
     }
 
     pub(crate) fn rename_inputs_current(&self) -> Result<bool> {
+        if let Some(error) = self
+            .package_errors
+            .iter()
+            .find(|error| error.kind == PackageErrorKind::Group)
+        {
+            bail!("cannot verify a complete package graph: {}", error.message);
+        }
         match &self.rename_inputs {
             None => Ok(false),
             Some(Ok(inputs)) => inputs.current(&self.roots),
@@ -210,6 +260,38 @@ impl Workspace {
 
     pub(crate) fn package_errors(&self) -> &[PackageLoadError] {
         &self.package_errors
+    }
+
+    pub(crate) fn total_load_failure(&self) -> Option<&str> {
+        let first = self.package_errors.first()?;
+        (self.roots.is_empty() && first.kind == PackageErrorKind::Group)
+            .then_some(first.message.as_str())
+    }
+
+    pub(crate) fn group_for_path(&self, path: &Path) -> Option<usize> {
+        let package = self.package_of_file(path);
+        scoped_group(
+            &self.group_scopes,
+            &path_key(path),
+            package.map(|package| package.groups.as_slice()),
+        )
+        .or_else(|| package.map(Package::group_id))
+    }
+
+    pub(crate) fn group_scope_for_path(&self, path: &Path) -> Option<usize> {
+        scoped_group(&self.group_scopes, &path_key(path), None)
+    }
+
+    pub(crate) fn package_in_group(&self, package: &Package, group: usize) -> bool {
+        package.groups.contains(&group)
+    }
+
+    pub(crate) fn package_in_group_by_import(
+        &self,
+        group: usize,
+        import_path: &str,
+    ) -> Option<&Package> {
+        self.package(self.group_imports.get(group)?.get(import_path)?)
     }
 
     pub(crate) fn builtin_source(&self, root: &Path) -> Result<&Path> {
@@ -251,11 +333,34 @@ impl Workspace {
     }
 
     pub fn resolve_import(&self, from: &Package, import_path: &str) -> Option<&Package> {
-        let id = from
-            .import_map
-            .get(import_path)
-            .or_else(|| self.group_imports.get(from.group?)?.get(import_path));
-        self.package(id.map_or(import_path, String::as_str))
+        if let Some(target) = from.import_map.get(import_path) {
+            return self.package(target.as_deref()?);
+        }
+        // A shared package can resolve a new import when its groups agree on the target.
+        let (first, others) = from.groups.split_first()?;
+        let id = self.group_imports[*first].get(import_path)?;
+        if others
+            .iter()
+            .all(|&group| self.group_imports[group].get(import_path) == Some(id))
+        {
+            return self.package(id);
+        }
+        None
+    }
+
+    pub(crate) fn resolve_import_in_group(
+        &self,
+        from: &Package,
+        group: usize,
+        import_path: &str,
+    ) -> Option<&Package> {
+        if !self.package_in_group(from, group) {
+            return None;
+        }
+        match from.import_map.get(import_path) {
+            Some(id) => self.package(id.as_deref()?),
+            None => self.package_in_group_by_import(group, import_path),
+        }
     }
 
     pub(crate) fn matches_import_variant(
@@ -264,12 +369,14 @@ impl Workspace {
         import_path: &str,
         id: &str,
     ) -> bool {
-        let Some(group) = from.group else { return true };
-        // Only colliding package IDs are qualified with their independent build group.
-        match self.group_imports[group].get(import_path) {
-            Some(selected) => selected == id,
-            None => !id.contains(':'),
-        }
+        from.groups
+            .iter()
+            .any(|&group| match self.group_imports[group].get(import_path) {
+                Some(selected) => selected == id,
+                None => self
+                    .package(id)
+                    .is_some_and(|package| self.package_in_group(package, group)),
+            })
     }
 
     pub(crate) fn package_of_draft(&self, path: &Path, name: &str) -> Option<&Package> {
@@ -361,21 +468,32 @@ impl Workspace {
     }
 }
 
+fn scoped_group(scopes: &[GroupScope], key: &Path, groups: Option<&[usize]>) -> Option<usize> {
+    scopes
+        .iter()
+        .enumerate()
+        .filter(|(group, _)| groups.is_none_or(|groups| groups.contains(group)))
+        .flat_map(|(group, scope)| {
+            scope
+                .folders
+                .iter()
+                .map(|path| (path, true))
+                .chain(scope.roots.iter().map(|path| (path, false)))
+                .map(move |(path, explicit)| (group, path, explicit))
+        })
+        .filter(|(_, scope, _)| key.starts_with(scope))
+        .max_by_key(|(_, scope, explicit)| (scope.components().count(), *explicit))
+        .map(|(group, _, _)| group)
+}
+
 impl Package {
-    fn remap_imports(&mut self, imports: &[String], aliases: &HashMap<String, String>) {
+    fn remap_imports(&mut self, aliases: &HashMap<String, String>) {
         if let Some(id) = aliases.get(&self.for_test) {
             self.for_test.clone_from(id);
         }
-        for target in self.import_map.values_mut() {
+        for target in self.import_map.values_mut().flatten() {
             if let Some(id) = aliases.get(target) {
                 target.clone_from(id);
-            }
-        }
-        for import in imports {
-            if let Some(id) = aliases.get(import) {
-                self.import_map
-                    .entry(import.clone())
-                    .or_insert_with(|| id.clone());
             }
         }
     }
@@ -423,6 +541,22 @@ impl Package {
         self.for_test.is_empty()
     }
 
+    pub(crate) fn test_of(&self) -> Option<&str> {
+        (!self.is_production()).then(|| {
+            self.for_test
+                .split_once(':')
+                .map_or(self.for_test.as_str(), |(_, path)| path)
+        })
+    }
+
+    pub(crate) fn group_id(&self) -> usize {
+        self.groups[0]
+    }
+
+    pub(crate) fn groups(&self) -> &[usize] {
+        &self.groups
+    }
+
     pub(crate) fn is_standard(&self) -> bool {
         self.standard
     }
@@ -437,13 +571,6 @@ impl Package {
 
     pub(crate) fn is_direct_dependency(&self) -> bool {
         self.direct_dependency
-    }
-
-    fn import_id<'a>(&'a self, path: &'a str) -> &'a str {
-        self.import_map
-            .get(path)
-            .map(String::as_str)
-            .unwrap_or(path)
     }
 }
 
@@ -474,9 +601,7 @@ fn list_packages(
     root: &Path,
     directories: &[PathBuf],
     include_tests: bool,
-    group: Option<usize>,
-    listing: &mut PackageListing,
-) -> Result<()> {
+) -> Result<Vec<ListedPackage>> {
     let patterns = directories.iter().map(|directory| {
         if directory == root {
             "./...".to_owned()
@@ -506,7 +631,7 @@ fn list_packages(
         stderr.read_to_end(&mut bytes)?;
         Ok::<_, std::io::Error>(bytes)
     });
-    let packages = listing.read(BufReader::new(stdout), root, group);
+    let packages = read_packages(BufReader::new(stdout));
     let status = child.wait().context("waiting for go list")?;
     let stderr = stderr_reader
         .join()
@@ -520,6 +645,13 @@ fn list_packages(
         );
     }
     packages.with_context(|| format!("reading Go packages in {}", root.display()))
+}
+
+fn read_packages(reader: impl Read) -> Result<Vec<ListedPackage>> {
+    serde_json::Deserializer::from_reader(reader)
+        .into_iter::<ListedPackage>()
+        .collect::<serde_json::Result<_>>()
+        .context("decoding go list package metadata")
 }
 
 #[derive(Default, Deserialize)]
@@ -537,6 +669,15 @@ struct ListedPackage {
     deps_errors: Option<Vec<ListedError>>,
     goroot: bool,
     module: Option<ListedModule>,
+}
+
+impl ListedPackage {
+    fn has_sources(&self) -> bool {
+        !self.dir.as_os_str().is_empty()
+            && !self.import_path.is_empty()
+            && !self.name.is_empty()
+            && !(self.go_files.is_empty() && self.cgo_files.is_empty())
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -566,13 +707,18 @@ struct ListedError {
 impl ListedError {
     fn resolve(
         self,
+        group_id: usize,
         kind: PackageErrorKind,
         package: &ListedPackage,
         root: &Path,
     ) -> PackageLoadError {
         let (path, line, column) = error_position(&self.pos, root, &package.dir);
         PackageLoadError {
-            package_id: package.import_path.clone(),
+            group_id,
+            import_path: package.import_path.clone(),
+            package_id: None,
+            package_dir: (!package.dir.as_os_str().is_empty()).then(|| root.join(&package.dir)),
+            package_name: package.name.clone(),
             for_test: package.for_test.clone(),
             kind,
             message: self.err,
@@ -645,12 +791,46 @@ struct PackageListing {
 }
 
 impl PackageListing {
-    fn read(&mut self, reader: impl Read, root: &Path, group: Option<usize>) -> Result<()> {
-        // go list -deps emits dependencies before their importers, including test variants.
-        let mut aliases: HashMap<String, String> = HashMap::new();
-        let stream = serde_json::Deserializer::from_reader(reader).into_iter::<ListedPackage>();
-        for package in stream {
-            let mut package = package.context("decoding go list package metadata")?;
+    fn add_failed_group(&mut self, error: anyhow::Error) {
+        self.errors.push(PackageLoadError {
+            group_id: self.group_imports.len(),
+            import_path: String::new(),
+            package_id: None,
+            package_dir: None,
+            package_name: String::new(),
+            for_test: String::new(),
+            kind: PackageErrorKind::Group,
+            message: format!("{error:#}"),
+            import_stack: Vec::new(),
+            path: None,
+            line: None,
+            column: None,
+        });
+        self.group_imports.push(HashMap::new());
+    }
+
+    fn add_group(&mut self, root: &Path, packages: Vec<ListedPackage>) {
+        let group = self.group_imports.len();
+        let mut aliases: HashMap<_, _> = packages
+            .iter()
+            .filter(|package| package.has_sources())
+            .map(|package| {
+                let raw = &package.import_path;
+                let id = if self.packages.contains_key(raw) {
+                    format!("{group}:{raw}")
+                } else {
+                    raw.clone()
+                };
+                (raw.clone(), id)
+            })
+            .collect();
+        let first_error = self.errors.len();
+        let mut reused = HashMap::new();
+        let mut added = Vec::new();
+        let mut seen = HashSet::new();
+        // go list -deps normally emits dependencies first. Provisional aliases keep
+        // forward edges (such as import cycles) inside the group during insertion.
+        for mut package in packages {
             if package.goroot && self.sdk_root.is_none() {
                 let import = package.import_path.split(" [").next().unwrap_or_default();
                 let relative = Path::new(import);
@@ -670,11 +850,15 @@ impl PackageListing {
             let load_error = package.error.is_some();
             if let Some(error) = package.error.take() {
                 self.errors
-                    .push(error.resolve(PackageErrorKind::Direct, &package, root));
+                    .push(error.resolve(group, PackageErrorKind::Direct, &package, root));
             }
             for error in package.deps_errors.take().unwrap_or_default() {
-                self.errors
-                    .push(error.resolve(PackageErrorKind::Dependency, &package, root));
+                self.errors.push(error.resolve(
+                    group,
+                    PackageErrorKind::Dependency,
+                    &package,
+                    root,
+                ));
             }
             if let Some(module) = &package.module
                 && module.main
@@ -682,15 +866,7 @@ impl PackageListing {
             {
                 self.module_paths.insert(module.path.clone());
             }
-            if package.dir.as_os_str().is_empty()
-                || package.import_path.is_empty()
-                || package.name.is_empty()
-                || (package.go_files.is_empty() && package.cgo_files.is_empty())
-            {
-                if let Some(group) = group {
-                    let id = format!("{group}:{}", package.import_path);
-                    aliases.insert(package.import_path, id);
-                }
+            if !package.has_sources() || !seen.insert(package.import_path.clone()) {
                 continue;
             }
 
@@ -702,20 +878,41 @@ impl PackageListing {
                 .collect();
             files.sort_unstable();
             files.dedup();
+            let raw = package.import_path;
+            let mut import_map: HashMap<_, _> = package
+                .import_map
+                .into_iter()
+                .map(|(path, id)| (path, aliases.get(&id).cloned()))
+                .collect();
+            for import in &package.imports {
+                import_map
+                    .entry(import.clone())
+                    .or_insert_with(|| aliases.get(import).cloned());
+            }
+            let for_test = if package.for_test.is_empty() {
+                package.for_test
+            } else {
+                // A test-only directory can omit its production graph node.
+                // Its private names still belong to this build group.
+                aliases
+                    .get(&package.for_test)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{group}:{}", package.for_test))
+            };
             let owner = Package {
-                id: package.import_path,
+                id: aliases[&raw].clone(),
                 name: package.name,
                 files,
                 load_error,
                 directory: path_key(&package.dir),
-                import_map: package.import_map,
-                for_test: package.for_test,
+                import_map,
+                for_test,
                 external: package.goroot
                     || package
                         .module
                         .as_ref()
                         .is_some_and(ListedModule::in_module_cache),
-                group,
+                groups: vec![group],
                 standard: package.goroot,
                 direct_dependency: package
                     .module
@@ -723,57 +920,52 @@ impl PackageListing {
                     .is_some_and(|m| !m.main && !m.indirect),
                 module_path: package.module.map(|m| m.path).filter(|p| !p.is_empty()),
             };
-            self.insert(owner, package.imports, group, &mut aliases);
+            if let Some(id) = self.reuse_package(&raw, &owner, group) {
+                reused.insert(owner.id, id.clone());
+                aliases.insert(raw, id);
+            } else {
+                added.push((owner.id.clone(), package.imports));
+                self.packages.insert(owner.id.clone(), owner);
+            }
         }
-        if group.is_some() {
-            self.group_imports.push(aliases);
+        for (id, imports) in added {
+            let owner = self.packages.get_mut(&id).expect("newly inserted package");
+            owner.remap_imports(&reused);
+            for import in &imports {
+                let selected = owner.import_map.get(import).and_then(Option::as_ref);
+                // Keep reverse edges both to the selected test variant and to
+                // the ordinary imported package used by project-wide searches.
+                for dependency in selected.into_iter().chain(aliases.get(import)) {
+                    self.importers
+                        .entry(dependency.clone())
+                        .or_default()
+                        .push(id.clone());
+                }
+            }
         }
-        Ok(())
+        for error in &mut self.errors[first_error..] {
+            error.package_id = aliases.get(&error.import_path).cloned();
+        }
+        self.group_imports.push(aliases);
     }
 
-    fn insert(
-        &mut self,
-        mut owner: Package,
-        imports: Vec<String>,
-        group: Option<usize>,
-        aliases: &mut HashMap<String, String>,
-    ) {
-        if !aliases.is_empty() {
-            owner.remap_imports(&imports, aliases);
+    fn reuse_package(&mut self, raw: &str, owner: &Package, group: usize) -> Option<String> {
+        if raw == owner.id {
+            return None;
         }
-        if let Some(existing) = self.packages.get_mut(&owner.id) {
-            let Some(group) = group else { return };
-            if existing.same_build(&owner) {
-                existing.direct_dependency |= owner.direct_dependency;
-                return;
-            }
-            // Independent modules may bind the same Go import path to different sources.
-            let variants = self.alternate_ids.entry(owner.id.clone()).or_default();
-            if let Some(id) = variants
-                .iter()
-                .find(|id| self.packages[*id].same_build(&owner))
-            {
-                self.packages.get_mut(id).unwrap().direct_dependency |= owner.direct_dependency;
-                aliases.insert(owner.id, id.clone());
-                return;
-            }
-            let id = format!("{group}:{}", owner.id);
-            variants.push(id.clone());
-            aliases.insert(owner.id, id.clone());
-            owner.id = id;
+        // Independent modules may bind the same Go import path to different sources.
+        let variants = self.alternate_ids.entry(raw.to_owned()).or_default();
+        let selected = std::iter::once(raw)
+            .chain(variants.iter().map(String::as_str))
+            .find(|id| self.packages[*id].same_build(owner));
+        if let Some(id) = selected {
+            let existing = self.packages.get_mut(id).expect("existing package variant");
+            existing.direct_dependency |= owner.direct_dependency;
+            existing.groups.push(group);
+            return Some(id.to_owned());
         }
-        for import in imports {
-            let id = owner.import_id(&import);
-            let unqualified = aliases.get(&import).map_or(import.as_str(), String::as_str);
-            for dependency in std::iter::once(id).chain((id != unqualified).then_some(unqualified))
-            {
-                self.importers
-                    .entry(dependency.to_owned())
-                    .or_default()
-                    .push(owner.id.clone());
-            }
-        }
-        self.packages.insert(owner.id.clone(), owner);
+        variants.push(owner.id.clone());
+        None
     }
 }
 
@@ -806,7 +998,9 @@ pub(crate) fn path_key(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{DefinitionKind, Engine, QueryProgress};
     use crate::test_support::TestProject;
+    use lsp_types::{Position, Range};
     use serde_json::json;
 
     #[test]
@@ -914,7 +1108,11 @@ mod tests {
         assert_eq!(
             errors[1],
             PackageLoadError {
-                package_id: id.into(),
+                group_id: 0,
+                import_path: id.into(),
+                package_id: None,
+                package_dir: Some(project.root.join("pkg")),
+                package_name: String::new(),
                 for_test: "example.test/pkg".into(),
                 kind: PackageErrorKind::Direct,
                 message: "parse failed".into(),
@@ -927,7 +1125,11 @@ mod tests {
         assert_eq!(
             errors[2],
             PackageLoadError {
-                package_id: id.into(),
+                group_id: 0,
+                import_path: id.into(),
+                package_id: None,
+                package_dir: Some(project.root.join("pkg")),
+                package_name: String::new(),
                 for_test: "example.test/pkg".into(),
                 kind: PackageErrorKind::Dependency,
                 message: "unknown import".into(),
@@ -1008,10 +1210,12 @@ mod tests {
                 workspace
                     .package_errors()
                     .iter()
-                    .any(|error| error.package_id == owner.id
-                        && error.kind == PackageErrorKind::Dependency
-                        && error.path.as_ref() == Some(&file)
-                        && error.line == Some(5))
+                    .any(
+                        |error| error.package_id.as_deref() == Some(owner.id.as_str())
+                            && error.kind == PackageErrorKind::Dependency
+                            && error.path.as_ref() == Some(&file)
+                            && error.line == Some(5)
+                    )
             );
         }
     }
@@ -1033,7 +1237,9 @@ mod tests {
             "two/pkg.go",
             "package two\nimport _ \"example.test/two/missing\"\n",
         );
-        assert_eq!(folder_groups(&folders).unwrap(), [folders.to_vec()]);
+        let groups = folder_groups(&folders);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].folders, folders);
         let workspace = Workspace::load_roots(&folders, false).unwrap();
         assert_eq!(
             workspace.module_paths(),
@@ -1043,7 +1249,7 @@ mod tests {
         let error = workspace
             .package_errors()
             .iter()
-            .find(|error| error.package_id == "example.test/one")
+            .find(|error| error.package_id.as_deref() == Some("example.test/one"))
             .unwrap();
         let path = error.path.as_deref().unwrap();
         let owner = workspace.package_of_file(path).unwrap();
@@ -1054,9 +1260,152 @@ mod tests {
         );
 
         let overlapping = [project.root.clone(), folders[0].clone()];
-        assert_eq!(list_roots_for_folders(&overlapping).unwrap().len(), 3);
+        let groups = folder_groups(&overlapping);
+        assert_eq!(groups[0].roots.as_ref().unwrap().len(), 3);
         let workspace = Workspace::load_roots(&overlapping, false).unwrap();
         assert_eq!(workspace.roots().len(), 3);
         assert_eq!(workspace.navigation_packages().count(), 3);
+    }
+
+    #[test]
+    fn workspace_group_failures_preserve_definition_and_block_rename() {
+        let project = TestProject::new();
+        project.write("healthy/go.mod", "module example.test/healthy\n\ngo 1.22\n");
+        let target = project.write("healthy/lib/lib.go", "package lib\nconst Value = 1\n");
+        let source = project.write(
+            "healthy/app.go",
+            "package app\nimport \"example.test/healthy/lib\"\nconst Use = lib.Value\n",
+        );
+        project.write(
+            "broken/go.mod",
+            "module example.test/healthy\n\ninvalid directive\n",
+        );
+        let broken = project.write("broken/app.go", "package app\nconst Use = 2\n");
+        let folders = ["healthy", "absent", "broken"].map(|folder| project.root.join(folder));
+        let workspace = Workspace::load_roots_for_rename(&folders, true).unwrap();
+        assert_eq!(workspace.navigation_packages().count(), 2);
+        assert_eq!(workspace.package_errors().len(), 2);
+        assert!(workspace.package_of_file(&broken).is_none());
+        for (path, command) in [(&folders[1], "go env"), (&folders[2], "go list")] {
+            let group = workspace.group_for_path(&path.join("app.go")).unwrap();
+            assert_ne!(Some(group), workspace.group_for_path(&source));
+            let error = workspace
+                .package_errors()
+                .iter()
+                .find(|error| error.group_id == group)
+                .unwrap();
+            assert_eq!(error.kind, PackageErrorKind::Group);
+            assert!(error.package_id.is_none());
+            assert!(error.message.contains(command), "{error:?}");
+        }
+        let mut engine = Engine::new(folders[0].clone());
+        assert!(engine.install_workspace(engine.workspace_load(), workspace));
+        let cursor = Position::new(2, 17);
+        let QueryProgress::Ready(Some((path, range))) = engine
+            .definition(&source, cursor, DefinitionKind::Declaration)
+            .unwrap()
+        else {
+            panic!("definition should resolve in the healthy group");
+        };
+        assert_eq!(path_key(&path), path_key(&target));
+        assert_eq!(range, Range::new(Position::new(1, 6), Position::new(1, 11)));
+        let failure = engine.prepare_rename(&source, cursor).err().unwrap();
+        assert!(failure.to_string().contains("complete package graph"));
+    }
+
+    #[test]
+    fn workspace_group_errors_use_canonical_ids_and_deduplicate_within_each_group() {
+        let project = TestProject::new();
+        let roots: Vec<_> = ["first", "second"]
+            .map(|folder| project.root.join(folder))
+            .into();
+        let raw = "example.test/app";
+        let mut listing = PackageListing::default();
+        for root in &roots {
+            let error =
+                json!({"ImportStack": [raw, "example.test/missing"], "Err": "missing package"});
+            let owner = json!({
+                "Dir": root, "ImportPath": raw, "Name": "app", "GoFiles": ["app.go"],
+                "DepsErrors": [error, error],
+            });
+            let missing = json!({"ImportPath": "example.test/missing", "Error": error});
+            let records = format!("{owner}\n{missing}");
+            listing.add_group(root, read_packages(records.as_bytes()).unwrap());
+        }
+        let scopes = roots
+            .iter()
+            .map(|root| GroupScope {
+                folders: vec![path_key(root)],
+                roots: Vec::new(),
+            })
+            .collect();
+        let workspace = Workspace::from_listing(roots.clone(), scopes, listing, false);
+        assert_eq!(workspace.package_errors().len(), 4);
+        for (group, root) in roots.iter().enumerate() {
+            let package = workspace.package_of_file(&root.join("app.go")).unwrap();
+            let mut errors = workspace
+                .package_errors()
+                .iter()
+                .filter(|error| error.group_id == group);
+            let attributed = errors.next().unwrap();
+            assert_eq!(attributed.package_id.as_deref(), Some(package.id.as_str()));
+            assert_eq!(attributed.import_path, raw);
+            assert_eq!(attributed.import_stack, [raw, "example.test/missing"]);
+            let missing = errors.next().unwrap();
+            assert!(missing.package_id.is_none());
+            assert_eq!(missing.import_path, "example.test/missing");
+            assert_eq!(missing.kind, PackageErrorKind::Direct);
+        }
+        assert!(workspace.package(&format!("1:{raw}")).is_some());
+    }
+
+    #[test]
+    fn workspace_test_only_package_has_group_local_private_names() {
+        let project = TestProject::new();
+        let module = "module example.test/same\n\ngo 1.22\n";
+        project.write("first/go.mod", module);
+        project.write("second/go.mod", module);
+        let production = project.write("first/sample.go", "package sample\nfunc private() {}\n");
+        let test_only = project.write(
+            "second/sample_test.go",
+            "package sample\nfunc private() {}\n",
+        );
+        let folders = ["first", "second"].map(|folder| project.root.join(folder));
+        let workspace = Workspace::load_roots(&folders, true).unwrap();
+        let production = workspace.package_of_file(&production).unwrap();
+        let test_only = workspace.package_of_file(&test_only).unwrap();
+        assert_eq!(test_only.test_of(), Some("example.test/same"));
+        assert_ne!(
+            test_only.private_name_owner(),
+            production.private_name_owner()
+        );
+        assert!(
+            workspace
+                .package_in_group_by_import(test_only.group_id(), "example.test/same")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_does_not_discover_unregistered_nested_modules() {
+        let project = TestProject::new();
+        project.write("go.mod", "module example.test/outer\n\ngo 1.22\n");
+        project.write("outer.go", "package outer\n");
+        project.write("nested/go.mod", "module example.test/nested\n\ngo 1.22\n");
+        let nested = project.write("nested/nested.go", "package nested\n");
+        let workspace = Workspace::load(&project.root, false).unwrap();
+        assert!(workspace.package("example.test/outer").is_some());
+        assert!(workspace.package("example.test/nested").is_none());
+        assert!(workspace.package_of_file(&nested).is_none());
+        let workspace =
+            Workspace::load_roots(&[project.root.clone(), project.root.join("nested")], false)
+                .unwrap();
+        assert!(workspace.package_of_file(&nested).is_some());
+        let outer = workspace.package("example.test/outer").unwrap();
+        assert!(
+            workspace
+                .resolve_import(outer, "example.test/nested")
+                .is_none()
+        );
     }
 }

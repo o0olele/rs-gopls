@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
+use super::package_errors::tested_package;
 use super::*;
 use crate::semantic::source::import_path;
+use crate::workspace::{PackageErrorKind, PackageLoadError};
 
 pub(super) fn qualifier(node: Node<'_>) -> bool {
     node.parent().is_some_and(|p| match p.kind() {
@@ -48,7 +50,7 @@ pub(super) fn collect(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
     let mut ancestors = HashSet::new();
     let mut stack: Vec<_> = graph.direct_importers(analysis.package).collect();
     while let Some(pkg) = stack.pop() {
-        if ancestors.insert(&pkg.id) {
+        if graph.package_in_group(pkg, analysis.group_id) && ancestors.insert(&pkg.id) {
             stack.extend(graph.direct_importers(pkg));
         }
     }
@@ -63,7 +65,7 @@ pub(super) fn collect(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
         if path == "C" {
             continue;
         }
-        let target = graph.resolve_import(analysis.package, &path);
+        let target = graph.resolve_import_in_group(analysis.package, analysis.group_id, &path);
         let binding = spec.child_by_field_name("name").unwrap_or(literal);
         let alias = spec
             .child_by_field_name("name")
@@ -100,12 +102,8 @@ pub(super) fn collect(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
             // go list indexes dependencies. A new import in an overlay may be outside that closure.
             if analysis.source.document_version.is_none()
                 || graph.package_errors().iter().any(|error| {
-                    error.package_id == path
-                        || error.import_stack.last() == Some(&path)
-                        || error
-                            .message
-                            .split_whitespace()
-                            .any(|word| word.trim_matches([':', '"']) == path)
+                    error.group_id == analysis.group_id
+                        && import_error_evidence(error, analysis.package, &path)
                 })
             {
                 analysis.error(
@@ -134,4 +132,16 @@ pub(super) fn collect(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn import_error_evidence(error: &PackageLoadError, package: &Package, path: &str) -> bool {
+    error.kind != PackageErrorKind::Group
+        && tested_package(error).is_none_or(|tested| package.test_of() == Some(tested))
+        && (!package.is_production() || !error.path.as_deref().is_some_and(is_test_source))
+        && (error.import_path == path
+            || error.import_stack.last().is_some_and(|entry| entry == path)
+            || error
+                .message
+                .split_whitespace()
+                .any(|word| word.trim_matches([':', '"']) == path))
 }

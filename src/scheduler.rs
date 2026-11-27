@@ -118,32 +118,34 @@ impl Scheduler {
         let mut installed = false;
         match update.result {
             Ok(workspace) => {
-                if engine.install_workspace(update.load, workspace) {
+                let failure = workspace.total_load_failure().map(str::to_owned);
+                if (failure.is_none() || update.load == engine.workspace_load())
+                    && engine.install_workspace(update.load, workspace)
+                {
                     installed = true;
-                    for pending in std::mem::take(&mut self.pending) {
-                        let Pending {
-                            id,
-                            document_key,
-                            query,
-                        } = pending;
-                        let progress = query.run(engine);
-                        self.resolve(engine, connection, id, progress, |id| Pending {
-                            id,
-                            document_key,
-                            query,
-                        })?;
+                    if let Some(message) = failure {
+                        // Diagnostics can use the installed failures. Graph
+                        // queries retain their load error and can retry later.
+                        self.fail_pending_load(engine, connection, &message)?;
+                    } else {
+                        for pending in std::mem::take(&mut self.pending) {
+                            let Pending {
+                                id,
+                                document_key,
+                                query,
+                            } = pending;
+                            let progress = query.run(engine);
+                            self.resolve(engine, connection, id, progress, |id| Pending {
+                                id,
+                                document_key,
+                                query,
+                            })?;
+                        }
                     }
                 }
             }
             Err(error) if update.load == engine.workspace_load() => {
-                let message = format!("{error:#}");
-                if self.pending.is_empty() {
-                    eprintln!("rs-gopls: loading Go packages: {message}");
-                }
-                for pending in std::mem::take(&mut self.pending) {
-                    let result = pending.query.load_failed(engine, &message);
-                    send_response(connection, pending.id, result)?;
-                }
+                self.fail_pending_load(engine, connection, &format!("{error:#}"))?;
             }
             Err(_) => {}
         }
@@ -151,6 +153,22 @@ impl Scheduler {
             self.request_workspace(engine.workspace_load());
         }
         Ok(installed)
+    }
+
+    fn fail_pending_load(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        message: &str,
+    ) -> Result<()> {
+        if self.pending.is_empty() {
+            eprintln!("rs-gopls: loading Go packages: {message}");
+        }
+        for pending in std::mem::take(&mut self.pending) {
+            let result = pending.query.load_failed(engine, message);
+            send_response(connection, pending.id, result)?;
+        }
+        Ok(())
     }
 
     pub(super) fn submit(

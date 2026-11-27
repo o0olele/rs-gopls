@@ -52,6 +52,8 @@ PREPARED_TARGETS = {
     "read-closer-supertypes": "ReadCloser",
     "derived-supertypes": "Derived",
 }
+# Each site gives the LSP identifier range, followed by GoLand's columns when they differ.
+# GoLand filters the recursive self-edge from both trees.
 RECURSIVE_SITE = ((49, 22, 31),)
 CALLS = {
     "leaf-callers": {
@@ -73,24 +75,30 @@ CALLS = {
     "leaf-callees": {},
 }
 TYPES = {
-    "reader-subtypes": ("ReadCloser", "Base", "Derived", "Alias"),
+    "reader-subtypes": ("ReadCloser", "Service", "Base", "Derived", "Alias"),
     "read-closer-subtypes": ("Service", "Derived", "Alias"),
     "base-subtypes": ("Derived",),
-    "service-supertypes": ("ReadCloser",),
+    "service-supertypes": ("Reader", "ReadCloser", "Resetter"),
     "read-closer-supertypes": ("Reader",),
     "derived-supertypes": ("Reader", "ReadCloser", "Service", "Resetter", "Base"),
 }
 GOLAND_TYPES = {
-    "reader-subtypes": ("ReadCloser", "Service", "Base", "Derived", "Alias"),
     "base-subtypes": (),
-    "service-supertypes": ("Reader", "ReadCloser", "Resetter"),
     "derived-supertypes": ("Reader", "ReadCloser", "Service", "Resetter"),
 }
-TYPE_DIFFERENCES = {
-    "reader-subtypes": "GoLand includes indirectly embedded interfaces",
-    "base-subtypes": "LSP includes structs that directly embed the queried type",
-    "service-supertypes": "GoLand includes transitive or structurally compatible interfaces",
-    "derived-supertypes": "LSP includes the directly embedded struct",
+IDENTIFIER_RANGES = "LSP uses identifier ranges for fromRanges"
+QUALIFIED_REFERENCES = f"{IDENTIFIER_RANGES}. GoLand highlights qualified references."
+CALL_EXPRESSIONS = f"{IDENTIFIER_RANGES}. GoLand highlights full call expressions."
+RECURSIVE_EDGE = "LSP keeps the recursive self-edge. GoLand filters that edge."
+INTENTIONAL_DIFFERENCES = {
+    "leaf-callers": QUALIFIED_REFERENCES,
+    "recursive-callers": f"{QUALIFIED_REFERENCES} {RECURSIVE_EDGE}",
+    "interface-method-callers": QUALIFIED_REFERENCES,
+    "dispatch-callees": CALL_EXPRESSIONS,
+    "method-callees": CALL_EXPRESSIONS,
+    "recursive-callees": f"{CALL_EXPRESSIONS} {RECURSIVE_EDGE}",
+    "base-subtypes": "LSP lists structs that directly embed the queried type. GoLand returns an empty tree.",
+    "derived-supertypes": "LSP lists the directly embedded struct as a parent. GoLand lists satisfied interfaces.",
 }
 
 
@@ -220,18 +228,21 @@ class Hierarchy(Fixture):
         actual = self.normalize(*raw, edge, edited_path=case["path"], edited_text=text, shift=shift)
         reference = self.baseline.get(case_id)
         captured = self.normalize(reference["target"], reference["results"], edge) if reference else None
-        if case_id not in PREPARED_TARGETS and captured is None:
+        if case_id in PREPARED_TARGETS:
+            expected = expected_results(case, edge)
+            if captured is not None and captured != expected_results(case, edge, goland=True):
+                raise ValueError(f"unexpected GoLand hierarchy result {captured!r}")
+        elif captured is not None:
+            expected = captured
+        else:
             raise ValueError("hierarchy query requires a GoLand result fixture")
-        expected = expected_results(case, edge) if case_id in PREPARED_TARGETS else captured
         if actual != expected:
             raise ValueError(f"hierarchy result expected {expected!r}, received {actual!r}")
         if captured is None or captured == actual:
             return Checked(actual)
-        if captured != expected_results(case, edge, goland=True):
-            raise ValueError(f"unexpected GoLand hierarchy result {captured!r}")
-        reason = TYPE_DIFFERENCES.get(case_id, "GoLand highlights qualified references or full call expressions")
-        if case_id in ("recursive-callers", "recursive-callees"):
-            reason += ". LSP includes the recursive call edge"
+        reason = INTENTIONAL_DIFFERENCES.get(case_id)
+        if reason is None:
+            raise ValueError("hierarchy difference requires a recorded reason")
         return Checked(actual, ({"reason": reason, "goland": captured, "rs_gopls": actual},))
 
 

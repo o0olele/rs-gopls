@@ -316,7 +316,8 @@ class Fixture:
         self.timed_rows = {}
         if getattr(args, "capture_goland", False):
             launcher = resolve_goland_exe(args.goland)
-            self.timed_capture = capture_goland(launcher, self.track, self.root, self.spec, self.timeout)
+            capture_spec = {**self.spec, "iterations": args.iterations}
+            self.timed_capture = capture_goland(launcher, self.track, self.root, capture_spec, self.timeout)
             if workspace_hash(self.root) != self.revision:
                 raise ValueError("workspace files changed during GoLand capture")
             self.timed_capture.update(workspaceSha256=self.revision, binary=describe_binary(launcher))
