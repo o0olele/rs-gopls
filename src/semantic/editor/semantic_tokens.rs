@@ -51,7 +51,7 @@ pub(super) fn tokens(editor: &Editor<'_>) -> SemanticTokens {
             modifiers |= DECLARATION;
         } else if !symbol.default_library
             && !symbol.readonly
-            && access(node, &symbol) == DocumentHighlightKind::WRITE
+            && access(editor, node, &symbol) == DocumentHighlightKind::WRITE
         {
             modifiers |= MODIFICATION;
         }

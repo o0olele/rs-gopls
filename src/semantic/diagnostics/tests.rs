@@ -258,12 +258,12 @@ fn partial_reports_upgrade_and_cache_checks_all_snapshot_fields() {
     let mut engine = Engine::new(project.root.clone());
     engine.open(path.clone(), text.into(), 4).unwrap();
     let mut cache = DiagnosticsCache::default();
-    let partial = {
+    let (partial, partial_key) = {
         let mut s = engine.snapshot();
         let d = s.document(&path).unwrap().unwrap();
         let report = get_or_compute(&mut cache, &mut s, &d).unwrap();
         assert!(report.is_partial && report.items.is_empty());
-        report.result_id.clone()
+        (report.result_id.clone(), report.snapshot.clone())
     };
     engine.install_workspace(
         engine.workspace_load(),
@@ -281,38 +281,212 @@ fn partial_reports_upgrade_and_cache_checks_all_snapshot_fields() {
             address,
             std::ptr::from_ref(get_or_compute(&mut cache, &mut s, &d).unwrap())
         );
-        assert!(cache.get(&d, 0, false).is_some());
-        assert!(cache.get(&d, 0, true).is_none());
-        assert!(cache.get(&d, 1, false).is_none());
+        assert!(cache.get(&snapshot_key(&s, &d).unwrap()).is_some());
+        assert!(cache.get(&partial_key).unwrap().is_partial);
     }
     for (version, content) in [(5, text), (4, "package sample\nvar X = 1\n")] {
         engine.open(path.clone(), content.into(), version).unwrap();
-        assert!(
-            cache
-                .get(
-                    &engine.snapshot().document(&path).unwrap().unwrap(),
-                    0,
-                    false
-                )
-                .is_none()
-        );
+        assert!(cache.get(&current_key(&mut engine, &path)).is_none());
     }
     engine.open(path.clone(), text.into(), 4).unwrap();
-    let mut s = engine.snapshot();
-    let d = s.document(&path).unwrap().unwrap();
-    let report = cache.get(&d, 0, false).unwrap().clone();
+    let key = current_key(&mut engine, &path);
+    let report = cache.get(&key).unwrap().clone();
     cache.invalidate_document(&path_key(&path));
-    assert!(cache.get(&d, 0, false).is_none());
+    assert!(cache.get(&key).is_none());
     cache.insert(report.clone());
     for i in 0..256 {
         let mut another = report.clone();
         another.snapshot.path_key = PathBuf::from(format!("doc{i}.go"));
         cache.insert(another);
     }
-    assert!(cache.get(&d, 0, false).is_none());
+    assert!(cache.get(&key).is_none());
     cache.insert(report);
     cache.clear();
-    assert!(cache.get(&d, 0, false).is_none());
+    assert!(cache.get(&key).is_none());
+}
+
+fn current_key(engine: &mut Engine, path: &Path) -> DiagnosticSnapshotKey {
+    snapshot_key_for_path(&engine.snapshot(), path).unwrap()
+}
+
+#[test]
+fn production_report_keeps_its_result_id_when_test_view_is_installed() {
+    let project = TestProject::new();
+    let text = "package sample\nvar _ = missing\n";
+    let path = project.write("sample.go", text);
+    let test = project.write("sample_test.go", "package sample\nvar _ = helper\n");
+    let listing = json!({"Dir": project.root, "ImportPath": "example.test/sample", "Name": "sample", "GoFiles": ["sample.go"]});
+    let variant = json!({"Dir": project.root, "ImportPath": "example.test/sample [example.test/sample.test]", "ForTest": "example.test/sample", "Name": "sample", "GoFiles": ["sample.go", "sample_test.go"]});
+    let roots = std::slice::from_ref(&project.root);
+    let mut engine = Engine::new(project.root.clone());
+    engine.open(path.clone(), text.into(), 1).unwrap();
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(roots, &listing.to_string(), false),
+    ));
+    let initial = engine.diagnostics_report(&path).unwrap().0.clone();
+    let partial = engine.diagnostics_report(&test).unwrap().0.clone();
+    assert!(partial.is_partial);
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(roots, &format!("{listing}\n{variant}"), true),
+    ));
+
+    let key = current_key(&mut engine, &path);
+    assert_eq!(engine.diagnostics_cache.get(&key), Some(&initial));
+    let report = engine.diagnostics_report(&test).unwrap().0.clone();
+    assert!(!report.is_partial);
+    assert_ne!(report.result_id, partial.result_id);
+    assert!(report.items.iter().any(|item| item.code == NameUnresolved));
+
+    engine
+        .open(test.clone(), "package sample\nvar helper int\n".into(), 2)
+        .unwrap();
+    let key = current_key(&mut engine, &path);
+    assert_eq!(engine.diagnostics_cache.get(&key), Some(&initial));
+    let repaired = engine.diagnostics_report(&test).unwrap().0;
+    assert_ne!(repaired.result_id, report.result_id);
+    assert!(repaired.items.is_empty(), "{:#?}", repaired.items);
+
+    engine.close(&test);
+    project.write("sample_test.go", "package sample\nimport _ \"other\"\n");
+    engine.file_changed(&test, lsp_types::FileChangeType::CHANGED);
+    let key = current_key(&mut engine, &path);
+    assert_eq!(engine.diagnostics_cache.get(&key), Some(&initial));
+    assert!(current_key(&mut engine, &test).partial);
+}
+
+#[test]
+fn a_watched_disk_edit_invalidates_a_dependent_report_without_a_new_graph() {
+    let project = TestProject::new();
+    let dependency = project.write("dependency.go", "package sample\nvar Defined int\n");
+    let text = "package sample\nvar _ = Defined\n";
+    let caller = project.write("caller.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    let load = engine.workspace_load();
+    assert!(engine.install_workspace(
+        load,
+        project.workspace(&["caller.go", "dependency.go"], false)
+    ));
+    engine.open(caller.clone(), text.into(), 1).unwrap();
+    let initial = engine.diagnostics_report(&caller).unwrap().0.clone();
+    assert!(initial.items.is_empty(), "{:#?}", initial.items);
+
+    project.write(
+        "dependency.go",
+        "package sample\nvar RenamedDeclaration int\n",
+    );
+    engine.file_changed(&dependency, lsp_types::FileChangeType::CHANGED);
+    assert_eq!(engine.workspace_load(), load);
+    let key = current_key(&mut engine, &caller);
+    assert!(!key.partial);
+    assert!(engine.diagnostics_cache.get(&key).is_none());
+    let changed = engine.diagnostics_report(&caller).unwrap().0.clone();
+    item_at(&changed, text, NameUnresolved, "= Defined", "Defined");
+
+    let test_load = crate::workspace::WorkspaceLoad {
+        include_tests: true,
+        ..load
+    };
+    assert!(engine.install_workspace(
+        test_load,
+        project.workspace(&["caller.go", "dependency.go"], true)
+    ));
+    let key = current_key(&mut engine, &caller);
+    assert_eq!(engine.diagnostics_cache.get(&key), Some(&changed));
+}
+
+#[test]
+fn changed_transitive_overlays_only_invalidate_dependent_views() {
+    let project = TestProject::new();
+    let app_text = "package app\nimport \"middle\"\nvar _ = middle.Value\n";
+    let app = project.write("app/app.go", app_text);
+    let other = project.write("other/other.go", "package other\n");
+    project.write(
+        "middle/middle.go",
+        "package middle\nimport \"leaf\"\nvar Value = leaf.Value\n",
+    );
+    let leaf = project.write("leaf/leaf.go", "package leaf\nconst Value = 1\n");
+    let packages = [
+        json!({"Dir": project.root.join("app"), "ImportPath": "app", "Name": "app", "GoFiles": ["app.go"], "Imports": ["middle"]}),
+        json!({"Dir": project.root.join("other"), "ImportPath": "other", "Name": "other", "GoFiles": ["other.go"]}),
+        json!({"Dir": project.root.join("middle"), "ImportPath": "middle", "Name": "middle", "GoFiles": ["middle.go"], "Imports": ["leaf"]}),
+        json!({"Dir": project.root.join("leaf"), "ImportPath": "leaf", "Name": "leaf", "GoFiles": ["leaf.go"]}),
+    ];
+    let listing = packages
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(std::slice::from_ref(&project.root), &listing, false),
+    ));
+    engine.open(app.clone(), app_text.into(), 1).unwrap();
+    let initial = engine.diagnostics_report(&app).unwrap().0.clone();
+    let other_report = engine.diagnostics_report(&other).unwrap().0.clone();
+    assert!(initial.items.is_empty(), "{:#?}", initial.items);
+
+    engine
+        .open(leaf, "package leaf\nconst Value = 2\n".into(), 2)
+        .unwrap();
+    let unaffected = current_key(&mut engine, &other);
+    assert_eq!(
+        engine.diagnostics_cache.get(&unaffected),
+        Some(&other_report)
+    );
+    let changed = current_key(&mut engine, &app);
+    assert!(engine.diagnostics_cache.get(&changed).is_none());
+    assert_ne!(
+        engine.diagnostics_report(&app).unwrap().0.result_id,
+        initial.result_id
+    );
+}
+
+#[test]
+fn import_target_and_package_errors_are_diagnostic_inputs() {
+    let project = TestProject::new();
+    let text = "package sample\nimport alias \"alias/path\"\nvar _ = alias.Value\n";
+    let path = project.write("sample.go", text);
+    project.write("first/dep.go", "package first\nconst Value = 1\n");
+    project.write("second/dep.go", "package second\n");
+    let roots = std::slice::from_ref(&project.root);
+    let mut engine = Engine::new(project.root.clone());
+    engine.open(path.clone(), text.into(), 1).unwrap();
+    let graph = |target: &str, error: Option<&str>| {
+        let mut owner = json!({"Dir": project.root, "ImportPath": "sample", "Name": "sample", "GoFiles": ["sample.go"], "Imports": ["alias/path"], "ImportMap": {"alias/path": target}});
+        if let Some(message) = error {
+            owner["Error"] = json!({"Err": message});
+        }
+        let first = json!({"Dir": project.root.join("first"), "ImportPath": "first", "Name": "first", "GoFiles": ["dep.go"]});
+        let second = json!({"Dir": project.root.join("second"), "ImportPath": "second", "Name": "second", "GoFiles": ["dep.go"]});
+        Workspace::from_test_listing(roots, &format!("{first}\n{second}\n{owner}"), false)
+    };
+
+    assert!(engine.install_workspace(engine.workspace_load(), graph("first", None)));
+    let clean = engine.diagnostics_report(&path).unwrap().0.clone();
+    assert!(clean.items.is_empty(), "{:#?}", clean.items);
+    assert!(engine.install_workspace(engine.workspace_load(), graph("second", None)));
+    let key = current_key(&mut engine, &path);
+    assert!(engine.diagnostics_cache.get(&key).is_none());
+    let changed = engine.diagnostics_report(&path).unwrap().0.clone();
+    item_at(&changed, text, NameUnresolved, "alias.Value", "Value");
+
+    for message in ["temporary package failure", "new package failure"] {
+        assert!(engine.install_workspace(engine.workspace_load(), graph("second", Some(message))));
+        let key = current_key(&mut engine, &path);
+        assert!(engine.diagnostics_cache.get(&key).is_none());
+        assert!(
+            engine
+                .diagnostics_report(&path)
+                .unwrap()
+                .0
+                .items
+                .iter()
+                .any(|item| { item.code == PackageLoad && item.message == message })
+        );
+    }
 }
 
 #[test]
@@ -877,17 +1051,50 @@ fn group_load_failure_is_visible_in_its_source_documents() {
     assert!(graph.package_of_file(&broken).is_some());
     let mut engine = Engine::with_roots(roots.to_vec());
     assert!(engine.install_workspace(engine.workspace_load(), graph));
-    let healthy = analyze_file(&mut engine, &healthy);
-    assert!(healthy.items.is_empty(), "{:#?}", healthy.items);
-    let broken = analyze_file(&mut engine, &broken);
+    let healthy_report = engine.diagnostics_report(&healthy).unwrap().0.clone();
+    assert!(
+        healthy_report.items.is_empty(),
+        "{:#?}",
+        healthy_report.items
+    );
+    let broken_report = engine.diagnostics_report(&broken).unwrap().0.clone();
     let item = item_at(
-        &broken,
+        &broken_report,
         "package sample\n",
         PackageLoad,
         "package sample",
         "package sample",
     );
     assert!(item.message.contains("invalid_group_setting"), "{item:?}");
+
+    project.write("broken/go.work", "go 1.24\nchanged_group_setting 1\n");
+    let graph = Workspace::load_roots(&roots, false).unwrap();
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    let healthy_key = current_key(&mut engine, &healthy);
+    assert_eq!(
+        engine.diagnostics_cache.get(&healthy_key),
+        Some(&healthy_report)
+    );
+    let broken_key = current_key(&mut engine, &broken);
+    assert!(engine.diagnostics_cache.get(&broken_key).is_none());
+    let changed = engine.diagnostics_report(&broken).unwrap().0;
+    assert_ne!(changed.result_id, broken_report.result_id);
+    assert!(
+        changed
+            .items
+            .iter()
+            .any(|item| item.message.contains("changed_group_setting"))
+    );
+
+    assert!(
+        engine
+            .update_environment([("GOFLAGS".into(), "-tags=diagnostic_cache_test".into())].into())
+    );
+    let graph = Workspace::load_roots_in_environment(&roots, false, engine.environment()).unwrap();
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    let changed = engine.diagnostics_report(&healthy).unwrap().0;
+    assert_ne!(changed.result_id, healthy_report.result_id);
+    assert!(changed.items.is_empty(), "{:#?}", changed.items);
 }
 
 #[test]
@@ -927,4 +1134,103 @@ import "ma\x74h"
 var _ = math.Pi
 "#;
     assert!(single_file(text).items.is_empty());
+}
+
+#[test]
+fn named_alias_and_anonymous_struct_literals_keep_field_diagnostics() {
+    let text = r#"package sample
+type Empty struct{}
+type Named struct{ Present int }
+type Alias = Named
+type InlineAlias = struct{ Present int }
+var _ = Empty{Missing: 1}
+var _ = Alias{Present: 1, Missing: 2}
+var _ = InlineAlias{Present: 1, Missing: 2}
+var _ = struct{ Present int }{Present: 1, Missing: 2}
+var _ = map[int]int{Undefined: 1}
+"#;
+    let report = single_file(text);
+    for context in [
+        "Empty{Missing",
+        "Alias{Present: 1, Missing",
+        "InlineAlias{Present: 1, Missing",
+        "}{Present: 1, Missing",
+    ] {
+        item_at(
+            &report,
+            text,
+            CompositeLiteralUnknownField,
+            context,
+            "Missing",
+        );
+    }
+    item_at(&report, text, NameUnresolved, "{Undefined", "Undefined");
+    assert_eq!(report.items.len(), 5, "{:#?}", report.items);
+}
+
+#[test]
+fn zero_parameter_calls_and_nested_returns_use_their_own_signatures() {
+    let text = r#"package sample
+func Getter() int { return 1 }
+var _ = Getter()
+var _ = Getter(1)
+func Outer() int {
+    func() (int, int) { return 1 }()
+    return Getter()
+}
+"#;
+    let report = single_file(text);
+    item_at(&report, text, CallArity, "Getter(1)", "(1)");
+    item_at(&report, text, ReturnArity, "{ return 1 }()", "return 1");
+    assert_eq!(report.items.len(), 2, "{:#?}", report.items);
+}
+
+#[test]
+fn escaped_explicit_import_only_suppresses_the_matching_qualifier() {
+    let text = r#"package sample
+import alias "ma\x74h"
+var _ = alias.Pi
+var _ = unknown.Pi
+"#;
+    let report = single_file(text);
+    let missing = item_at(&report, text, NameUnresolved, "unknown.Pi", "unknown");
+    assert!(matches!(
+        missing.fix_data,
+        DiagnosticFixData::ImportMissingPackage { .. }
+    ));
+    assert_eq!(report.items.len(), 1, "{:#?}", report.items);
+}
+
+#[test]
+fn methods_conflict_with_direct_fields_in_their_file_and_siblings() {
+    let project = TestProject::new();
+    let text = r#"package sample
+type Local struct{ Same int }
+func (Local) Same() {}
+func (Sibling) Embedded() {}
+func (Sibling) Nested() {}
+"#;
+    let path = project.write("main.go", text);
+    project.write(
+        "sibling.go",
+        r#"package sample
+type Embedded struct{}
+type Sibling struct{ Embedded; Outer struct{ Nested int } }
+"#,
+    );
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["main.go", "sibling.go"], false),
+    ));
+    let report = analyze_file(&mut engine, &path);
+    item_at(&report, text, NameRedeclared, "(Local) Same", "Same");
+    item_at(
+        &report,
+        text,
+        NameRedeclared,
+        "(Sibling) Embedded",
+        "Embedded",
+    );
+    assert_eq!(report.items.len(), 2, "{:#?}", report.items);
 }

@@ -8,14 +8,12 @@ use lsp_types::{
     CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionParams,
     CodeActionProviderCapability, CompletionItem, CompletionOptions,
     CompletionOptionsCompletionItem, CompletionParams, DiagnosticOptions,
-    DiagnosticServerCapabilities, DocumentDiagnosticParams, DocumentDiagnosticReportKind,
-    DocumentFormattingParams, DocumentSymbolParams, FoldingRangeParams,
-    FoldingRangeProviderCapability, FullDocumentDiagnosticReport, HoverProviderCapability,
-    InitializeParams, InlayHintParams, OneOf, Position, ReferenceParams, RenameOptions,
-    RenameParams, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
-    ServerCapabilities, SignatureHelpOptions, TextDocumentPositionParams,
-    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, UnchangedDocumentDiagnosticReport,
-    Uri, WorkspaceSymbolParams,
+    DiagnosticServerCapabilities, DocumentDiagnosticParams, DocumentFormattingParams,
+    DocumentSymbolParams, FoldingRangeParams, FoldingRangeProviderCapability,
+    HoverProviderCapability, InitializeParams, InlayHintParams, OneOf, Position, ReferenceParams,
+    RenameOptions, RenameParams, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, ServerCapabilities, SignatureHelpOptions, TextDocumentPositionParams,
+    TypeHierarchySubtypesParams, TypeHierarchySupertypesParams, Uri, WorkspaceSymbolParams,
     request::{
         CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
         CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
@@ -33,11 +31,11 @@ use crate::protocol::{
     RequestResult, file_path, internal_error, invalid_params, send_response, serialize_location,
     serialize_locations, serialize_query,
 };
-use crate::scheduler::{DeferredQuery, RequestProgress, Scheduler, SearchTask};
+use crate::scheduler::{DeferredQuery, DiagnosticConsumer, RequestProgress, Scheduler, SearchTask};
+use crate::semantic::actions::needs_diagnostics;
 use crate::semantic::completion::{
     CompletionClientCapabilities, ResolveCompletionResult, StaleCompletion, Trace,
 };
-use crate::semantic::diagnostics::DiagnosticReport;
 use crate::semantic::rename::{RenameError, RenameResult};
 use crate::semantic::{
     DefinitionKind, EditorFoldingOptions, Engine, QueryProgress, SemanticTask,
@@ -296,6 +294,13 @@ pub(super) fn handle(
             format!("unsupported request: {method}"),
         )),
     )
+}
+
+pub(super) fn telemetry_method(method: &str) -> Option<&'static str> {
+    FEATURES
+        .iter()
+        .flat_map(|feature| feature.methods)
+        .find_map(|&(name, _)| (method == name).then_some(name))
 }
 
 struct RequestContext<'a> {
@@ -658,7 +663,16 @@ fn document_highlight(
     id: RequestId,
     params: Value,
 ) -> Result<()> {
-    context.immediate_document_query(id, document_position(params), Engine::document_highlight)
+    match document_position(params) {
+        Ok((path, position)) => context.scheduler.submit_highlight(
+            context.engine,
+            context.connection,
+            id,
+            path,
+            position,
+        ),
+        Err(error) => context.respond(id, Err(invalid_params(error))),
+    }
 }
 
 fn inlay_hints(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
@@ -666,7 +680,10 @@ fn inlay_hints(context: &mut RequestContext<'_>, id: RequestId, params: Value) -
         let params: InlayHintParams = serde_json::from_value(params)?;
         Ok((file_path(&params.text_document.uri)?, params.range))
     })();
-    context.immediate_document_query(id, params, Engine::inlay_hints)
+    context.immediate_document_query(id, params, |engine, path, range| {
+        let _operation = crate::telemetry::loop_start("inlay_hint", 20.0);
+        engine.inlay_hints(path, range)
+    })
 }
 
 fn folding_ranges(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
@@ -690,43 +707,24 @@ fn workspace_symbols(context: &mut RequestContext<'_>, id: RequestId, params: Va
     }
 }
 
-fn diagnostic_result(report: &DiagnosticReport, previous: Option<&str>) -> RequestResult {
-    let result = if previous == Some(&report.result_id) {
-        DocumentDiagnosticReportKind::Unchanged(UnchangedDocumentDiagnosticReport {
-            result_id: report.result_id.clone(),
-        })
-    } else {
-        DocumentDiagnosticReportKind::Full(FullDocumentDiagnosticReport {
-            result_id: Some(report.result_id.clone()),
-            items: report.to_lsp_diagnostics(),
-        })
-    };
-    serialize_query(result)
-}
-
 fn document_diagnostics(
     context: &mut RequestContext<'_>,
     id: RequestId,
     params: Value,
 ) -> Result<()> {
-    context.document_query(
-        id,
-        document_params(params, |p: &DocumentDiagnosticParams| &p.text_document.uri),
-        |engine, path, params| {
-            let (report, load) = engine.diagnostics_report(path)?;
-            Ok(match load {
-                Some(load) => QueryProgress::Pending(load),
-                None => QueryProgress::Ready(diagnostic_result(
-                    report,
-                    params.previous_result_id.as_deref(),
-                )),
-            })
-        },
-        Some(|engine, path, _| {
-            let (report, _) = engine.diagnostics_report(path).map_err(internal_error)?;
-            diagnostic_result(report, None)
-        }),
-    )
+    match document_params(params, |p: &DocumentDiagnosticParams| &p.text_document.uri) {
+        Ok((path, params)) => context.scheduler.submit_diagnostics(
+            context.engine,
+            context.connection,
+            path,
+            DiagnosticConsumer::Pull {
+                id,
+                previous: params.previous_result_id,
+            },
+            "textDocument/diagnostic",
+        ),
+        Err(error) => context.respond(id, Err(invalid_params(error))),
+    }
 }
 
 fn formatting(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
@@ -743,32 +741,27 @@ fn formatting(context: &mut RequestContext<'_>, id: RequestId, params: Value) ->
 }
 
 fn code_actions(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
-    context.document_query(
-        id,
-        document_params(params, |p: &CodeActionParams| &p.text_document.uri),
-        |engine, path, p| {
-            Ok(adapt(
-                engine.code_actions(
-                    path,
-                    &p.text_document.uri,
-                    p.range,
-                    p.context.only.as_deref(),
-                )?,
-                serialize_query,
-            ))
-        },
-        Some(|engine, path, p| {
-            engine
-                .local_code_actions(
-                    path,
-                    &p.text_document.uri,
-                    p.range,
-                    p.context.only.as_deref(),
-                )
-                .map_err(internal_error)
-                .and_then(serialize_query)
-        }),
-    )
+    match document_params(params, |p: &CodeActionParams| &p.text_document.uri) {
+        Ok((path, params))
+            if path.extension().is_some_and(|ext| ext == "go")
+                && needs_diagnostics(params.context.only.as_deref()) =>
+        {
+            context.scheduler.submit_diagnostics(
+                context.engine,
+                context.connection,
+                path,
+                DiagnosticConsumer::Actions {
+                    id,
+                    uri: params.text_document.uri,
+                    range: params.range,
+                    only: params.context.only,
+                },
+                "textDocument/codeAction",
+            )
+        }
+        Ok(_) => context.respond(id, Ok(Value::Array(Vec::new()))),
+        Err(error) => context.respond(id, Err(invalid_params(error))),
+    }
 }
 
 fn prepare_call_hierarchy(

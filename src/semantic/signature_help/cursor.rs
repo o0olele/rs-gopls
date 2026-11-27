@@ -149,7 +149,7 @@ pub(super) fn repair_call(
         return Ok(None);
     }
 
-    let mut text = source.text.clone();
+    let mut text = source.text.as_ref().clone();
     let suffix = ")".repeat(closes);
     text.insert_str(offset, &suffix);
     let point = source.lines.point(offset);

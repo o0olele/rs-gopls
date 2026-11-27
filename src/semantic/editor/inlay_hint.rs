@@ -7,8 +7,7 @@ use tree_sitter::Node;
 
 use super::super::constants::{ConstDefinition, const_definitions, integer_binary, parse_integer};
 use super::{
-    Editor, Parameter, SymbolId, descendants, function_owner, named_children, terminal_type_name,
-    unwrap_parens,
+    Editor, Parameter, SymbolId, descendants, named_children, terminal_type_name, unwrap_parens,
 };
 
 pub(super) fn hints(editor: &Editor<'_>, range: Range) -> Vec<InlayHint> {
@@ -100,7 +99,9 @@ impl<'tree> Hints<'_, 'tree> {
     }
 
     fn results(&mut self, statement: Node<'tree>) {
-        if let Some(result) = function_owner(statement)
+        if let Some(result) = self
+            .editor
+            .function_owner(statement)
             .and_then(|function| function.child_by_field_name("result"))
             .filter(|result| result.kind() == "parameter_list")
             && let Some(expressions) =
@@ -184,7 +185,7 @@ fn builtin_parameters(name: &str) -> Option<Vec<Parameter<'static>>> {
     )
 }
 
-fn show_inlay(editor: &Editor<'_>, argument: Node<'_>) -> bool {
+fn show_inlay<'tree>(editor: &Editor<'tree>, argument: Node<'tree>) -> bool {
     let expression = if argument.kind() == "variadic_argument" {
         let Some(expression) = named_children(argument).next() else {
             return false;
@@ -193,7 +194,7 @@ fn show_inlay(editor: &Editor<'_>, argument: Node<'_>) -> bool {
     } else {
         argument
     };
-    let simple = |node: Node<'_>| match node.kind() {
+    let simple = |node: Node<'tree>| match node.kind() {
         "nil" | "true" | "false" | "identifier" => matches!(
             editor.symbol(node).map(|occurrence| occurrence.id),
             Some(SymbolId::Builtin("nil" | "true" | "false"))

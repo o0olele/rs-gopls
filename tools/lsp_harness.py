@@ -18,6 +18,7 @@ from urllib.request import url2pathname
 WORKSPACE_ENVIRONMENT = {"GO111MODULE": "on", "GOWORK": "off", "GOPROXY": "off"}
 GO_WATCH_PATTERNS = {"**/*.go", "**/go.mod", "**/go.sum", "**/go.work", "**/go.work.sum"}
 WATCHED_FILES_METHOD = "workspace/didChangeWatchedFiles"
+_DEFAULT_INITIALIZATION_OPTIONS = object()
 
 
 def position_at(text, offset):
@@ -320,6 +321,9 @@ class LspClient:
     def notify(self, method, **params):
         self.send(method=method, params=params)
 
+    def change_configuration(self, settings):
+        self.notify("workspace/didChangeConfiguration", settings=settings)
+
     def reply(self, message):
         if isinstance(message, _AnsweredRequest):
             return
@@ -329,7 +333,10 @@ class LspClient:
             self.send(id=request_id, result=self.folders)
         elif method == "workspace/configuration":
             self.send(id=request_id, result=[None] * len(message.get("params", {}).get("items", ())))
-        elif method in {"window/workDoneProgress/create", "client/registerCapability", "client/unregisterCapability"}:
+        elif method in {
+            "window/workDoneProgress/create", "client/registerCapability", "client/unregisterCapability",
+            "workspace/diagnostic/refresh",
+        }:
             self.send(id=request_id, result=None)
         else:
             self.send(id=request_id, error={"code": -32601, "message": f"Unsupported client method: {method}"})
@@ -341,7 +348,8 @@ class LspClient:
             raise RuntimeError(f"{method} failed: {response['error']}")
         return response["result"]
 
-    def initialize(self, *, watch_files=False, hierarchical_document_symbols=None, document_changes=None, prepare_rename=None):
+    def initialize(self, *, watch_files=False, hierarchical_document_symbols=None, document_changes=None,
+                   prepare_rename=None, initialization_options=_DEFAULT_INITIALIZATION_OPTIONS):
         workspace = {"workspaceFolders": True}
         if watch_files:
             workspace["didChangeWatchedFiles"] = {"dynamicRegistration": True}
@@ -357,12 +365,14 @@ class LspClient:
             }
         if prepare_rename is not None:
             capabilities.setdefault("textDocument", {})["rename"] = {"prepareSupport": prepare_rename}
+        if initialization_options is _DEFAULT_INITIALIZATION_OPTIONS:
+            initialization_options = {"diagnosticsTrigger": "Save"}
         init = self.request(
             "initialize",
             processId=os.getpid(),
             rootUri=self.folders[0]["uri"],
             workspaceFolders=self.folders,
-            initializationOptions={"diagnosticsTrigger": "Save"},
+            initializationOptions=initialization_options,
             capabilities=capabilities,
         )
         capabilities = init["capabilities"]
@@ -451,10 +461,12 @@ def acknowledge_file_watches(client):
 
 
 def initialize_session(client, *, watch_files=False, hierarchical=None, require_go_watches=True,
-                       document_changes=None, prepare_rename=None):
+                       document_changes=None, prepare_rename=None,
+                       initialization_options=_DEFAULT_INITIALIZATION_OPTIONS):
     capabilities = client.initialize(
         watch_files=watch_files, hierarchical_document_symbols=hierarchical,
         document_changes=document_changes, prepare_rename=prepare_rename,
+        initialization_options=initialization_options,
     )
     if watch_files:
         if require_go_watches:
@@ -466,13 +478,16 @@ def initialize_session(client, *, watch_files=False, hierarchical=None, require_
 
 @contextmanager
 def session(executable_path, root, timeout, *, watch_files=False, hierarchical=None,
-            document_changes=None, prepare_rename=None, **env):
-    environment = {**os.environ, **WORKSPACE_ENVIRONMENT, **env}
-    client = LspClient([executable_path], root, timeout, environment=environment)
+            document_changes=None, prepare_rename=None,
+            initialization_options=_DEFAULT_INITIALIZATION_OPTIONS, environment=None, **env):
+    if environment is None:
+        environment = {**os.environ, **WORKSPACE_ENVIRONMENT}
+    client = LspClient([executable_path], root, timeout, environment={**environment, **env})
     try:
         initialize_session(
             client, watch_files=watch_files, hierarchical=hierarchical,
             document_changes=document_changes, prepare_rename=prepare_rename,
+            initialization_options=initialization_options,
         )
         yield client
         client.shutdown()

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use super::path_key;
+use crate::go_environment::GoEnvironment;
 
 // A rename needs a complete reference set even when the editor supplies no
 // file watcher. Capture before go list so a newly added importer, package or
@@ -19,7 +20,7 @@ pub(super) struct PackageInputs {
 impl PackageInputs {
     // Module and work files can live above an editor folder. Take their
     // fingerprints before discovering the build groups and Go project roots.
-    pub(super) fn configuration(folders: &[PathBuf]) -> Result<Self> {
+    pub(super) fn configuration(folders: &[PathBuf], environment: &GoEnvironment) -> Result<Self> {
         let folders = folders
             .iter()
             .map(std::path::absolute)
@@ -33,7 +34,7 @@ impl PackageInputs {
                 }
             }
         }
-        if let Some(path) = std::env::var_os("GOWORK").map(PathBuf::from)
+        if let Some(path) = environment.get("GOWORK").map(PathBuf::from)
             && path.is_absolute()
             && path.is_file()
         {
@@ -87,8 +88,8 @@ impl PackageInputs {
         Ok(self)
     }
 
-    pub(super) fn current(&self, roots: &[PathBuf]) -> Result<bool> {
-        let current = Self::configuration(&self.folders)?;
+    pub(super) fn current(&self, roots: &[PathBuf], environment: &GoEnvironment) -> Result<bool> {
+        let current = Self::configuration(&self.folders, environment)?;
         Ok(current.configuration == self.configuration
             && current.with_sources(roots)?.files == self.files)
     }

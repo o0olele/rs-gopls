@@ -1,10 +1,9 @@
 use std::collections::HashSet;
 
 use super::*;
-use crate::scope::lexical_binding;
 use crate::semantic::resolver::{
-    MAX_TYPE_DEPTH, TypeIdentity, TypeKind, explicit_type_arguments, is_predeclared_type,
-    materialize_type, untyped_default,
+    MAX_TYPE_DEPTH, TypeIdentity, TypeKind, explicit_type_arguments, is_exported,
+    is_predeclared_type, materialize_type, untyped_default,
 };
 use crate::semantic::source::{function_at, import_path};
 use crate::symbols::{self, Container, OutlineKind, SymbolKind};
@@ -43,16 +42,10 @@ fn shape<'w>(resolver: &mut Resolver<'w, '_>, ty: &Ty<'w>) -> Result<Option<Shap
     }
     Ok(Some(match &base.kind {
         TypeKind::Named { name, .. } => {
-            if let Some((file, details)) = resolver.type_info(base.package, name)? {
+            if let Some((_, details)) = resolver.type_info(base.package, name)? {
                 if details.interface {
                     Shape::Interface
-                } else if resolver.indexes.reference_source(&file)?.is_some_and(|s| {
-                    s.as_ref()
-                        .outline()
-                        .symbols
-                        .iter()
-                        .any(|sym| sym.name == *name && sym.kind == OutlineKind::Struct)
-                }) {
+                } else if details.structure {
                     Shape::Struct
                 } else {
                     return Ok(None);
@@ -81,6 +74,18 @@ fn shape<'w>(resolver: &mut Resolver<'w, '_>, ty: &Ty<'w>) -> Result<Option<Shap
 }
 
 impl<'s, 'w> Analysis<'s, 'w, '_> {
+    fn source_type(&mut self, node: Node<'_>) -> Option<Ty<'w>> {
+        if !self.locals.has_bindings()
+            || (matches!(node.kind(), "type_identifier" | "identifier")
+                && self.locals.lookup(node, self.text(node)).is_none())
+        {
+            self.resolver
+                .source_type_unscoped(self.package, self.source, node)
+        } else {
+            self.resolver.source_type(self.package, self.source, node)
+        }
+    }
+
     fn universe(&self, node: Node<'_>) -> bool {
         let name = self.text(node);
         self.locals.lookup(node, name).is_none() && !self.locals.globals.contains_key(name)
@@ -98,39 +103,31 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
         }
         let node = unparen(node);
         let name = self.text(node);
-        if declarations::is_identifier(node)
-            && let Some(local) = self.locals.lookup(node, name)
-        {
-            let Some(binding) =
-                lexical_binding(node, name, &self.source.text).filter(|b| b.name == local.name)
-            else {
-                return Ok(None);
-            };
-            let owner = binding.name.parent().map(|p| p.kind());
-            if !matches!(
-                owner,
-                Some("type_spec" | "type_alias" | "type_parameter_declaration" | "type_elem")
-            ) {
-                if let Some(syntax) = binding.explicit_type {
-                    let ty = self.resolver.source_type(self.package, self.source, syntax);
+        let local = declarations::is_identifier(node)
+            .then(|| self.locals.lookup(node, name))
+            .flatten();
+        if let Some(local) = local {
+            if !local.is_type() {
+                if let Some(syntax) = local.explicit_type {
+                    let ty = self.source_type(syntax);
                     return Ok(ty.map(|mut ty| {
-                        if owner == Some("variadic_parameter_declaration") {
+                        if local.kind == "variadic_parameter_declaration" {
                             ty = Ty::new(
                                 self.package,
                                 TypeKind::Container(Box::new(Container::Slice(ty)), None),
                                 0,
                             );
                         }
-                        ty.addressable = owner != Some("const_spec");
+                        ty.addressable = local.kind != "const_spec";
                         ty
                     }));
                 }
-                if owner == Some("const_spec") {
+                if local.kind == "const_spec" {
                     // An untyped constant takes its type from the assignment context.
                     return Ok(None);
                 }
-                if binding.result_index == 0
-                    && let Some(value) = binding.initializer
+                if local.result_index == 0
+                    && let Some(value) = local.initializer
                 {
                     let mut ty = self.inferred_at(value, depth + 1)?;
                     if let Some(ty) = &mut ty {
@@ -195,7 +192,7 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
                 target = inner;
                 stars += 1;
             }
-            let Some(mut ty) = self.resolver.source_type(self.package, self.source, target) else {
+            let Some(mut ty) = self.source_type(target) else {
                 return Ok(None);
             };
             for _ in 0..stars {
@@ -213,9 +210,33 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
             ty.addressable = true;
             return Ok(Some(ty));
         }
-        let resolved = self
-            .resolver
-            .infer_type(self.package, self.source, node, depth, 0)?;
+        match node.kind() {
+            "func_literal" => return Ok(self.source_type(node)),
+            "composite_literal" | "type_assertion_expression" => {
+                return Ok(node
+                    .child_by_field_name("type")
+                    .and_then(|ty| self.source_type(ty)));
+            }
+            "selector_expression" | "qualified_type" => {
+                return self.inferred_selector(node, depth + 1);
+            }
+            _ => {}
+        }
+        let resolved = if matches!(
+            node.kind(),
+            "identifier" | "type_identifier" | "package_identifier" | "true" | "false"
+        ) && local.is_none()
+        {
+            match self.resolver.find_symbol(self.package, name, None)? {
+                Some(symbol) => self
+                    .resolver
+                    .symbol_type(self.source, &symbol, name, depth + 1)?,
+                None => None,
+            }
+        } else {
+            self.resolver
+                .infer_type(self.package, self.source, node, depth, 0)?
+        };
         if resolved.is_some() || node.kind() != "identifier" {
             return Ok(resolved);
         }
@@ -245,56 +266,123 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
         }
         Ok(None)
     }
+
+    fn inferred_selector(&mut self, node: Node<'_>, depth: usize) -> Result<Option<Ty<'w>>> {
+        let (receiver_field, name_field) = if node.kind() == "qualified_type" {
+            ("package", "name")
+        } else {
+            ("operand", "field")
+        };
+        let (Some(receiver), Some(name)) = (
+            node.child_by_field_name(receiver_field),
+            node.child_by_field_name(name_field),
+        ) else {
+            return Ok(None);
+        };
+        let name = self.text(name);
+        let symbol = if matches!(receiver.kind(), "identifier" | "package_identifier")
+            && self.locals.lookup(receiver, self.text(receiver)).is_none()
+            && let Some(package) = self.imports.package(self.text(receiver))
+        {
+            if !is_exported(name) {
+                return Ok(None);
+            }
+            self.resolver.find_symbol(package, name, None)?
+        } else if let Some(ty) = self.inferred_at(receiver, depth + 1)? {
+            self.resolver.member_selector(self.package, ty, name)?
+        } else {
+            None
+        };
+        match symbol {
+            Some(symbol) => self.resolver.symbol_type(self.source, &symbol, name, depth),
+            None => Ok(None),
+        }
+    }
 }
 
-pub(super) fn literal_key(node: Node<'_>) -> Option<Node<'_>> {
-    let wrapper = node.parent()?;
-    let key = wrapper.parent()?;
+pub(super) fn literal_key<'t>(parents: Parents<'t, '_>) -> Option<Node<'t>> {
+    let wrapper = parents.at(1)?;
+    let key = parents.at(2)?;
     (wrapper.kind() == "literal_element"
         && key.kind() == "keyed_element"
         && key.child_by_field_name("key") == Some(wrapper))
     .then_some(key)
 }
 
-fn literal_owner<'w>(analysis: &mut Analysis<'_, 'w, '_>, key: Node<'_>) -> Option<Ty<'w>> {
-    let literal = key.parent()?.parent()?;
+fn literal_owner<'w>(analysis: &mut Analysis<'_, 'w, '_>, literal: Node<'_>) -> Option<Ty<'w>> {
     if literal.kind() != "composite_literal" {
         return None;
     }
-    analysis.resolver.source_type(
-        analysis.package,
-        analysis.source,
-        literal.child_by_field_name("type")?,
-    )
+    analysis.source_type(literal.child_by_field_name("type")?)
 }
 
-fn key_shape(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<Option<Shape>> {
-    let Some(ty) = literal_key(node).and_then(|key| literal_owner(analysis, key)) else {
+fn key_shape(
+    analysis: &mut Analysis<'_, '_, '_>,
+    parents: Parents<'_, '_>,
+) -> Result<Option<Shape>> {
+    let Some(ty) = parents
+        .at(4)
+        .and_then(|literal| literal_owner(analysis, literal))
+    else {
         return Ok(None);
     };
     shape(&mut analysis.resolver, &ty)
 }
 
-pub(super) fn is_struct_key(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<bool> {
-    Ok(key_shape(analysis, node)? == Some(Shape::Struct))
+pub(super) fn is_struct_key(
+    analysis: &mut Analysis<'_, '_, '_>,
+    parents: Parents<'_, '_>,
+) -> Result<bool> {
+    Ok(literal_key(parents).is_some() && key_shape(analysis, parents)? == Some(Shape::Struct))
 }
 
 pub(super) fn is_container_key(
     analysis: &mut Analysis<'_, '_, '_>,
-    node: Node<'_>,
+    parents: Parents<'_, '_>,
 ) -> Result<bool> {
     Ok(matches!(
-        key_shape(analysis, node)?,
+        key_shape(analysis, parents)?,
         Some(Shape::Map | Shape::Array | Shape::Slice)
     ))
 }
 
-pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
+pub(super) fn requires_check(kind: &str, blank_value: bool) -> bool {
+    matches!(
+        kind,
+        "call_expression"
+            | "type_conversion_expression"
+            | "return_statement"
+            | "var_spec"
+            | "assignment_statement"
+            | "short_var_declaration"
+            | "if_statement"
+            | "for_clause"
+            | "for_statement"
+            | "keyed_element"
+            | "expression_switch_statement"
+            | "receive_statement"
+            | "range_clause"
+            | "inc_statement"
+            | "dec_statement"
+    ) || blank_value && kind == "identifier"
+}
+
+pub(super) fn check(
+    analysis: &mut Analysis<'_, '_, '_>,
+    node: Node<'_>,
+    parents: Parents<'_, '_>,
+    value_name: bool,
+    returns: Option<&ReturnSlots<'_>>,
+) -> Result<()> {
     match node.kind() {
         "call_expression" | "type_conversion_expression" => check_call(analysis, node)?,
-        "return_statement" => check_return(analysis, node)?,
+        "return_statement" => {
+            if let Some(returns) = returns {
+                check_return(analysis, node, returns)?;
+            }
+        }
         "var_spec" | "assignment_statement" | "short_var_declaration" => {
-            check_assignment(analysis, node)?
+            check_assignment(analysis, node, parents)?
         }
         "if_statement" | "for_clause" | "for_statement" => {
             let condition = node.child_by_field_name("condition").or_else(|| {
@@ -323,7 +411,9 @@ pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
                 .child_by_field_name("key")
                 .and_then(|key| key.named_child(0))
                 && name.kind() == "identifier"
-                && let Some(ty) = literal_owner(analysis, node)
+                && let Some(ty) = parents
+                    .at(2)
+                    .and_then(|literal| literal_owner(analysis, literal))
                 && shape(&mut analysis.resolver, &ty)? == Some(Shape::Struct)
                 && !analysis
                     .resolver
@@ -340,8 +430,8 @@ pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
         "expression_switch_statement" => duplicate_cases(analysis, node),
         "identifier"
             if analysis.text(node) == "_"
-                && unused::value_name(analysis, node)
-                && unused::assignment_target(node).is_none() =>
+                && value_name
+                && unused::assignment_target(parents).is_none() =>
         {
             analysis.error(
                 DiagnosticCode::BlankAsValue,
@@ -441,13 +531,14 @@ fn signature<'w>(analysis: &mut Analysis<'_, 'w, '_>, ty: Ty<'w>) -> Result<Opti
         }
     }
     let parsed;
-    let params = if signature.parameters.is_empty() && signature.origin.function_type().is_none() {
+    let params = if !signature.parameters_known {
         let Some(source) = analysis.resolver.indexes.reference_source(&file)? else {
             return Ok(None);
         };
         let source = source.as_ref();
         let Some(list) = function_at(source, signature.origin.range())
             .and_then(|f| f.child_by_field_name("parameters"))
+            .filter(|list| !list.has_error())
         else {
             return Ok(None);
         };
@@ -651,11 +742,7 @@ fn check_call(analysis: &mut Analysis<'_, '_, '_>, call: Node<'_>) -> Result<()>
         Call::Builtin("print" | "println") => (0, usize::MAX),
         Call::Builtin("recover") => (0, 0),
         Call::Builtin("make") => {
-            let ty = args.first().and_then(|n| {
-                analysis
-                    .resolver
-                    .source_type(analysis.package, analysis.source, *n)
-            });
+            let ty = args.first().and_then(|n| analysis.source_type(*n));
             match ty
                 .as_ref()
                 .map(|t| shape(&mut analysis.resolver, t))
@@ -709,32 +796,51 @@ fn check_call(analysis: &mut Analysis<'_, '_, '_>, call: Node<'_>) -> Result<()>
     Ok(())
 }
 
-fn check_return(analysis: &mut Analysis<'_, '_, '_>, stmt: Node<'_>) -> Result<()> {
-    let Some(function) = std::iter::successors(stmt.parent(), |n| n.parent()).find(|n| {
-        matches!(
-            n.kind(),
-            "func_literal" | "function_declaration" | "method_declaration"
-        )
-    }) else {
-        return Ok(());
-    };
-    let mut results = Vec::new();
-    let mut named = true;
-    if let Some(result) = function.child_by_field_name("result") {
-        if result.kind() == "parameter_list" {
-            for param in children(result) {
-                let names = field_children(param, "name").len();
-                named &= names > 0;
-                results.extend(std::iter::repeat_n(
-                    param.child_by_field_name("type"),
-                    names.max(1),
-                ));
-            }
-        } else {
-            named = false;
-            results.push(Some(result));
+pub(super) enum ReturnSlots<'t> {
+    Empty,
+    Single(Option<Node<'t>>),
+    Tuple {
+        slots: Vec<Option<Node<'t>>>,
+        named: bool,
+    },
+}
+
+impl<'t> ReturnSlots<'t> {
+    pub(super) fn new(function: Node<'t>) -> Self {
+        let Some(result) = function.child_by_field_name("result") else {
+            return Self::Empty;
+        };
+        if result.kind() != "parameter_list" {
+            return Self::Single(Some(result));
+        }
+        let mut named = true;
+        let mut slots = Vec::new();
+        for param in children(result) {
+            let names = field_children(param, "name").len();
+            named &= names > 0;
+            slots.extend(std::iter::repeat_n(
+                param.child_by_field_name("type"),
+                names.max(1),
+            ));
+        }
+        Self::Tuple { slots, named }
+    }
+
+    fn slots(&self) -> (&[Option<Node<'t>>], bool) {
+        match self {
+            Self::Empty => (&[], true),
+            Self::Single(slot) => (std::slice::from_ref(slot), false),
+            Self::Tuple { slots, named } => (slots, *named),
         }
     }
+}
+
+fn check_return(
+    analysis: &mut Analysis<'_, '_, '_>,
+    stmt: Node<'_>,
+    returns: &ReturnSlots<'_>,
+) -> Result<()> {
+    let (results, named) = returns.slots();
     let exprs = children(stmt)
         .into_iter()
         .find(|n| n.kind() == "expression_list")
@@ -754,12 +860,8 @@ fn check_return(analysis: &mut Analysis<'_, '_, '_>, stmt: Node<'_>) -> Result<(
             format!("Expected {} return values, got {count}", results.len()),
         );
     } else {
-        for (ty, value) in results.into_iter().zip(values) {
-            if let Some(ty) = ty.and_then(|n| {
-                analysis
-                    .resolver
-                    .source_type(analysis.package, analysis.source, n)
-            }) {
+        for (ty, value) in results.iter().zip(values) {
+            if let Some(ty) = ty.and_then(|n| analysis.source_type(n)) {
                 value.check(analysis, &ty)?;
             }
         }
@@ -767,7 +869,11 @@ fn check_return(analysis: &mut Analysis<'_, '_, '_>, stmt: Node<'_>) -> Result<(
     Ok(())
 }
 
-fn check_assignment(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
+fn check_assignment(
+    analysis: &mut Analysis<'_, '_, '_>,
+    node: Node<'_>,
+    parents: Parents<'_, '_>,
+) -> Result<()> {
     let var = node.kind() == "var_spec";
     if node.kind() == "assignment_statement" && token(node, "=").is_none() {
         return Ok(());
@@ -801,7 +907,7 @@ fn check_assignment(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
                     .lookup(name, analysis.text(name))
                     .is_some_and(|binding| {
                         analysis.locals.declared_in_same_block(
-                            node,
+                            parents,
                             analysis.text(name),
                             binding.name,
                         )
@@ -816,9 +922,7 @@ fn check_assignment(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
             continue;
         }
         let expected = if let Some(ty) = annotation {
-            analysis
-                .resolver
-                .source_type(analysis.package, analysis.source, ty)
+            analysis.source_type(ty)
         } else if existing && analysis.text(name) != "_" {
             analysis.inferred(name)?
         } else {
@@ -852,6 +956,24 @@ fn check_types<'w>(
     value: Node<'_>,
     untyped: bool,
 ) -> Result<()> {
+    if expected.pointers == actual.pointers
+        && std::ptr::eq(expected.package, actual.package)
+        && let (
+            TypeKind::Named {
+                name: expected_name,
+                arguments: expected_arguments,
+            },
+            TypeKind::Named {
+                name: actual_name,
+                arguments: actual_arguments,
+            },
+        ) = (&expected.kind, &actual.kind)
+        && expected_name == actual_name
+        && expected_arguments.is_empty()
+        && actual_arguments.is_empty()
+    {
+        return Ok(());
+    }
     let (Some(left), Some(right)) = (
         shape(&mut analysis.resolver, expected)?,
         shape(&mut analysis.resolver, actual)?,

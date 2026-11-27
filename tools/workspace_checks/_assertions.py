@@ -100,10 +100,10 @@ def check_references(client, query, expected, *, include_declaration=False):
     result = client.request("textDocument/references", **reference_params(query, include_declaration))
     if result is not None and not isinstance(result, list):
         raise RuntimeError(f"expected an array of references, received {result!r}")
-    actual = [
+    actual = sorted(
         location_key(Path(location["path"]), location["range"])
         for location in normalize_locations(result)
-    ]
+    )
     targets = sorted(location_key(target.path, target.selection()) for target in expected)
     if actual != targets:
         raise RuntimeError(

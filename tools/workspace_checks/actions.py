@@ -112,7 +112,7 @@ def check_code_actions(executable, root, timeout):
             raise RuntimeError("organizeImports was not idempotent")
 
     gate = PausedGoList(root / "control", timeout)
-    with capability_session(executable, project, timeout, PULL, environment=gate.environment) as (client, _):
+    with capability_session(executable, project, timeout, PULL, **gate.environment) as (client, _):
         gate.fail_next()
         unsorted = 'package sample\nimport (\n\t"strings"\n\t"fmt"\n)\n'
         client.open_document(imports, unsorted)

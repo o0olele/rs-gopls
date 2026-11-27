@@ -17,7 +17,7 @@ fn request(
 
 fn start(project: &TestProject, capabilities: Value) -> (TestSession, State) {
     let session = TestSession::new();
-    let mut state = State::Starting;
+    let mut state = State::starting();
     request(
         &session,
         &mut state,
@@ -165,15 +165,15 @@ fn waits_for_latest_test_graph_and_preserves_pending_queries_across_edits() {
     );
     session.assert_no_messages();
 
-    running(&mut state)
-        .workspace_loaded(
-            session.server(),
-            WorkspaceResult {
-                load: regular,
-                result: Ok(project.workspace(&["disk.go"], false)),
-            },
-        )
-        .unwrap();
+    let State::Running(server) = &mut state else {
+        unreachable!()
+    };
+    let update = WorkspaceResult::for_test(
+        &server.engine,
+        regular,
+        Ok(project.workspace(&["disk.go"], false)),
+    );
+    server.workspace_loaded(session.server(), update).unwrap();
     let pending = running(&mut state);
     assert_eq!(pending.pending.len(), 1);
     let old_test_graph = pending.requested.take().unwrap();
@@ -191,15 +191,15 @@ fn waits_for_latest_test_graph_and_preserves_pending_queries_across_edits() {
         json!({"changes": [{"uri": path_uri(&created).unwrap(), "type": 1}]}),
         notifications(&mut state),
     );
-    running(&mut state)
-        .workspace_loaded(
-            session.server(),
-            WorkspaceResult {
-                load: old_test_graph,
-                result: Ok(project.workspace(&["disk.go"], true)),
-            },
-        )
-        .unwrap();
+    let State::Running(server) = &mut state else {
+        unreachable!()
+    };
+    let update = WorkspaceResult::for_test(
+        &server.engine,
+        old_test_graph,
+        Ok(project.workspace(&["disk.go"], true)),
+    );
+    server.workspace_loaded(session.server(), update).unwrap();
     let pending = running(&mut state);
     assert_eq!(pending.pending.len(), 1);
     assert!(pending.searches.is_empty());
@@ -209,15 +209,12 @@ fn waits_for_latest_test_graph_and_preserves_pending_queries_across_edits() {
         current_test_graph.generation > old_test_graph.generation
             && current_test_graph.include_tests
     );
-    pending
-        .workspace_loaded(
-            session.server(),
-            WorkspaceResult {
-                load: current_test_graph,
-                result: Ok(project.workspace(&["disk.go", "created.go"], true)),
-            },
-        )
-        .unwrap();
+    let update = WorkspaceResult::for_test(
+        &pending.engine,
+        current_test_graph,
+        Ok(project.workspace(&["disk.go", "created.go"], true)),
+    );
+    pending.workspace_loaded(session.server(), update).unwrap();
     finish_searches(&session, &mut state);
     let result = session.response(1).result.unwrap();
     assert_eq!(result.as_array().unwrap().len(), 2);

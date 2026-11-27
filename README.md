@@ -163,4 +163,39 @@ Use `-PrepareOnly` to stage a new server build in the isolated profile without o
 }
 ```
 
-For a legacy GOPATH project, also set `lsp.rs-gopls.binary.env.GO111MODULE` to `"off"` and set `lsp.rs-gopls.binary.env.GOPATH` if needed. Zed can use `lsp.rs-gopls.binary.path` when you want to point the extension at a different local build.
+### Configure the Go environment in Zed
+
+With the opt-in extension enabled, set `lsp.rs-gopls.initialization_options.env` in the project's `.zed/settings.json`. Replace the placeholders with absolute paths. The example sets two GOPATH entries using the Windows path list separator.
+
+```json
+{
+  "lsp": {
+    "rs-gopls": {
+      "binary": { "path": "<RS_GOPLS_BINARY>" },
+      "initialization_options": {
+        "env": { "GOPATH": "<WORKSPACE>\\serverbase;<WORKSPACE>\\server" }
+      }
+    }
+  }
+}
+```
+
+To use Zed's built-in Go adapter, select `gopls` for Go and point `lsp.gopls.binary.path` at the `rs-gopls` executable. Keep the Go environment under `lsp.gopls.initialization_options.env`.
+
+```json
+{
+  "languages": {
+    "Go": { "language_servers": ["gopls"] }
+  },
+  "lsp": {
+    "gopls": {
+      "binary": { "path": "<RS_GOPLS_BINARY>" },
+      "initialization_options": {
+        "env": { "GOPATH": "<WORKSPACE>\\serverbase;<WORKSPACE>\\server" }
+      }
+    }
+  }
+}
+```
+
+`binary.env` contributes to the server's startup environment. The session's `initialization_options.env` overrides matching startup values. With the opt-in extension, set `lsp.rs-gopls.settings.env` to update the environment and reload the package graph without restarting the server. Each supplied `env` object replaces the entire session override. Set `env` to `{}` to restore the startup environment, or omit `env` to keep the current override. Empty strings are passed to Go as supplied, so `"GOWORK": ""` overrides an inherited value and lets Go discover its workspace.

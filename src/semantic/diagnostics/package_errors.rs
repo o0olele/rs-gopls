@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use lsp_types::Position;
 
 use super::syntax::visible_range;
@@ -7,6 +9,90 @@ use super::{
 };
 use crate::workspace::{PackageErrorKind, PackageLoadError, path_key};
 
+pub(super) struct PackageErrorContext<'w> {
+    key: PathBuf,
+    tests: bool,
+    package: Option<&'w Package>,
+    group_id: Option<usize>,
+    group_scope: Option<usize>,
+}
+
+impl<'w> PackageErrorContext<'w> {
+    pub(super) fn new(
+        graph: &Workspace,
+        path: &Path,
+        package: Option<&'w Package>,
+        group_id: Option<usize>,
+    ) -> Self {
+        Self {
+            key: path_key(path),
+            tests: is_test_source(path),
+            package,
+            group_id,
+            group_scope: graph.group_scope_for_path(path),
+        }
+    }
+
+    /// Returns whether an applicable error has a position in this document.
+    pub(super) fn position(
+        &self,
+        graph: &Workspace,
+        error: &PackageLoadError,
+        matches_name: impl FnOnce(&str) -> bool,
+    ) -> Option<bool> {
+        if error.kind == PackageErrorKind::Group {
+            return (self.group_scope == Some(error.group_id)).then_some(false);
+        }
+        let positioned = error
+            .path
+            .as_ref()
+            .is_some_and(|path| path_key(path) == self.key);
+        // A broken dependency outside the roots can have a source position
+        // without a package node or registered folder.
+        let same_context = self
+            .group_id
+            .map_or(positioned, |group| group == error.group_id);
+        let tested = tested_package(error);
+        if !same_context || !self.tests && tested.is_some() {
+            return None;
+        }
+        if positioned {
+            return Some(true);
+        }
+        // A test compilation can fail in a shared source file. Report that
+        // failure at its test package's clause when visiting a test file.
+        if error
+            .path
+            .as_deref()
+            .is_some_and(|path| tested.is_none() || is_test_source(path))
+        {
+            return None;
+        }
+        let owner_matches = match unpositioned_package(graph, error) {
+            Some(owner) => {
+                self.tests != owner.is_production()
+                    && self.package.is_some_and(|package| package.id == owner.id)
+            }
+            None => {
+                self.tests == tested.is_some()
+                    && error
+                        .package_dir
+                        .as_deref()
+                        .is_some_and(|dir| self.key.parent() == Some(path_key(dir).as_path()))
+                    && (error.package_name.is_empty() || matches_name(&error.package_name))
+                    && self.package.is_none_or(|package| {
+                        let raw = error
+                            .import_path
+                            .split_once(" [")
+                            .map_or(error.import_path.as_str(), |(raw, _)| raw);
+                        package.import_path() == raw && package.test_of() == tested
+                    })
+            }
+        };
+        owner_matches.then_some(false)
+    }
+}
+
 pub(super) fn collect_package_errors(
     graph: &Workspace,
     document: &DocumentSnapshot<'_>,
@@ -14,9 +100,7 @@ pub(super) fn collect_package_errors(
     group_id: Option<usize>,
     syntax: &[DiagnosticItem],
 ) -> Vec<DiagnosticItem> {
-    let key = path_key(document.path());
-    let tests = is_test_source(document.path());
-    let group_scope = graph.group_scope_for_path(document.path());
+    let context = PackageErrorContext::new(graph, document.path(), package, group_id);
     let root = document.root_node();
     let fallback = root
         .named_children(&mut root.walk())
@@ -26,64 +110,15 @@ pub(super) fn collect_package_errors(
         .package_errors()
         .iter()
         .filter_map(|error| {
-            let positioned = error
-                .path
-                .as_ref()
-                .is_some_and(|path| path_key(path) == key);
-            let same_context = if error.kind == PackageErrorKind::Group {
-                group_scope == Some(error.group_id)
-            } else {
-                // A broken dependency outside the roots might have a Go
-                // source position without a package node or registered folder.
-                group_id.map_or(positioned, |group| group == error.group_id)
-            };
-            let tested = tested_package(error);
-            if !same_context || !tests && tested.is_some() {
-                return None;
-            }
+            let positioned = context.position(graph, error, |name| {
+                document.outline().package.as_deref() == Some(name)
+            })?;
             if error.kind != PackageErrorKind::Group
                 && document.version().is_some()
                 && syntax.is_empty()
                 && is_parse_error(&error.message)
             {
                 return None;
-            }
-            // A test compilation can fail in a shared source file. Report that
-            // failure at its test package's clause when visiting a test file.
-            if !positioned {
-                if error
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| tested.is_none() || is_test_source(path))
-                {
-                    return None;
-                }
-                let owner_matches = match unpositioned_package(graph, error) {
-                    Some(owner) => {
-                        tests != owner.is_production()
-                            && package.is_some_and(|package| package.id == owner.id)
-                    }
-                    None => {
-                        tests == tested.is_some()
-                            && error
-                                .package_dir
-                                .as_deref()
-                                .is_some_and(|dir| key.parent() == Some(path_key(dir).as_path()))
-                            && (error.package_name.is_empty()
-                                || document.outline().package.as_deref()
-                                    == Some(&error.package_name))
-                            && package.is_none_or(|package| {
-                                let raw = error
-                                    .import_path
-                                    .split_once(" [")
-                                    .map_or(error.import_path.as_str(), |(raw, _)| raw);
-                                package.import_path() == raw && package.test_of() == tested
-                            })
-                    }
-                };
-                if error.kind != PackageErrorKind::Group && !owner_matches {
-                    return None;
-                }
             }
             let line = if positioned { error.line } else { None };
             let bytes = line

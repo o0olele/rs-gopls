@@ -197,6 +197,13 @@ pub(crate) fn incoming_calls(
 }
 
 impl SemanticTask<Option<Vec<CallHierarchyIncomingCall>>> for IncomingCallsTask {
+    fn ready(&self, engine: &Engine) -> bool {
+        self.references
+            .search
+            .as_ref()
+            .is_none_or(|search| search.ready(engine))
+    }
+
     fn advance(&mut self, engine: &mut Engine) -> Result<bool> {
         ensure!(
             engine.workspace_load().generation == self.generation,

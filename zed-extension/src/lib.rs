@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use zed_extension_api as zed;
+use zed_extension_api::{self as zed, settings::LspSettings};
 
 struct RsGoplsExtension;
 
@@ -32,6 +32,14 @@ impl zed::Extension for RsGoplsExtension {
             args: Vec::new(),
             env: worktree.shell_env(),
         })
+    }
+
+    fn language_server_workspace_configuration(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> zed::Result<Option<zed::serde_json::Value>> {
+        Ok(LspSettings::for_worktree(language_server_id.as_ref(), worktree)?.settings)
     }
 }
 

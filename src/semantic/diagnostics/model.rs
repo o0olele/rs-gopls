@@ -4,45 +4,51 @@ use std::path::PathBuf;
 use lsp_types::{Diagnostic, NumberOrString, Position, Range};
 use serde::{Serialize, Serializer};
 
-use crate::semantic::index::text_fingerprint;
-use crate::semantic::snapshot::DocumentSnapshot;
-use crate::workspace::path_key;
+use crate::workspace::DiagnosticFileStamp;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum DiagnosticDocumentRevision {
+    Open {
+        version: i32,
+        fingerprint: u64,
+    },
+    Disk {
+        stamp: DiagnosticFileStamp,
+        epoch: u64,
+    },
+}
+
+impl DiagnosticDocumentRevision {
+    fn version(self) -> Option<i32> {
+        match self {
+            Self::Open { version, .. } => Some(version),
+            Self::Disk { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct DiagnosticSnapshotKey {
     pub(crate) path_key: PathBuf,
     pub(crate) version: Option<i32>,
-    pub(crate) text_fingerprint: u64,
-    pub(crate) graph_generation: u64,
-    pub(crate) includes_tests: bool,
+    pub(super) revision: DiagnosticDocumentRevision,
+    pub(crate) partial: bool,
+    pub(super) semantic_inputs: u64,
 }
 
 impl DiagnosticSnapshotKey {
-    pub(crate) fn new(
-        document: &DocumentSnapshot<'_>,
-        graph_generation: u64,
-        includes_tests: bool,
+    pub(super) fn new(
+        path_key: PathBuf,
+        revision: DiagnosticDocumentRevision,
+        semantic_inputs: Option<u64>,
     ) -> Self {
         Self {
-            path_key: path_key(document.path()),
-            version: document.version(),
-            text_fingerprint: text_fingerprint(document.text()),
-            graph_generation,
-            includes_tests,
+            path_key,
+            version: revision.version(),
+            revision,
+            partial: semantic_inputs.is_none(),
+            semantic_inputs: semantic_inputs.unwrap_or_default(),
         }
-    }
-
-    pub(crate) fn matches(
-        &self,
-        document: &DocumentSnapshot<'_>,
-        graph_generation: u64,
-        includes_tests: bool,
-    ) -> bool {
-        self.graph_generation == graph_generation
-            && self.includes_tests == includes_tests
-            && self.version == document.version()
-            && self.path_key == path_key(document.path())
-            && self.text_fingerprint == text_fingerprint(document.text())
     }
 
     pub(crate) fn result_id(&self, content_hash: u64) -> String {
@@ -304,16 +310,18 @@ fn hash(value: impl Hash) -> u64 {
 mod tests {
     use super::*;
     use crate::semantic::Engine;
+    use crate::semantic::diagnostics::snapshot_key_for_path;
     use crate::test_support::TestProject;
 
     fn snapshot_key() -> DiagnosticSnapshotKey {
-        DiagnosticSnapshotKey {
-            path_key: "sample.go".into(),
-            version: Some(7),
-            text_fingerprint: text_fingerprint("package sample\n"),
-            graph_generation: 2,
-            includes_tests: false,
-        }
+        DiagnosticSnapshotKey::new(
+            "sample.go".into(),
+            DiagnosticDocumentRevision::Open {
+                version: 7,
+                fingerprint: 1,
+            },
+            Some(2),
+        )
     }
 
     fn columns(start: u32, end: u32) -> Range {
@@ -384,7 +392,7 @@ mod tests {
         assert_ne!(report.result_id, changed.result_id);
 
         let next = DiagnosticSnapshotKey {
-            graph_generation: 3,
+            semantic_inputs: 3,
             ..snapshot
         };
         let next = DiagnosticReport::new(next, items, false);
@@ -392,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_key_checks_document_identity_revision_and_graph() {
+    fn snapshot_key_checks_document_identity_and_revision() {
         let project = TestProject::new();
         let text = "package sample\n";
         let path = project.write("sample.go", text);
@@ -402,31 +410,29 @@ mod tests {
         engine.open(other_path.clone(), text.into(), 7).unwrap();
 
         let key = {
-            let mut snapshot = engine.snapshot();
-            let document = snapshot.document(&path).unwrap().unwrap();
-            let key = DiagnosticSnapshotKey::new(&document, 2, false);
-            assert!(key.matches(&document, 2, false));
-            assert!(!key.matches(&document, 3, false));
-            assert!(!key.matches(&document, 2, true));
-            assert!(!key.matches(&snapshot.document(&other_path).unwrap().unwrap(), 2, false));
+            let snapshot = engine.snapshot();
+            let key = snapshot_key_for_path(&snapshot, &path).unwrap();
+            assert_eq!(key, snapshot_key_for_path(&snapshot, &path).unwrap());
+            assert_ne!(key, snapshot_key_for_path(&snapshot, &other_path).unwrap());
             key
         };
 
         for (version, text) in [(8, text), (7, "package sample\nvar changed int\n")] {
             engine.open(path.clone(), text.into(), version).unwrap();
-            let document = engine.snapshot().document(&path).unwrap().unwrap();
-            assert!(!key.matches(&document, 2, false));
+            assert_ne!(
+                key,
+                snapshot_key_for_path(&engine.snapshot(), &path).unwrap()
+            );
         }
 
         engine.close(&path);
-        let mut snapshot = engine.snapshot();
-        let document = snapshot.document(&path).unwrap().unwrap();
-        assert!(!key.matches(&document, 2, false));
-        let disk_key = DiagnosticSnapshotKey::new(&document, 2, false);
+        let snapshot = engine.snapshot();
+        let disk_key = snapshot_key_for_path(&snapshot, &path).unwrap();
+        assert_ne!(key, disk_key);
         assert_eq!(disk_key.version, None);
-        assert!(disk_key.matches(&document, 2, false));
+        assert_eq!(disk_key, snapshot_key_for_path(&snapshot, &path).unwrap());
         project.write("sample.go", "package changed\n");
-        assert!(!disk_key.matches(&snapshot.document(&path).unwrap().unwrap(), 2, false));
+        assert_ne!(disk_key, snapshot_key_for_path(&snapshot, &path).unwrap());
     }
 
     #[test]

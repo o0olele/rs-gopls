@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use anyhow::Result;
 use lsp_types::{
@@ -65,23 +64,6 @@ pub(in crate::semantic) struct Description {
     pub(super) label_suffix: Option<String>,
     pub(super) deprecated: bool,
     pub(super) has_parameters: bool,
-    docs: Option<Rc<str>>,
-}
-
-impl Description {
-    pub(super) fn with_kind(mut self, kind: CompletionItemKind, detect_deprecation: bool) -> Self {
-        if self.kind != CompletionItemKind::CONSTANT {
-            self.kind = kind;
-        }
-        self.deprecated &= detect_deprecation;
-        self
-    }
-
-    pub(super) fn markup(&self, caps: &CompletionClientCapabilities) -> Option<Documentation> {
-        self.docs
-            .as_deref()
-            .map(|docs| documentation_markup(docs.to_owned(), caps))
-    }
 }
 
 fn owner(token: Node<'_>) -> Option<Node<'_>> {
@@ -122,17 +104,15 @@ pub(in crate::semantic) fn describe(
         name,
         default_kind,
         detect_deprecation,
-        false,
     )
 }
 
-pub(in crate::semantic) fn describe_token(
+fn describe_token(
     token: Option<Node<'_>>,
     text: &str,
     name: &str,
     default_kind: CompletionItemKind,
     detect_deprecation: bool,
-    keep_docs: bool,
 ) -> Description {
     let mut description = Description {
         kind: default_kind,
@@ -140,7 +120,6 @@ pub(in crate::semantic) fn describe_token(
         label_suffix: None,
         deprecated: false,
         has_parameters: false,
-        docs: None,
     };
     let Some(owner) = token.and_then(owner) else {
         return description;
@@ -191,12 +170,8 @@ pub(in crate::semantic) fn describe_token(
             |ty| format!("{prefix} {name} {}", syntax_text(ty, text)),
         ));
     }
-    if detect_deprecation || keep_docs {
-        let docs = documentation(owner, text);
-        description.deprecated = detect_deprecation && docs.contains("Deprecated:");
-        if keep_docs && !docs.is_empty() {
-            description.docs = Some(docs.into());
-        }
+    if detect_deprecation {
+        description.deprecated = documentation(owner, text).contains("Deprecated:");
     }
     description
 }
@@ -418,14 +393,7 @@ pub(super) fn target_markup(
     target: &Target,
     caps: &CompletionClientCapabilities,
 ) -> Option<Documentation> {
-    let key = path_key(&target.file);
-    if let Some(presentation) = indexes
-        .known_index(&key)
-        .and_then(|index| index.presentation.get(&target.range))
-    {
-        return presentation.markup(caps);
-    }
-    let source = indexes.reference_source(&target.file).ok()??;
+    let source = indexes.declaration_source(&target.file).ok()??;
     markup(source.as_ref(), target.range, caps)
 }
 

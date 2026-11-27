@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use lsp_types::Range;
 use tree_sitter::{Node, Tree};
@@ -103,6 +104,7 @@ pub(crate) struct FunctionSignature {
     pub(crate) result_tuple: Option<Range>,
     pub(crate) results: Arc<[Option<TypeRef>]>,
     pub(crate) parameters: Vec<Option<TypeRef>>,
+    pub(crate) parameters_known: bool,
     pub(crate) variadic: bool,
     pub(crate) type_parameters: Vec<GenericParameter>,
 }
@@ -153,6 +155,7 @@ pub(crate) struct TypeDetails {
     pub(crate) alias: Option<TypeRef>,
     pub(crate) underlying: Option<TypeRef>,
     pub(crate) interface: bool,
+    pub(crate) structure: bool,
     pub(crate) method_names: Vec<String>,
     pub(crate) embedded: Vec<TypeRef>,
     pub(crate) parameters: Vec<GenericParameter>,
@@ -189,6 +192,7 @@ impl FileSymbols {
             .map(|(name, member)| (name.as_str(), member))
     }
 
+    #[cfg(test)]
     pub(crate) fn members(&self) -> impl Iterator<Item = (&str, &Symbol)> {
         self.members
             .values()
@@ -255,14 +259,77 @@ pub(crate) struct FileOutline {
 }
 
 pub(crate) fn collect_outline(tree: &Tree, text: &str) -> FileOutline {
+    collect_outline_with(tree, text, true, None, None)
+}
+
+pub(crate) type MethodNames = HashMap<String, HashSet<String>>;
+
+pub(crate) fn diagnostic_method_names(
+    tree: &Tree,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<MethodNames> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let collector = OutlineCollector {
+        text,
+        details: false,
+        methods: None,
+        cancelled,
+    };
+    let mut methods = MethodNames::new();
+    for (i, node) in root.named_children(&mut cursor).enumerate() {
+        if i & 1023 == 0 && is_cancelled(cancelled) {
+            break;
+        }
+        if node.kind() == "method_declaration"
+            && let Some(symbol) = collector.callable(node)
+            && let Some(receiver) = symbol.receiver
+        {
+            methods
+                .entry(receiver.base)
+                .or_default()
+                .insert(symbol.name);
+        }
+    }
+    anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
+    Ok(methods)
+}
+
+pub(crate) fn collect_diagnostic_outline(
+    tree: &Tree,
+    text: &str,
+    methods: &MethodNames,
+    cancelled: Option<&AtomicBool>,
+) -> anyhow::Result<FileOutline> {
+    let outline = collect_outline_with(tree, text, false, Some(methods), cancelled);
+    anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
+    Ok(outline)
+}
+
+fn collect_outline_with(
+    tree: &Tree,
+    text: &str,
+    details: bool,
+    methods: Option<&MethodNames>,
+    cancelled: Option<&AtomicBool>,
+) -> FileOutline {
     let mut outline = FileOutline {
         package: None,
         symbols: Vec::new(),
     };
     let root = tree.root_node();
     let mut cursor = root.walk();
-    let collector = OutlineCollector { text };
+    let collector = OutlineCollector {
+        text,
+        details,
+        methods,
+        cancelled,
+    };
     for node in root.named_children(&mut cursor) {
+        if is_cancelled(cancelled) {
+            break;
+        }
         collector.top_level(node, &mut outline);
     }
     outline
@@ -270,6 +337,9 @@ pub(crate) fn collect_outline(tree: &Tree, text: &str) -> FileOutline {
 
 struct OutlineCollector<'a> {
     text: &'a str,
+    details: bool,
+    methods: Option<&'a MethodNames>,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 impl<'a> OutlineCollector<'a> {
@@ -323,6 +393,9 @@ impl<'a> OutlineCollector<'a> {
     ) {
         let mut cursor = list.walk();
         for spec in list.named_children(&mut cursor) {
+            if is_cancelled(self.cancelled) {
+                break;
+            }
             let range = declaration.unwrap_or(spec);
             match spec.kind() {
                 "const_spec" => {
@@ -353,6 +426,15 @@ impl<'a> OutlineCollector<'a> {
         kind: OutlineKind,
         symbols: &mut Vec<OutlineSymbol>,
     ) {
+        let mut cursor = spec.walk();
+        let names = spec
+            .children_by_field_name("name", &mut cursor)
+            .filter(|node| node.kind() == "identifier")
+            .take_while(|_| !is_cancelled(self.cancelled));
+        if !self.details {
+            symbols.extend(names.filter_map(|name| self.symbol(name, declaration, kind)));
+            return;
+        }
         let ty = initializer.child_by_field_name("type");
         let values = initializer.child_by_field_name("value");
         let mut value_cursor = initializer.walk();
@@ -365,11 +447,7 @@ impl<'a> OutlineCollector<'a> {
         let first = expressions.next();
         let shared = expressions.peek().is_none();
         let mut ordered_values = first.into_iter().chain(expressions);
-        let mut cursor = spec.walk();
-        for name in spec
-            .children_by_field_name("name", &mut cursor)
-            .filter(|node| node.kind() == "identifier")
-        {
+        for name in names {
             let value = if shared { first } else { ordered_values.next() };
             let Some(mut symbol) = self.symbol(name, declaration, kind) else {
                 continue;
@@ -397,7 +475,9 @@ impl<'a> OutlineCollector<'a> {
             _ => OutlineKind::Class,
         };
         let mut symbol = self.symbol(name, declaration, kind)?;
-        if let Some(ty) = ty {
+        if self.details
+            && let Some(ty) = ty
+        {
             let detail = self.type_detail(ty, inline);
             symbol.detail = Some(if alias {
                 format!("= {detail}")
@@ -406,23 +486,42 @@ impl<'a> OutlineCollector<'a> {
             });
         }
         if let Some(inline) = inline {
-            symbol.children = self.members(inline);
+            if self.details {
+                symbol.children = self.members(inline, None);
+            } else if kind == OutlineKind::Struct
+                && let Some(names) = self.methods.and_then(|methods| methods.get(&symbol.name))
+            {
+                symbol.children = self.members(inline, Some(names));
+            }
         }
         Some(symbol)
     }
 
-    fn members(&self, inline: Node<'_>) -> Option<Rc<[OutlineSymbol]>> {
+    fn members(
+        &self,
+        inline: Node<'_>,
+        filter: Option<&HashSet<String>>,
+    ) -> Option<Rc<[OutlineSymbol]>> {
         let mut members = Vec::new();
-        self.collect_members(inline, &mut members);
+        self.collect_members(inline, filter, &mut members);
         (!members.is_empty()).then(|| members.into())
     }
 
-    fn collect_members(&self, list: Node<'_>, members: &mut Vec<OutlineSymbol>) {
+    fn collect_members(
+        &self,
+        list: Node<'_>,
+        filter: Option<&HashSet<String>>,
+        members: &mut Vec<OutlineSymbol>,
+    ) {
         let mut cursor = list.walk();
+        let mut names = list.walk();
         for member in list.named_children(&mut cursor) {
+            if is_cancelled(self.cancelled) {
+                break;
+            }
             match member.kind() {
-                "field_declaration_list" | "ERROR" => self.collect_members(member, members),
-                "field_declaration" => self.fields(member, members),
+                "field_declaration_list" | "ERROR" => self.collect_members(member, filter, members),
+                "field_declaration" => self.fields(member, &mut names, filter, members),
                 "method_elem" => members.extend(self.callable(member)),
                 "type_elem" => members.extend(self.embedded_interface(member)),
                 _ => {}
@@ -430,20 +529,39 @@ impl<'a> OutlineCollector<'a> {
         }
     }
 
-    fn fields(&self, field: Node<'_>, members: &mut Vec<OutlineSymbol>) {
+    fn fields<'t>(
+        &self,
+        field: Node<'t>,
+        cursor: &mut tree_sitter::TreeCursor<'t>,
+        filter: Option<&HashSet<String>>,
+        members: &mut Vec<OutlineSymbol>,
+    ) {
         let Some(ty) = field.child_by_field_name("type") else {
             return;
         };
-        let mut cursor = field.walk();
-        let mut names = field.children_by_field_name("name", &mut cursor).peekable();
+        let matches = |name: Node<'_>| filter.is_none_or(|names| names.contains(self.text(name)));
+        let mut names = field.children_by_field_name("name", cursor).peekable();
         if names.peek().is_none() {
             if let Some(syntax) = named_type_syntax(ty)
+                && matches(syntax.name)
                 && let Some(mut symbol) = self.symbol(syntax.name, field, OutlineKind::Field)
             {
-                let spelling = self.text(field);
-                symbol.detail = (spelling != symbol.name).then(|| spelling.to_owned());
+                if self.details {
+                    let spelling = self.text(field);
+                    symbol.detail = (spelling != symbol.name).then(|| spelling.to_owned());
+                }
                 members.push(symbol);
             }
+            return;
+        }
+
+        if !self.details {
+            members.extend(
+                names
+                    .take_while(|_| !is_cancelled(self.cancelled))
+                    .filter(|name| matches(*name))
+                    .filter_map(|name| self.symbol(name, field, OutlineKind::Field)),
+            );
             return;
         }
 
@@ -456,7 +574,7 @@ impl<'a> OutlineCollector<'a> {
                 }
             })
             .and_then(outline_inline_type);
-        let children = inline.and_then(|inline| self.members(inline));
+        let children = inline.and_then(|inline| self.members(inline, None));
         let ty_detail = self.type_detail(ty, inline);
         let detail = match field.child_by_field_name("tag") {
             Some(tag) => format!("{ty_detail} {}", self.text(tag)),
@@ -510,11 +628,16 @@ impl<'a> OutlineCollector<'a> {
             }
             symbol.receiver = Some(OutlineReceiver {
                 base: self.name(named.name)?.to_owned(),
-                spelling: self.text(ty).to_owned(),
+                spelling: if self.details {
+                    self.text(ty).to_owned()
+                } else {
+                    String::new()
+                },
             });
         }
-        let parameters = declaration.child_by_field_name("parameters");
-        if let Some(parameters) = parameters {
+        if self.details
+            && let Some(parameters) = declaration.child_by_field_name("parameters")
+        {
             let start = declaration
                 .child_by_field_name("type_parameters")
                 .unwrap_or(parameters);
@@ -544,7 +667,8 @@ impl<'a> OutlineCollector<'a> {
         {
             return None;
         }
-        if range == selection_range
+        if self.details
+            && range == selection_range
             && let Some(parent) = declaration.parent()
         {
             // Bare embeddings and implicit const specs can be a single token.
@@ -612,17 +736,42 @@ pub(crate) fn collect(
     tree: &Tree,
     text: &str,
     range: impl Fn(Node<'_>) -> Range,
+    visit: impl FnMut(Node<'_>, &str, &Symbol),
+) -> FileSymbols {
+    collect_symbols(tree, text, range, visit, None)
+}
+
+pub(crate) fn collect_cancellable(
+    tree: &Tree,
+    text: &str,
+    range: impl Fn(Node<'_>) -> Range,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<FileSymbols> {
+    let symbols = collect_symbols(tree, text, range, |_, _, _| {}, Some(cancelled));
+    anyhow::ensure!(!cancelled.load(Relaxed), "diagnostics cancelled");
+    Ok(symbols)
+}
+
+fn collect_symbols(
+    tree: &Tree,
+    text: &str,
+    range: impl Fn(Node<'_>) -> Range,
     mut visit: impl FnMut(Node<'_>, &str, &Symbol),
+    cancelled: Option<&AtomicBool>,
 ) -> FileSymbols {
     let mut indexer = Indexer {
         text,
         range: &range,
         visit: &mut visit,
         symbols: FileSymbols::default(),
+        cancelled,
     };
     let root = tree.root_node();
     let mut cursor = root.walk();
     for declaration in root.named_children(&mut cursor) {
+        if is_cancelled(cancelled) {
+            break;
+        }
         indexer.declaration(declaration);
     }
     indexer.symbols
@@ -633,6 +782,7 @@ struct Indexer<'a> {
     range: &'a dyn Fn(Node<'_>) -> Range,
     visit: &'a mut dyn FnMut(Node<'_>, &str, &Symbol),
     symbols: FileSymbols,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 impl Indexer<'_> {
@@ -641,6 +791,9 @@ impl Indexer<'_> {
         match declaration.kind() {
             "var_declaration" | "var_spec_list" | "const_declaration" | "type_declaration" => {
                 for spec in declaration.named_children(&mut cursor) {
+                    if is_cancelled(self.cancelled) {
+                        break;
+                    }
                     self.declaration(spec);
                 }
             }
@@ -663,10 +816,14 @@ impl Indexer<'_> {
             .children_by_field_name("name", &mut cursor)
             .filter(|node| node.kind() == "identifier");
         let ty = declaration.child_by_field_name("type");
-        let explicit_type = ty.and_then(|node| type_ref(node, self.text, self.range));
+        let explicit_type =
+            ty.and_then(|node| type_ref_inner(node, self.text, self.range, self.cancelled));
         let values = declaration.child_by_field_name("value");
         let variable = declaration.kind() == "var_spec";
         for (index, name) in names.enumerate() {
+            if is_cancelled(self.cancelled) {
+                break;
+            }
             let kind = if variable
                 && ty.is_none()
                 && let (Some(initializer), result_index) = initializer_at(values, index)
@@ -713,28 +870,32 @@ impl Indexer<'_> {
             parameters: type_parameters(declaration, self.text, self.range),
             ..TypeDetails::default()
         };
-        let underlying = type_ref(ty, self.text, self.range);
         if declaration.kind() == "type_alias" {
-            details.alias = underlying;
-        } else if let Some(TypeRef {
-            pointers: 0,
-            kind: TypeRefKind::Inline(inline),
-        }) = underlying
-        {
+            details.alias = type_ref_inner(ty, self.text, self.range, self.cancelled);
+        } else if let Some(node) = outline_inline_type(ty) {
+            // Named declarations store members separately. Structural fields
+            // are needed only for inline and alias type references.
+            let inline = inline_type(node, self.text, self.range, self.cancelled, false);
             details.interface = inline.interface;
+            details.structure = !inline.interface;
             details.has_type_terms = inline.has_type_terms;
             if inline.interface {
                 details.method_names = inline.members.keys().cloned().collect();
             }
-            details.embedded = inline.embedded.clone();
+            details.embedded = inline.embedded;
             let members = self.symbols.members.entry(owner.to_owned()).or_default();
-            for (name, symbol) in &inline.members {
-                members
-                    .entry(name.clone())
-                    .or_insert_with(|| symbol.clone());
+            if members.is_empty() {
+                *members = inline.members;
+            } else {
+                for (name, symbol) in inline.members {
+                    if is_cancelled(self.cancelled) {
+                        return;
+                    }
+                    members.entry(name).or_insert(symbol);
+                }
             }
         } else {
-            details.underlying = underlying;
+            details.underlying = type_ref_inner(ty, self.text, self.range, self.cancelled);
         }
         self.symbols
             .types
@@ -815,8 +976,24 @@ pub(crate) fn type_ref(
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
 ) -> Option<TypeRef> {
+    type_ref_inner(node, text, range, None)
+}
+
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Relaxed))
+}
+
+fn type_ref_inner(
+    node: Node<'_>,
+    text: &str,
+    range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
+) -> Option<TypeRef> {
+    if is_cancelled(cancelled) {
+        return None;
+    }
     let node = unparenthesized_type(node)?;
-    let parse = |field| type_ref(node.child_by_field_name(field)?, text, range);
+    let parse = |field| type_ref_inner(node.child_by_field_name(field)?, text, range, cancelled);
     let container = |container| {
         let token = node.child(0)?;
         Some(TypeRefKind::Container(Box::new(container), range(token)))
@@ -828,7 +1005,7 @@ pub(crate) fn type_ref(
                     .child_by_field_name("operator")
                     .is_some_and(|op| op.kind() == "*") =>
         {
-            let mut inner = type_ref(only_named_child(node)?, text, range)?;
+            let mut inner = type_ref_inner(only_named_child(node)?, text, range, cancelled)?;
             inner.pointers = inner.pointers.checked_add(1)?;
             return Some(inner);
         }
@@ -853,7 +1030,7 @@ pub(crate) fn type_ref(
             send: node.child(0).is_some_and(|first| first.kind() != "<-"),
         })?,
         "struct_type" | "interface_type" => {
-            TypeRefKind::Inline(Arc::new(inline_type(node, text, range)))
+            TypeRefKind::Inline(Arc::new(inline_type(node, text, range, cancelled, true)))
         }
         "function_type"
         | "func_literal"
@@ -888,7 +1065,13 @@ fn named_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) -> 
     })
 }
 
-fn inline_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) -> InlineType {
+fn inline_type(
+    node: Node<'_>,
+    text: &str,
+    range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
+    retain_fields: bool,
+) -> InlineType {
     let mut inline = InlineType {
         origin: range(node.child(0).unwrap_or(node)),
         interface: node.kind() == "interface_type",
@@ -897,6 +1080,9 @@ fn inline_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) ->
     let mut cursor = node.walk();
     if inline.interface {
         for element in node.named_children(&mut cursor) {
+            if is_cancelled(cancelled) {
+                break;
+            }
             match element.kind() {
                 "method_elem" => {
                     if let Some(name) = element.child_by_field_name("name") {
@@ -910,7 +1096,7 @@ fn inline_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) ->
                 }
                 "type_elem" => {
                     if let Some(term) = only_named_child(element)
-                        && let Some(reference) = type_ref(term, text, range)
+                        && let Some(reference) = type_ref_inner(term, text, range, cancelled)
                         && matches!(reference.kind, TypeRefKind::Named(_))
                     {
                         inline.embedded.push(reference);
@@ -929,31 +1115,49 @@ fn inline_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) ->
     else {
         return inline;
     };
+    inline.members.reserve(list.named_child_count());
+    let mut name_cursor = list.walk();
     for field in list
         .named_children(&mut list.walk())
         .filter(|node| node.kind() == "field_declaration")
     {
+        if is_cancelled(cancelled) {
+            break;
+        }
         let field_type = field.child_by_field_name("type");
-        let ty = field_type.and_then(|node| type_ref(node, text, range));
-        let tag = field
-            .child_by_field_name("tag")
-            .map(|tag| node_text(tag, text).to_owned());
-        let mut name_cursor = field.walk();
+        let mut ty = field_type.and_then(|node| type_ref_inner(node, text, range, cancelled));
+        let tag = if retain_fields {
+            field
+                .child_by_field_name("tag")
+                .map(|tag| node_text(tag, text).to_owned())
+        } else {
+            None
+        };
         let mut names = field
             .children_by_field_name("name", &mut name_cursor)
             .filter(|node| node.kind() == "field_identifier")
             .peekable();
         if names.peek().is_some() {
-            for name in names {
+            while let Some(name) = names.next() {
+                if is_cancelled(cancelled) {
+                    return inline;
+                }
                 let key = node_text(name, text);
-                inline.fields.push(InlineField {
-                    name: key.to_owned(),
-                    embedded: false,
-                    tag: tag.clone(),
-                    ty: ty.clone(),
-                });
+                if retain_fields {
+                    inline.fields.push(InlineField {
+                        name: key.to_owned(),
+                        embedded: false,
+                        tag: tag.clone(),
+                        ty: ty.clone(),
+                    });
+                }
                 if !key.is_empty() && key != "_" {
-                    let symbol = Symbol::new(range(name), SymbolKind::Value(ty.clone()), true);
+                    let field_type = if names.peek().is_some() {
+                        ty.clone()
+                    } else {
+                        ty.take()
+                    };
+                    let symbol = Symbol::new(range(name), SymbolKind::Value(field_type), true);
                     inline.members.entry(key.to_owned()).or_insert(symbol);
                 }
             }
@@ -966,12 +1170,14 @@ fn inline_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) ->
                 ty.pointers += 1;
             }
             let name = syntax.name;
-            inline.fields.push(InlineField {
-                name: node_text(name, text).to_owned(),
-                embedded: true,
-                tag,
-                ty: Some(ty.clone()),
-            });
+            if retain_fields {
+                inline.fields.push(InlineField {
+                    name: node_text(name, text).to_owned(),
+                    embedded: true,
+                    tag,
+                    ty: Some(ty.clone()),
+                });
+            }
             let symbol = Symbol::new(range(name), SymbolKind::Value(Some(ty.clone())), true);
             inline
                 .members
@@ -1171,6 +1377,7 @@ fn function_signature(
 ) -> Arc<FunctionSignature> {
     let type_parameters = type_parameters(function, text, range);
     let parameters = function.child_by_field_name("parameters");
+    let parameters_known = parameters.is_some_and(|list| !list.has_error());
     let variadic = parameters.is_some_and(|list| {
         list.named_children(&mut list.walk())
             .any(|node| node.kind() == "variadic_parameter_declaration")
@@ -1195,6 +1402,7 @@ fn function_signature(
         result_tuple,
         results: function_results(function, text, range),
         parameters,
+        parameters_known,
         variadic,
         type_parameters,
     })
@@ -1208,15 +1416,12 @@ fn function_results(
     let Some(result) = function.child_by_field_name("result") else {
         return Arc::from([]);
     };
-    let mut enclosing = function.parent();
-    let mut local = false;
-    while let Some(owner) = enclosing {
-        if owner.kind() == "block" {
-            local = true;
-            break;
-        }
-        enclosing = owner.parent();
-    }
+    // Go's named functions and methods are declared at package scope.
+    let local = !matches!(
+        function.kind(),
+        "function_declaration" | "method_declaration"
+    ) && std::iter::successors(function.parent(), |node| node.parent())
+        .any(|owner| owner.kind() == "block");
     let parse = |node| {
         if local && has_shadowed_result_type(node, text) {
             return None;
@@ -1552,5 +1757,22 @@ mod outline_tests {
             );
             assert_ranges(&text, &outline.symbols, 0..text.len());
         }
+    }
+
+    #[test]
+    fn distinguishes_an_empty_parameter_list_from_a_recovered_signature() {
+        let text = "package p\nfunc Getter() int { return 1 }\nfunc Broken(a int, @) {}\n";
+        let tree = parse(text);
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let mut functions = root
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "function_declaration");
+        let getter = function_signature(functions.next().unwrap(), text, &|_| Range::default());
+        assert!(getter.parameters_known && getter.parameters.is_empty());
+        let broken = functions
+            .next()
+            .unwrap_or_else(|| panic!("{}", root.to_sexp()));
+        assert!(!function_signature(broken, text, &|_| Range::default()).parameters_known);
     }
 }

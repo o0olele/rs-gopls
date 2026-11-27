@@ -736,6 +736,200 @@ fn document_highlights_do_not_merge_unresolved_or_shadowed_names() {
 }
 
 #[test]
+fn highlights_lexical_initializers_case_bindings_and_closure_captures() {
+    let source = concat!(
+        "package p\n",
+        "const step = 9\n",
+        "type Box[T any] struct { field T }\n",
+        "func (recv Box[R]) f(ch chan int, value any) {\n",
+        "  var member R\n",
+        "  _ = recv.field\n",
+        "  _ = member\n",
+        "  const captured = 100\n",
+        "  _ = func() { _ = captured + 1; _ = recv.field }\n",
+        "  { const captured = 200; _ = captured + 2 }\n",
+        "  if step := 1; step < 3 { step++ } else { _ = step + 4 }\n",
+        "  for step := 5; step < 6; step++ { _ = step + 7 }\n",
+        "  switch step := 8; step { case 8: _ = step + 9 }\n",
+        "  for index := range ch { _ = index + 10 }\n",
+        "  select {\n",
+        "  case item := <-ch:\n",
+        "    item, count := item + 11, 1\n",
+        "    _, _ = func() int { return item + 12 }, count\n",
+        "  case item := <-ch:\n",
+        "    _ = item + 13\n",
+        "  }\n",
+        "  switch bound := value.(type) {\n",
+        "  case int: _ = bound + 14\n",
+        "  default: _ = func() { _ = bound }\n",
+        "  }\n",
+        "  _ = step + 15\n",
+        "}\n",
+    );
+    let (_project, path, mut engine) = open_fixture(source);
+    let mut check = |context, selected, expected: &[(&str, &str, DocumentHighlightKind)]| {
+        let result = engine
+            .document_highlight(&path, span(source, context, selected).start)
+            .unwrap();
+        assert_highlights(source, result, expected);
+    };
+    check(
+        "captured + 1",
+        "captured",
+        &[
+            ("const captured = 100", "captured", WRITE),
+            ("captured + 1", "captured", READ),
+        ],
+    );
+    check(
+        "Box[R]",
+        "R",
+        &[("Box[R]", "R", TEXT), ("member R", "R", TEXT)],
+    );
+    check(
+        "recv Box",
+        "recv",
+        &[
+            ("recv Box", "recv", READ),
+            ("_ = recv.field\n", "recv", READ),
+            ("_ = recv.field }", "recv", READ),
+        ],
+    );
+    check(
+        "field T",
+        "T",
+        &[("Box[T any]", "T", TEXT), ("field T", "T", TEXT)],
+    );
+    check(
+        "step + 4",
+        "step",
+        &[
+            ("step := 1", "step", WRITE),
+            ("step < 3", "step", READ),
+            ("{ step++ }", "step", WRITE),
+            ("step + 4", "step", READ),
+        ],
+    );
+    check(
+        "step < 6",
+        "step",
+        &[
+            ("step := 5", "step", WRITE),
+            ("step < 6", "step", READ),
+            ("step++ {", "step", WRITE),
+            ("step + 7", "step", READ),
+        ],
+    );
+    check(
+        "step + 9",
+        "step",
+        &[
+            ("step := 8", "step", WRITE),
+            ("; step {", "step", READ),
+            ("step + 9", "step", READ),
+        ],
+    );
+    check(
+        "index + 10",
+        "index",
+        &[
+            ("index := range", "index", WRITE),
+            ("index + 10", "index", READ),
+        ],
+    );
+    check(
+        "item + 11",
+        "item",
+        &[
+            ("item := <-ch:", "item", WRITE),
+            ("item, count :=", "item", WRITE),
+            ("item + 11", "item", READ),
+            ("item + 12", "item", READ),
+        ],
+    );
+    check(
+        "bound + 14",
+        "bound",
+        &[
+            ("bound :=", "bound", WRITE),
+            ("bound + 14", "bound", READ),
+            ("_ = bound }", "bound", READ),
+        ],
+    );
+    check(
+        "step + 15",
+        "step",
+        &[("const step", "step", WRITE), ("step + 15", "step", READ)],
+    );
+}
+
+#[test]
+fn highlights_predeclared_constants_through_the_same_name_index() {
+    let source = concat!(
+        "package p\n",
+        "const (a = iota; b = iota + 1)\n",
+        "var _ = []any{nil, true, false}\n",
+        "func f() {\n",
+        "  _, _, _ = true, false, nil\n",
+        "  { true := 1; _ = true + 2 }\n",
+        "  _ = iota\n",
+        "}\n",
+    );
+    let (_project, path, mut engine) = open_fixture(source);
+    let mut check = |context, selected, expected: &[(&str, &str, DocumentHighlightKind)]| {
+        let result = engine
+            .document_highlight(&path, span(source, context, selected).start)
+            .unwrap();
+        assert_highlights(source, result, expected);
+    };
+    check(
+        "a = iota",
+        "iota",
+        &[("a = iota", "iota", READ), ("b = iota", "iota", READ)],
+    );
+    for name in ["nil", "true", "false"] {
+        check(
+            "{nil, true, false}",
+            name,
+            &[
+                ("{nil, true, false}", name, READ),
+                ("= true, false, nil", name, READ),
+            ],
+        );
+    }
+    check("  _ = iota", "iota", &[]);
+}
+
+#[test]
+fn a_cancelled_highlight_computation_produces_no_result() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{Editor, document_highlight};
+
+    let source = "package p\nconst target = 42\nvar _ = target\n";
+    let (_project, path, mut engine) = open_fixture(source);
+    let mut snapshot = engine.snapshot();
+    let document = snapshot.document(&path).unwrap().unwrap();
+    let editor = Editor::new(&document);
+    let target =
+        document_highlight::prepare(&editor, span(source, "const target", "target").start).unwrap();
+    let cancelled = AtomicBool::new(true);
+    assert!(document_highlight::compute(&editor, target, Some(&cancelled)).is_none());
+    cancelled.store(false, Ordering::Relaxed);
+    let (result, candidates) =
+        document_highlight::compute(&editor, target, Some(&cancelled)).unwrap();
+    assert_eq!(candidates, 2);
+    assert_highlights(
+        source,
+        result,
+        &[
+            ("const target", "target", WRITE),
+            ("_ = target", "target", READ),
+        ],
+    );
+}
+
+#[test]
 fn document_highlights_include_the_implicit_import_path() {
     let source = concat!(
         "package p\r\n",
@@ -781,6 +975,23 @@ fn document_highlights_include_the_implicit_import_path() {
             ("strings :=", "strings", WRITE),
             ("_ = strings }", "strings", READ),
         ],
+    );
+}
+
+#[test]
+fn highlights_utf8_names_across_cold_offset_scan_boundaries() {
+    let prefix = "package p\n//";
+    let declaration = "\nconst ";
+    let padding = "a".repeat(65_535 - prefix.len() - declaration.len());
+    let source = format!(
+        "{prefix}{padding}{declaration}界名 = 1\nvar _ = 界名\nvar _ = \"界名\"\nvar 界名字 = 2\n"
+    );
+    let (_project, path, mut engine) = open_fixture(&source);
+    let usage = span(&source, "_ = 界名", "界名");
+    assert_highlights(
+        &source,
+        engine.document_highlight(&path, usage.start).unwrap(),
+        &[("const 界名", "界名", WRITE), ("_ = 界名", "界名", READ)],
     );
 }
 
@@ -974,6 +1185,14 @@ fn return_slot_highlights_follow_result_positions_and_overlay_named_results() {
             ("return 10, \"outer\"", "\"outer\"", TEXT),
             ("return pair()", "pair()", TEXT),
             ("pick(\"arg\")", "pick(\"arg\")", TEXT),
+        ],
+    );
+    check(
+        "last = \"v\"",
+        "last",
+        &[
+            ("last string", "last", READ),
+            ("last = \"v\"", "last", WRITE),
         ],
     );
     check(

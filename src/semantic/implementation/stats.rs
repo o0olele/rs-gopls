@@ -41,7 +41,13 @@ impl IndexStats {
 
     pub(super) fn add_build(&mut self, started: Instant) {
         if self.scheduled.is_some() {
-            self.build += started.elapsed();
+            self.add_duration(started.elapsed());
+        }
+    }
+
+    pub(super) fn add_duration(&mut self, duration: Duration) {
+        if self.scheduled.is_some() {
+            self.build += duration;
         }
     }
 

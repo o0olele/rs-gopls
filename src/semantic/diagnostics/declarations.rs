@@ -1,19 +1,46 @@
 use std::collections::{HashMap, HashSet};
 
 use super::*;
-use crate::scope::receiver_type_parameters;
-use crate::symbols::OutlineKind;
+use crate::scope::{initializer_at, receiver_type_parameters};
+use crate::symbols::{self, OutlineKind};
 use crate::workspace::path_key;
 
 #[derive(Clone, Copy)]
 pub(super) struct Local<'t> {
     pub(super) name: Node<'t>,
+    pub(super) kind: &'static str,
+    pub(super) explicit_type: Option<Node<'t>>,
+    pub(super) initializer: Option<Node<'t>>,
+    pub(super) result_index: usize,
     visible_from: usize,
+}
+
+impl<'t> Local<'t> {
+    fn new(name: Node<'t>, owner: Node<'t>, visible_from: usize) -> Self {
+        Self {
+            name,
+            kind: owner.kind(),
+            explicit_type: owner.child_by_field_name("type"),
+            initializer: None,
+            result_index: 0,
+            visible_from,
+        }
+    }
+
+    pub(super) fn is_type(self) -> bool {
+        matches!(
+            self.kind,
+            "type_spec" | "type_alias" | "type_parameter_declaration" | "type_elem"
+        )
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Locals<'t> {
     bindings: HashMap<(usize, &'t str), Local<'t>>,
+    scopes: Vec<(usize, Option<usize>)>,
+    scope_changes: Vec<(usize, Option<usize>)>,
+    current_scope: Option<usize>,
     pub(super) declarations: HashSet<usize>,
     pub(super) variables: Vec<Node<'t>>,
     pub(super) globals: HashMap<String, OutlineKind>,
@@ -21,231 +48,304 @@ pub(super) struct Locals<'t> {
 }
 
 impl<'t> Locals<'t> {
+    pub(super) fn has_bindings(&self) -> bool {
+        !self.bindings.is_empty()
+    }
+
     pub(super) fn declared_in_same_block(
         &self,
-        node: Node<'_>,
+        parents: Parents<'_, '_>,
         name: &str,
         previous: Node<'_>,
     ) -> bool {
-        block_scope(node)
+        block_scope(parents)
             .and_then(|scope| self.bindings.get(&(scope.id(), name)))
             .is_some_and(|b| b.name == previous)
     }
 
     pub(super) fn lookup(&self, node: Node<'_>, name: &str) -> Option<Local<'t>> {
-        std::iter::successors(node.parent(), |n| n.parent()).find_map(|scope| {
-            self.bindings
-                .get(&(scope.id(), name))
-                .filter(|v| v.visible_from <= node.start_byte())
-                .copied()
-        })
+        if self.bindings.is_empty() {
+            return None;
+        }
+        let offset = node.start_byte();
+        let index = self.scope_changes.partition_point(|(at, _)| *at <= offset);
+        let mut scope = self.scope_changes.get(index.checked_sub(1)?)?.1;
+        while let Some(index) = scope {
+            let (id, parent) = self.scopes[index];
+            if let Some(binding) = self.bindings.get(&(id, name))
+                && binding.visible_from <= offset
+            {
+                return Some(*binding);
+            }
+            scope = parent;
+        }
+        None
+    }
+
+    fn push_scope(&mut self, node: Node<'_>) {
+        let scope = self.scopes.len();
+        self.scopes.push((node.id(), self.current_scope));
+        self.current_scope = Some(scope);
+        self.scope_changes.push((node.start_byte(), Some(scope)));
+    }
+
+    fn pop_scope(&mut self, node: Node<'_>) {
+        let (_, parent) = self.scopes[self.current_scope.expect("active lexical scope")];
+        self.current_scope = parent;
+        self.scope_changes.push((node.end_byte(), parent));
     }
 }
 
 pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
     package_declarations(analysis)?;
-    walk(analysis.source.tree.root_node(), |node| {
-        match node.kind() {
-            "var_spec" | "const_spec" | "type_spec" | "type_alias" => {
-                if let Some(scope) = block_scope(node) {
-                    for name in field_children(node, "name") {
-                        let start = if matches!(node.kind(), "type_spec" | "type_alias") {
-                            name.start_byte()
+    let mut member_names = HashSet::new();
+    walk(
+        analysis.source.tree.root_node(),
+        analysis.cancelled,
+        |node, kind, parents, entering| {
+            if !entering {
+                analysis.locals.pop_scope(node);
+                return Ok(WalkControl::Children);
+            }
+            let scoped = scope_node(kind);
+            if scoped {
+                analysis.locals.push_scope(node);
+            }
+            match kind {
+                "package_clause" | "import_declaration" => return Ok(WalkControl::Skip),
+                "var_spec" | "const_spec" | "type_spec" | "type_alias" => {
+                    if let Some(scope) = block_scope(parents) {
+                        for (index, name) in field_children(node, "name").into_iter().enumerate() {
+                            let start = if matches!(kind, "type_spec" | "type_alias") {
+                                name.start_byte()
+                            } else {
+                                node.end_byte()
+                            };
+                            let mut local = Local::new(name, node, start);
+                            (local.initializer, local.result_index) =
+                                initializer_at(node.child_by_field_name("value"), index);
+                            bind(analysis, scope, local, kind == "var_spec");
+                        }
+                    }
+                }
+                "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "type_parameter_declaration" => {
+                    if let Some(owner) = parents.at(2) {
+                        let start = if kind == "type_parameter_declaration" {
+                            owner.start_byte()
                         } else {
-                            node.end_byte()
+                            owner
+                                .child_by_field_name("body")
+                                .map_or(owner.end_byte(), |n| n.start_byte())
                         };
-                        bind(analysis, scope, name, start, node.kind() == "var_spec");
+                        for name in field_children(node, "name") {
+                            bind(analysis, owner, Local::new(name, node, start), false);
+                        }
                     }
                 }
-            }
-            "parameter_declaration"
-            | "variadic_parameter_declaration"
-            | "type_parameter_declaration" => {
-                if let Some(owner) = node.parent().and_then(|list| list.parent()) {
-                    let start = if node.kind() == "type_parameter_declaration" {
-                        owner.start_byte()
-                    } else {
-                        owner
-                            .child_by_field_name("body")
-                            .map_or(owner.end_byte(), |n| n.start_byte())
-                    };
-                    for name in field_children(node, "name") {
-                        bind(analysis, owner, name, start, false);
+                "method_declaration" => {
+                    if let Some((_, arguments)) = receiver_type_parameters(node) {
+                        for arg in children(arguments) {
+                            if let Some(name) =
+                                arg.named_child(0).filter(|n| n.kind() == "type_identifier")
+                            {
+                                bind(
+                                    analysis,
+                                    node,
+                                    Local::new(name, arg, node.start_byte()),
+                                    false,
+                                );
+                            }
+                        }
                     }
                 }
-            }
-            "method_declaration" => {
-                if let Some((_, arguments)) = receiver_type_parameters(node) {
-                    for arg in children(arguments)
-                        .into_iter()
-                        .filter_map(|n| n.named_child(0))
-                        .filter(|n| n.kind() == "type_identifier")
+                "short_var_declaration" | "receive_statement" | "range_clause" => {
+                    if let (Some(operator), Some(left), Some(scope)) = (
+                        token(node, ":="),
+                        node.child_by_field_name("left"),
+                        block_scope(parents),
+                    ) {
+                        let mut distinct = HashSet::new();
+                        let mut new = false;
+                        for (index, name) in children(left).into_iter().enumerate() {
+                            let spelling = analysis.text(name);
+                            analysis.locals.declarations.insert(name.id());
+                            if spelling == "_" {
+                                continue;
+                            }
+                            if !is_identifier(name) {
+                                return Ok(WalkControl::Children);
+                            }
+                            if !distinct.insert(spelling) {
+                                redeclared(analysis, name);
+                            } else if !analysis
+                                .locals
+                                .bindings
+                                .contains_key(&(scope.id(), spelling))
+                            {
+                                let mut local = Local::new(name, node, node.end_byte());
+                                (local.initializer, local.result_index) = match kind {
+                                    "range_clause" => (Some(node), index),
+                                    "receive_statement" => {
+                                        (node.child_by_field_name("right"), index)
+                                    }
+                                    _ => initializer_at(node.child_by_field_name("right"), index),
+                                };
+                                bind(analysis, scope, local, true);
+                                new = true;
+                            }
+                        }
+                        if !new {
+                            let item = analysis.error(
+                                DiagnosticCode::ShortVarNoNewVars,
+                                operator,
+                                "No new variables on the left of :=",
+                            );
+                            item.fix = Fix::Assign;
+                        }
+                    }
+                }
+                "type_switch_statement" => {
+                    if let Some(alias) = node
+                        .child_by_field_name("alias")
+                        .and_then(|n| n.named_child(0))
+                        && analysis.text(alias) != "_"
                     {
-                        bind(analysis, node, arg, node.start_byte(), false);
+                        analysis.locals.declarations.insert(alias.id());
+                        analysis.locals.variables.push(alias);
                     }
                 }
-            }
-            "short_var_declaration" | "receive_statement" | "range_clause" => {
-                if let (Some(operator), Some(left), Some(scope)) = (
-                    token(node, ":="),
-                    node.child_by_field_name("left"),
-                    block_scope(node),
-                ) {
-                    let mut distinct = HashSet::new();
-                    let mut new = false;
-                    for name in children(left) {
-                        let spelling = analysis.text(name);
-                        analysis.locals.declarations.insert(name.id());
-                        if spelling == "_" {
-                            continue;
-                        }
-                        if !is_identifier(name) {
-                            return Ok(());
-                        }
-                        if !distinct.insert(spelling) {
-                            redeclared(analysis, name);
-                        } else if !analysis
-                            .locals
-                            .bindings
-                            .contains_key(&(scope.id(), spelling))
-                        {
-                            bind(analysis, scope, name, node.end_byte(), true);
-                            new = true;
-                        }
-                    }
-                    if !new {
-                        let item = analysis.error(
-                            DiagnosticCode::ShortVarNoNewVars,
-                            operator,
-                            "No new variables on the left of :=",
-                        );
-                        item.fix_data = DiagnosticFixData::ChangeShortDeclToAssign {
-                            operator_range: item.range,
-                        };
-                    }
-                }
-            }
-            "type_switch_statement" => {
-                if let Some(alias) = node
-                    .child_by_field_name("alias")
-                    .and_then(|n| n.named_child(0))
-                    && analysis.text(alias) != "_"
-                {
-                    analysis.locals.declarations.insert(alias.id());
-                    analysis.locals.variables.push(alias);
-                    for case in children(node)
-                        .into_iter()
-                        .filter(|n| matches!(n.kind(), "type_case" | "default_case"))
+                "type_case" | "default_case" => {
+                    if let Some(switch) = parents
+                        .at(1)
+                        .filter(|n| n.kind() == "type_switch_statement")
+                        && let Some(alias) = switch
+                            .child_by_field_name("alias")
+                            .and_then(|n| n.named_child(0))
+                        && analysis.text(alias) != "_"
                     {
-                        let start = children(case)
+                        let start = children(node)
                             .into_iter()
                             .find(|n| n.kind() == "statement_list")
-                            .map_or(case.end_byte(), |n| n.start_byte());
-                        bind(analysis, case, alias, start, false);
+                            .map_or(node.end_byte(), |n| n.start_byte());
+                        let mut local = Local::new(alias, node, start);
+                        let mut cursor = node.walk();
+                        let mut types = node
+                            .children_by_field_name("type", &mut cursor)
+                            .filter(Node::is_named);
+                        local.explicit_type = types
+                            .next()
+                            .filter(|n| analysis.text(*n) != "nil" && types.next().is_none());
+                        if local.explicit_type.is_none() {
+                            local.initializer = switch.child_by_field_name("value");
+                        }
+                        bind(analysis, node, local, false);
                     }
                 }
-            }
-            "field_declaration_list" | "interface_type" => member_declarations(analysis, node),
-            _ => {}
-        }
-        Ok(())
-    })?;
-    walk(analysis.source.tree.root_node(), |node| {
-        let operands = match node.kind() {
-            "assignment_statement" | "receive_statement" | "range_clause"
-                if token(node, ":=").is_none() =>
-            {
-                node.child_by_field_name("left")
-                    .map(children)
-                    .unwrap_or_default()
-            }
-            "inc_statement" | "dec_statement" => children(node),
-            _ => return Ok(()),
-        };
-        for operand in operands {
-            let operand = unparen(operand);
-            let name = analysis.text(operand);
-            let constant = if is_identifier(operand) {
-                if let Some(local) = analysis.locals.lookup(operand, name) {
-                    local
-                        .name
-                        .parent()
-                        .is_some_and(|p| p.kind() == "const_spec")
-                } else if let Some(kind) = analysis.locals.globals.get(name) {
-                    *kind == OutlineKind::Constant
-                } else {
-                    analysis
-                        .resolver
-                        .indexes
-                        .find_dot_import(
-                            analysis.resolver.workspace,
-                            analysis.package,
-                            &analysis.source.imports,
-                            name,
-                        )?
-                        .and_then(|(path, _)| analysis.resolver.workspace.package_of_file(&path))
-                        .map(|pkg| analysis.resolver.find_symbol(pkg, name, None))
-                        .transpose()?
-                        .flatten()
-                        .is_some_and(|s| {
-                            matches!(s.symbol.kind, crate::symbols::SymbolKind::Value(_))
-                                && !s.symbol.addressable
-                        })
+                "field_declaration_list" | "interface_type" => {
+                    if member_declarations(analysis, node, kind, &mut member_names)? {
+                        return Ok(WalkControl::Skip);
+                    }
                 }
-            } else if operand.kind() == "selector_expression"
-                && let (Some(receiver), Some(field)) = (
-                    operand.child_by_field_name("operand"),
-                    operand.child_by_field_name("field"),
-                )
-                && let Some((_, package)) = analysis.source.imported_package(
-                    analysis.resolver.workspace,
-                    analysis.package,
-                    analysis.text(receiver),
-                )
-                && analysis
-                    .locals
-                    .lookup(receiver, analysis.text(receiver))
-                    .is_none()
-            {
+                _ => {}
+            }
+            Ok(if scoped {
+                WalkControl::Scoped
+            } else {
+                WalkControl::Children
+            })
+        },
+    )
+}
+
+pub(super) fn check_assignable(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
+    let operands = match node.kind() {
+        "assignment_statement" | "receive_statement" | "range_clause"
+            if token(node, ":=").is_none() =>
+        {
+            node.child_by_field_name("left")
+                .map(children)
+                .unwrap_or_default()
+        }
+        "inc_statement" | "dec_statement" => children(node),
+        _ => return Ok(()),
+    };
+    for operand in operands {
+        let operand = unparen(operand);
+        let name = analysis.text(operand);
+        let constant = if is_identifier(operand) {
+            if let Some(local) = analysis.locals.lookup(operand, name) {
+                local.kind == "const_spec"
+            } else if let Some(kind) = analysis.locals.globals.get(name) {
+                *kind == OutlineKind::Constant
+            } else {
                 analysis
                     .resolver
-                    .find_symbol(package, analysis.text(field), None)?
+                    .indexes
+                    .find_dot_import(
+                        analysis.resolver.workspace,
+                        analysis.package,
+                        &analysis.source.imports,
+                        name,
+                    )?
+                    .and_then(|(path, _)| analysis.resolver.workspace.package_of_file(&path))
+                    .map(|pkg| analysis.resolver.find_symbol(pkg, name, None))
+                    .transpose()?
+                    .flatten()
                     .is_some_and(|s| {
                         matches!(s.symbol.kind, crate::symbols::SymbolKind::Value(_))
                             && !s.symbol.addressable
                     })
-            } else {
-                false
-            };
-            if constant {
-                analysis.error(
-                    DiagnosticCode::ConstReassign,
-                    operand,
-                    format!("Cannot assign to constant {name}"),
-                );
             }
+        } else if operand.kind() == "selector_expression"
+            && let (Some(receiver), Some(field)) = (
+                operand.child_by_field_name("operand"),
+                operand.child_by_field_name("field"),
+            )
+            && let Some(package) = analysis.imports.package(analysis.text(receiver))
+            && analysis
+                .locals
+                .lookup(receiver, analysis.text(receiver))
+                .is_none()
+        {
+            analysis
+                .resolver
+                .find_symbol(package, analysis.text(field), None)?
+                .is_some_and(|s| {
+                    matches!(s.symbol.kind, crate::symbols::SymbolKind::Value(_))
+                        && !s.symbol.addressable
+                })
+        } else {
+            false
+        };
+        if constant {
+            analysis.error(
+                DiagnosticCode::ConstReassign,
+                operand,
+                format!("Cannot assign to constant {name}"),
+            );
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 pub(super) fn is_identifier(node: Node<'_>) -> bool {
+    identifier_kind(node.kind())
+}
+
+pub(super) fn identifier_kind(kind: &str) -> bool {
     matches!(
-        node.kind(),
+        kind,
         "identifier" | "type_identifier" | "package_identifier" | "nil" | "true" | "false" | "iota"
     )
 }
 
-fn block_scope(node: Node<'_>) -> Option<Node<'_>> {
-    for scope in std::iter::successors(node.parent(), |n| n.parent()) {
+fn block_scope<'t>(parents: Parents<'t, '_>) -> Option<Node<'t>> {
+    for (index, scope) in parents.iter().rev().enumerate() {
         match scope.kind() {
             "block" => {
-                if let Some(function) = scope.parent().filter(|n| {
-                    matches!(
-                        n.kind(),
-                        "function_declaration" | "method_declaration" | "func_literal"
-                    )
-                }) {
+                if let Some(function) = parents.at(index + 2).filter(|n| is_function(n.kind())) {
                     return Some(function);
                 }
                 return Some(scope);
@@ -264,13 +364,33 @@ fn block_scope(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+fn scope_node(kind: &str) -> bool {
+    is_function(kind)
+        || matches!(
+            kind,
+            "block"
+                | "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "type_case"
+                | "expression_case"
+                | "default_case"
+                | "communication_case"
+                | "type_spec"
+                | "type_alias"
+                | "function_type"
+                | "method_elem"
+        )
+}
+
 fn bind<'s>(
     analysis: &mut Analysis<'s, '_, '_>,
     scope: Node<'s>,
-    name: Node<'s>,
-    visible_from: usize,
+    local: Local<'s>,
     variable: bool,
 ) {
+    let name = local.name;
     let spelling = analysis.text(name);
     analysis.locals.declarations.insert(name.id());
     if spelling == "_" {
@@ -279,7 +399,7 @@ fn bind<'s>(
     if let std::collections::hash_map::Entry::Vacant(entry) =
         analysis.locals.bindings.entry((scope.id(), spelling))
     {
-        entry.insert(Local { name, visible_from });
+        entry.insert(local);
         if variable {
             analysis.locals.variables.push(name);
         }
@@ -296,34 +416,66 @@ fn redeclared(analysis: &mut Analysis<'_, '_, '_>, name: Node<'_>) {
     );
 }
 
-fn member_declarations(analysis: &mut Analysis<'_, '_, '_>, list: Node<'_>) {
-    let mut seen = HashSet::new();
-    for field in children(list) {
-        let mut names = field_children(field, "name");
-        if names.is_empty()
-            && field.kind() == "field_declaration"
-            && let Some(mut ty) = field.child_by_field_name("type")
-        {
-            if ty.kind() == "generic_type"
-                && let Some(base) = ty.child_by_field_name("type")
-            {
-                ty = base;
-            }
-            names.push(ty.child_by_field_name("name").unwrap_or(ty));
+// A flat field list contains no declarations outside the fields themselves.
+fn member_declarations<'s>(
+    analysis: &mut Analysis<'s, '_, '_>,
+    list: Node<'_>,
+    kind: &str,
+    seen: &mut HashSet<&'s str>,
+) -> Result<bool> {
+    seen.clear();
+    let mut flat = kind == "field_declaration_list";
+    let mut cursor = list.walk();
+    let mut field_cursor = list.walk();
+    for (i, field) in list
+        .named_children(&mut cursor)
+        .filter(|n| !n.is_extra())
+        .enumerate()
+    {
+        if i & 1023 == 0 {
+            checkpoint(analysis.cancelled)?;
         }
-        for name in names {
+        let ty = field.child_by_field_name("type");
+        flat &= ty.is_some_and(|ty| matches!(ty.kind(), "type_identifier" | "qualified_type"));
+        let mut names = field
+            .children_by_field_name("name", &mut field_cursor)
+            .filter(|name| name.is_named() && !name.is_extra())
+            .peekable();
+        let embedded = if names.peek().is_none() && field.kind() == "field_declaration" {
+            ty.map(|ty| {
+                let base = if ty.kind() == "generic_type" {
+                    ty.child_by_field_name("type").unwrap_or(ty)
+                } else {
+                    ty
+                };
+                base.child_by_field_name("name").unwrap_or(base)
+            })
+        } else {
+            None
+        };
+        for name in names.chain(embedded) {
             let spelling = analysis.text(name);
             if spelling != "_" && !seen.insert(spelling) {
                 redeclared(analysis, name);
             }
         }
     }
+    Ok(flat)
 }
 
 fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
     let key = path_key(&analysis.source.path);
     let mut seen = HashSet::new();
     let mut fields = HashSet::new();
+    let tree = &analysis.source.tree;
+    let methods =
+        symbols::diagnostic_method_names(tree, &analysis.source.text, analysis.cancelled)?;
+    let outline = symbols::collect_diagnostic_outline(
+        tree,
+        &analysis.source.text,
+        &methods,
+        analysis.cancelled,
+    )?;
     let mut files = analysis
         .resolver
         .indexes
@@ -331,25 +483,37 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
         .into_owned();
     files.sort_by_cached_key(|path| path_key(path));
     for file in &files {
-        let other;
+        checkpoint(analysis.cancelled)?;
         let path = path_key(file);
-        let source = if path == key {
-            analysis.source
+        let other_outline;
+        let file_outline = if path == key {
+            &outline
         } else {
-            let Some(found) = analysis.resolver.indexes.reference_source(file)? else {
+            let Some(source) = analysis.resolver.indexes.reference_source(file)? else {
                 analysis.locals.incomplete_package = true;
                 continue;
             };
-            other = found;
-            other.as_ref()
+            let source = source.as_ref();
+            if !syntax::has_reliable_declarations(source.tree.root_node()) {
+                analysis.locals.incomplete_package = true;
+                continue;
+            }
+            other_outline = symbols::collect_diagnostic_outline(
+                &source.tree,
+                &source.text,
+                &methods,
+                analysis.cancelled,
+            )?;
+            &other_outline
         };
-        if !syntax::has_reliable_declarations(source.tree.root_node())
-            || source.outline().package.as_deref() != Some(analysis.package.name.as_str())
-        {
+        if file_outline.package.as_deref() != Some(analysis.package.name.as_str()) {
             analysis.locals.incomplete_package = true;
             continue;
         }
-        for symbol in &source.outline().symbols {
+        for (i, symbol) in file_outline.symbols.iter().enumerate() {
+            if i & 1023 == 0 {
+                checkpoint(analysis.cancelled)?;
+            }
             let owner = symbol.receiver.as_ref().map(|r| r.base.clone());
             if owner.is_none() {
                 analysis
@@ -371,7 +535,10 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
             }
         }
     }
-    for symbol in &analysis.source.outline().symbols {
+    for (i, symbol) in outline.symbols.iter().enumerate() {
+        if i & 1023 == 0 {
+            checkpoint(analysis.cancelled)?;
+        }
         if symbol.name == "_" || (symbol.name == "init" && symbol.kind == OutlineKind::Function) {
             continue;
         }
@@ -380,13 +547,11 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
             symbol.name.clone(),
         );
         if fields.contains(&member) || !seen.insert(member) {
-            let range = analysis.source.byte_range(symbol.selection_range.clone());
-            analysis.items.push(DiagnosticItem::new(
+            analysis.error_bytes(
                 DiagnosticCode::NameRedeclared,
-                DiagnosticSeverity::Error,
-                range,
+                symbol.selection_range.clone(),
                 format!("{} redeclared in this package", symbol.name),
-            ));
+            );
         }
     }
     Ok(())

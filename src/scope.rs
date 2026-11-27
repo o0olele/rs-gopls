@@ -390,6 +390,15 @@ pub(crate) fn lexical_binding<'tree>(
     name: &str,
     text: &str,
 ) -> Option<Binding<'tree>> {
+    lexical_binding_with(reference, name, text, &|node| node.parent())
+}
+
+pub(crate) fn lexical_binding_with<'tree>(
+    reference: Node<'tree>,
+    name: &str,
+    text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Binding<'tree>> {
     if name == "_" {
         return None;
     }
@@ -403,10 +412,10 @@ pub(crate) fn lexical_binding<'tree>(
     };
 
     let mut child = reference;
-    while let Some(scope) = child.parent() {
+    while let Some(scope) = parent_of(child) {
         let binding = match scope.kind() {
             "statement_list" | "var_spec_list" | "const_declaration" | "type_declaration" => {
-                preceding_binding(child, name, text)
+                preceding_binding(child, scope, name, text, parent_of)
             }
             "if_statement" | "expression_switch_statement" | "for_clause" => initializer(scope),
             "for_statement" if child.kind() == "block" => {
@@ -424,7 +433,7 @@ pub(crate) fn lexical_binding<'tree>(
             "type_switch_statement" => {
                 type_case_binding(scope, child, offset, name, text).or_else(|| initializer(scope))
             }
-            "communication_case" => case_entry_binding(child, name, text),
+            "communication_case" => case_entry_binding(child, name, text, parent_of),
             "function_declaration" | "method_declaration" | "func_literal"
                 if child.kind() == "block" =>
             {
@@ -434,7 +443,7 @@ pub(crate) fn lexical_binding<'tree>(
             "method_declaration" => receiver_type_parameter_binding(scope, name, text),
             "type_spec" | "type_alias" => type_parameter_binding(scope, offset, name, text)
                 .or_else(|| {
-                    let statement = scope.parent()?.parent()?;
+                    let statement = parent_of(parent_of(scope)?)?;
                     (statement.kind() != "source_file")
                         .then(|| declaration(scope, name, text))
                         .flatten()
@@ -449,15 +458,18 @@ pub(crate) fn lexical_binding<'tree>(
     None
 }
 
-fn preceding_binding<'tree>(child: Node<'tree>, name: &str, text: &str) -> Option<Binding<'tree>> {
-    let mut previous = child.prev_named_sibling();
+fn preceding_binding<'tree>(
+    child: Node<'tree>,
+    statement_list: Node<'tree>,
+    name: &str,
+    text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Binding<'tree>> {
     let mut binding = None;
-    while let Some(node) = previous {
+    for node in previous_named_siblings(child, statement_list) {
         if let Some(found) = declaration(node, name, text) {
-            if found
-                .name
-                .parent()
-                .and_then(|list| list.parent())
+            if parent_of(found.name)
+                .and_then(parent_of)
                 .is_none_or(|node| node.kind() != "short_var_declaration")
             {
                 return Some(found);
@@ -465,28 +477,51 @@ fn preceding_binding<'tree>(child: Node<'tree>, name: &str, text: &str) -> Optio
             // A short declaration can reuse an existing variable from the same block.
             binding = Some(found);
         }
-        previous = node.prev_named_sibling();
     }
 
-    let statement_list = child.parent()?;
-    if binding.is_some()
-        && let Some(initial) = case_entry_binding(statement_list, name, text)
-    {
+    let binding = binding?;
+    if let Some(initial) = case_entry_binding(statement_list, name, text, parent_of) {
         return Some(initial);
     }
-    let block = statement_list.parent()?;
-    let function = block.parent()?;
-    if binding.is_some()
-        && statement_list.kind() == "statement_list"
+    let block = parent_of(statement_list)?;
+    let function = parent_of(block)?;
+    if statement_list.kind() == "statement_list"
         && block.kind() == "block"
         && matches!(
             function.kind(),
             "function_declaration" | "method_declaration" | "func_literal"
         )
     {
-        return function_binding(function, name, text).or(binding);
+        return function_binding(function, name, text).or(Some(binding));
     }
-    binding
+    Some(binding)
+}
+
+fn previous_named_siblings<'tree>(
+    child: Node<'tree>,
+    parent: Node<'tree>,
+) -> impl Iterator<Item = Node<'tree>> {
+    let mut cursor = parent.walk();
+    let at_child = !parent.has_error()
+        && cursor
+            .goto_first_child_for_byte(child.start_byte())
+            .is_some()
+        && cursor.node() == child;
+    let mut previous = Some(child);
+    std::iter::from_fn(move || {
+        if !at_child {
+            // Preserve the Node lookup in recovery trees with zero-width siblings.
+            previous = previous.and_then(|node| node.prev_named_sibling());
+            return previous;
+        }
+        while cursor.goto_previous_sibling() {
+            let node = cursor.node();
+            if node.is_named() {
+                return Some(node);
+            }
+        }
+        None
+    })
 }
 
 // The implicit block of a select or type-switch case already contains its
@@ -495,20 +530,19 @@ fn case_entry_binding<'tree>(
     statements: Node<'tree>,
     name: &str,
     text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
 ) -> Option<Binding<'tree>> {
     if statements.kind() != "statement_list" {
         return None;
     }
-    let case = statements.parent()?;
+    let case = parent_of(statements)?;
     match case.kind() {
         "communication_case" => case
             .child_by_field_name("communication")
             .filter(|n| n.kind() == "receive_statement" && has_short_operator(*n))
             .and_then(|receive| left_binding(receive, name, text)),
         "type_case" | "default_case" => {
-            let switch = case
-                .parent()
-                .filter(|s| s.kind() == "type_switch_statement")?;
+            let switch = parent_of(case).filter(|s| s.kind() == "type_switch_statement")?;
             type_case_binding(switch, case, statements.start_byte(), name, text)
         }
         _ => None,
@@ -616,43 +650,52 @@ fn case_alias_binding<'tree>(
 }
 
 pub(crate) fn reference_binding<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {
+    reference_binding_with(node, text, &|node| node.parent())
+}
+
+pub(crate) fn reference_binding_with<'tree>(
+    node: Node<'tree>,
+    text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Node<'tree>> {
     let spelling = text.get(node.byte_range())?;
     if spelling == "_" {
         return None;
     }
-    let previous = lexical_binding(node, spelling, text).map(|binding| binding.name);
-    if declaration_binding(node, text).is_none() {
+    let previous =
+        lexical_binding_with(node, spelling, text, parent_of).map(|binding| binding.name);
+    if declaration_binding_with(node, text, parent_of).is_none() {
         return previous;
     }
-    let parent = node.parent()?;
+    let parent = parent_of(node)?;
     if parent.kind() == "expression_list"
-        && let Some(statement) = parent
-            .parent()
-            .filter(|node| node.kind() == "short_var_declaration")
-        && let Some(block) = statement
-            .parent()
-            .filter(|node| node.kind() == "statement_list")
+        && let Some(statement) =
+            parent_of(parent).filter(|node| node.kind() == "short_var_declaration")
+        && let Some(block) = parent_of(statement).filter(|node| node.kind() == "statement_list")
         && let Some(previous) = previous
-        && same_short_declaration_scope(previous, block, spelling, text)
+        && same_short_declaration_scope(previous, block, spelling, text, parent_of)
     {
         return Some(previous);
     }
     Some(node)
 }
 
-fn same_short_declaration_scope(
-    previous: Node<'_>,
-    block: Node<'_>,
+fn same_short_declaration_scope<'tree>(
+    previous: Node<'tree>,
+    block: Node<'tree>,
     spelling: &str,
     text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
 ) -> bool {
-    if case_entry_binding(block, spelling, text).is_some_and(|binding| binding.name == previous) {
+    if case_entry_binding(block, spelling, text, parent_of)
+        .is_some_and(|binding| binding.name == previous)
+    {
         return true;
     }
-    let Some(body) = block.parent() else {
+    let Some(body) = parent_of(block) else {
         return false;
     };
-    let mut cursor = previous.parent();
+    let mut cursor = parent_of(previous);
     while let Some(node) = cursor {
         match node.kind() {
             "statement_list" => return node == block,
@@ -660,16 +703,24 @@ fn same_short_declaration_scope(
                 return node.child_by_field_name("body") == Some(body);
             }
             "source_file" => return false,
-            _ => cursor = node.parent(),
+            _ => cursor = parent_of(node),
         }
     }
     false
 }
 
 pub(crate) fn declaration_binding<'tree>(name: Node<'tree>, text: &str) -> Option<Binding<'tree>> {
-    let parent = name.parent()?;
+    declaration_binding_with(name, text, &|node| node.parent())
+}
+
+pub(crate) fn declaration_binding_with<'tree>(
+    name: Node<'tree>,
+    text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Binding<'tree>> {
+    let parent = parent_of(name)?;
     let owner = if parent.kind() == "expression_list" {
-        parent.parent()?
+        parent_of(parent)?
     } else {
         parent
     };

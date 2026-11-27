@@ -140,7 +140,7 @@ pub(super) fn check_collisions(
             }
             // Imports share a file block, and Go additionally forbids a package
             // declaration from duplicating any identifier in a file block.
-            for existing in index.imports.clone() {
+            for existing in index.imports.clone().iter() {
                 if import && existing.binding.start == range.start {
                     continue;
                 }

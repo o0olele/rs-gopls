@@ -1,36 +1,21 @@
 use std::collections::HashSet;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::SystemTime;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 use crate::semantic::index::text_fingerprint;
+pub(in crate::semantic) use crate::workspace::DiagnosticFileStamp as Stamp;
 
 use super::imports::SymbolMatcher;
 use super::sdk_names::{Names, scan_names};
 
 pub(in crate::semantic) const SOURCE_LIMIT: usize = 8;
 pub(in crate::semantic) const BYTE_LIMIT: usize = 16 * 1024 * 1024;
-
-#[derive(Clone, PartialEq, Eq)]
-pub(in crate::semantic) struct Stamp {
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-impl From<Metadata> for Stamp {
-    fn from(metadata: Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub(in crate::semantic) struct FileNames {

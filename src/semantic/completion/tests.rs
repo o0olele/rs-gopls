@@ -2164,7 +2164,7 @@ struct LspSession {
 impl LspSession {
     fn new(path: &Path, capabilities: Value) -> Self {
         let session = TestSession::new();
-        let mut state = crate::State::Starting;
+        let mut state = crate::State::starting();
         let uri = crate::protocol::path_uri(path).unwrap();
         let root = crate::protocol::path_uri(path.parent().unwrap()).unwrap();
         session.request(
@@ -2503,10 +2503,7 @@ fn lsp_cancels_pending_and_batched_requests_and_rejects_outdated_batches() {
     running
         .workspace_loaded(
             lsp.session.server(),
-            crate::scheduler::WorkspaceResult {
-                load,
-                result: Ok(workspace()),
-            },
+            crate::scheduler::WorkspaceResult::for_test(&running.engine, load, Ok(workspace())),
         )
         .unwrap();
     running.engine.completion_imports.use_empty_sdk(
@@ -2585,9 +2582,10 @@ fn lsp_completion_uses_unsaved_edits_close_restores_disk_and_graph_refresh_adds_
     running
         .workspace_loaded(
             lsp.session.server(),
-            crate::scheduler::WorkspaceResult {
-                load: running.engine.workspace_load(),
-                result: Ok(listing(
+            crate::scheduler::WorkspaceResult::for_test(
+                &running.engine,
+                running.engine.workspace_load(),
+                Ok(listing(
                     &project,
                     &[
                         pkg(
@@ -2605,7 +2603,7 @@ fn lsp_completion_uses_unsaved_edits_close_restores_disk_and_graph_refresh_adds_
                     ],
                     false,
                 )),
-            },
+            ),
         )
         .unwrap();
     running.engine.completion_imports.use_empty_sdk(

@@ -1,19 +1,223 @@
 use std::cmp::Reverse;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lsp_types::{DocumentHighlight, DocumentHighlightKind, Position, Range};
 use tree_sitter::Node;
 
 use super::{
-    Editor, Occurrence, SymbolId, SymbolKind, ancestors, descendants, function_owner, is_breakable,
-    is_function, named_children, parameter_slots,
+    Editor, Occurrence, SymbolId, SymbolKind, is_breakable, is_function, named_children,
+    parameter_slots,
 };
 use crate::scope::initializer_at;
 
-pub(super) fn highlights(editor: &Editor<'_>, position: Position) -> Vec<DocumentHighlight> {
-    let Some(leaf) = caret_leaf(editor, position) else {
-        return Vec::new();
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum HighlightKey {
+    Exits(usize),
+    Jump {
+        target: usize,
+        labeled: bool,
+    },
+    Name {
+        binding: Option<HighlightBinding>,
+        slot: Option<ReturnSlotKey>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum HighlightBinding {
+    Declaration(usize),
+    Builtin(Box<str>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ReturnSlotKey {
+    owner: usize,
+    index: usize,
+    signature: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Target<'tree> {
+    Exits(Node<'tree>),
+    Jump(JumpTarget<'tree>),
+    Name {
+        symbol: Option<NameTarget<'tree>>,
+        slot: Option<ReturnTarget<'tree>>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NameTarget<'tree> {
+    symbol: Occurrence<'tree>,
+    spelling: &'tree str,
+    scope: Option<Node<'tree>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ReturnTarget<'tree> {
+    body: Node<'tree>,
+    index: usize,
+    signature: Option<Node<'tree>>,
+}
+
+impl Target<'_> {
+    pub(super) fn key(&self) -> HighlightKey {
+        match *self {
+            Self::Exits(owner) => HighlightKey::Exits(owner.start_byte()),
+            Self::Jump(target) => HighlightKey::Jump {
+                target: match target {
+                    JumpTarget::Statement(node) | JumpTarget::Label(node) => node.start_byte(),
+                },
+                labeled: matches!(target, JumpTarget::Label(_)),
+            },
+            Self::Name { symbol, slot } => HighlightKey::Name {
+                binding: symbol.map(|target| match target.symbol.id {
+                    SymbolId::Declaration(offset) => HighlightBinding::Declaration(offset),
+                    SymbolId::Builtin(name) => HighlightBinding::Builtin(name.into()),
+                }),
+                slot: slot.map(|target| ReturnSlotKey {
+                    owner: target.body.start_byte(),
+                    index: target.index,
+                    signature: target.signature.map(|node| node.byte_range()),
+                }),
+            },
+        }
+    }
+
+    pub(super) fn path(&self) -> &'static str {
+        match self {
+            Self::Exits(_) => "function_exit",
+            Self::Jump(_) => "jump",
+            Self::Name { slot: Some(_), .. } => "return_slot",
+            Self::Name {
+                symbol: Some(NameTarget { scope: Some(_), .. }),
+                ..
+            } => "lexical",
+            Self::Name { .. } => "name_offsets",
+        }
+    }
+}
+
+pub(super) fn prepare<'tree>(editor: &Editor<'tree>, position: Position) -> Option<Target<'tree>> {
+    let leaf = caret_leaf(editor, position)?;
+    if matches!(leaf.kind(), "func" | "return") || is_panic_callee(editor, leaf) {
+        return editor.function_owner(leaf).map(Target::Exits);
+    }
+    if matches!(
+        leaf.kind(),
+        "for" | "switch" | "select" | "break" | "continue"
+    ) {
+        return jump_target_at(editor, leaf).map(Target::Jump);
+    }
+
+    let slot = editor.function_owner(leaf).and_then(|owner| {
+        let body = owner.child_by_field_name("body")?;
+        let slots = result_slots(owner);
+        if slots.is_empty() {
+            return None;
+        }
+        let (index, signature) = return_slot_at(editor, leaf, owner, &slots)?;
+        Some(ReturnTarget {
+            body,
+            index,
+            signature,
+        })
+    });
+    let symbol = (leaf.kind() != "dot")
+        .then(|| editor.symbol(leaf))
+        .flatten()
+        .map(|symbol| NameTarget {
+            spelling: editor.text(leaf),
+            scope: lexical_scope(editor, leaf, symbol),
+            symbol,
+        });
+    (symbol.is_some() || slot.is_some()).then_some(Target::Name { symbol, slot })
+}
+
+fn lexical_scope<'tree>(
+    editor: &Editor<'tree>,
+    leaf: Node<'tree>,
+    symbol: Occurrence<'tree>,
+) -> Option<Node<'tree>> {
+    let SymbolId::Declaration(offset) = symbol.id else {
+        return None;
     };
+    if matches!(
+        symbol.kind,
+        SymbolKind::Namespace | SymbolKind::Property | SymbolKind::Method
+    ) {
+        return None;
+    }
+    let declaration = if leaf.start_byte() == offset {
+        leaf
+    } else {
+        editor.node_for_bytes(offset, offset + 1)?
+    };
+    let scope = match symbol.kind {
+        SymbolKind::Label => editor.function_owner(declaration),
+        SymbolKind::Parameter => editor.ancestors(declaration).find(|node| {
+            is_function(*node) || matches!(node.kind(), "function_type" | "method_elem")
+        }),
+        SymbolKind::TypeParameter => editor
+            .ancestors(declaration)
+            .find(|node| is_function(*node) || matches!(node.kind(), "type_spec" | "type_alias")),
+        _ => local_declaration_scope(editor, declaration),
+    }?;
+
+    let inside = scope.start_byte() <= leaf.start_byte() && leaf.end_byte() <= scope.end_byte();
+    // Scope recovery can join a detached body to its preceding signature.
+    // Include every same-name candidate in an uncertain recovery scope.
+    let recovered = scope.has_error()
+        || editor
+            .ancestors(scope)
+            .take_while(|node| node.kind() != "source_file")
+            .any(|node| node.is_error() || node.is_missing())
+        || (is_function(scope)
+            && scope.child_by_field_name("body").is_none()
+            && editor.root().has_error());
+    (inside && !recovered).then_some(scope)
+}
+
+fn local_declaration_scope<'tree>(
+    editor: &Editor<'tree>,
+    declaration: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let parent = editor.parent(declaration)?;
+    if parent.kind() == "expression_list" {
+        let statement = editor.parent(parent)?;
+        let owner = editor.parent(statement)?;
+        match statement.kind() {
+            "type_switch_statement" => return Some(statement),
+            "range_clause" if owner.kind() == "for_statement" => return Some(owner),
+            "receive_statement" if owner.kind() == "communication_case" => return Some(owner),
+            "short_var_declaration" => match owner.kind() {
+                "if_statement" | "expression_switch_statement" | "type_switch_statement" => {
+                    return Some(owner);
+                }
+                "for_clause" => {
+                    return editor
+                        .parent(owner)
+                        .filter(|node| node.kind() == "for_statement");
+                }
+                _ => {}
+            },
+            _ => return None,
+        }
+    }
+    editor
+        .ancestors(parent)
+        .take_while(|node| !node.is_error() && !is_function(*node))
+        .find(|node| node.kind() == "statement_list")
+}
+
+pub(super) fn compute<'tree>(
+    editor: &Editor<'tree>,
+    target: Target<'tree>,
+    cancelled: Option<&AtomicBool>,
+) -> Option<(Vec<DocumentHighlight>, usize)> {
+    check_cancelled(cancelled)?;
     let mut result = Vec::new();
+    let mut count = 0;
     let mut add = |node, kind| {
         let range = editor.range(node);
         if range.start < range.end {
@@ -24,37 +228,34 @@ pub(super) fn highlights(editor: &Editor<'_>, position: Position) -> Vec<Documen
         }
     };
 
-    if matches!(leaf.kind(), "func" | "return") || is_panic_callee(editor, leaf) {
-        if let Some(owner) = function_owner(leaf) {
-            function_exits(editor, owner, |node| add(node, DocumentHighlightKind::TEXT));
+    match target {
+        Target::Exits(owner) => {
+            function_exits(editor, owner, cancelled, |node| {
+                count += 1;
+                add(node, DocumentHighlightKind::TEXT);
+            })?;
         }
-    } else if matches!(
-        leaf.kind(),
-        "for" | "switch" | "select" | "break" | "continue"
-    ) {
-        if let Some(target) = jump_target_at(editor, leaf) {
-            jump_occurrences(editor, target, |node| {
-                add(node, DocumentHighlightKind::TEXT)
-            });
+        Target::Jump(target) => {
+            jump_occurrences(editor, target, cancelled, |node| {
+                count += 1;
+                add(node, DocumentHighlightKind::TEXT);
+            })?;
         }
-    } else {
-        if let Some(owner) = function_owner(leaf) {
-            return_occurrences(owner, leaf, |node| add(node, DocumentHighlightKind::TEXT));
-        }
-        if leaf.kind() != "dot"
-            && let Some(symbol) = editor.symbol(leaf)
-        {
-            let spelling = editor.text(leaf);
-            for node in descendants(editor.root()) {
-                if node.child_count() == 0
-                    && editor.text(node) == spelling
-                    && let Some(candidate) = editor.symbol(node)
-                    && candidate.id == symbol.id
-                {
-                    add(node, access(node, &candidate));
-                }
+        Target::Name { symbol, slot } => {
+            if let Some(slot) = slot {
+                return_occurrences(slot, cancelled, |node| {
+                    count += 1;
+                    add(node, DocumentHighlightKind::TEXT);
+                })?;
             }
-            result.extend(implicit_import_highlight(editor, spelling, symbol));
+            if let Some(target) = symbol {
+                count += name_occurrences(editor, target, cancelled, add)?;
+                result.extend(implicit_import_highlight(
+                    editor,
+                    target.spelling,
+                    target.symbol,
+                ));
+            }
         }
     }
 
@@ -67,7 +268,78 @@ pub(super) fn highlights(editor: &Editor<'_>, position: Position) -> Vec<Documen
         (item.range.start, item.range.end, Reverse(priority))
     });
     result.dedup_by_key(|item| item.range);
-    result
+    check_cancelled(cancelled)?;
+    Some((result, count))
+}
+
+fn name_occurrences<'tree>(
+    editor: &Editor<'tree>,
+    target: NameTarget<'tree>,
+    cancelled: Option<&AtomicBool>,
+    mut add: impl FnMut(Node<'tree>, DocumentHighlightKind),
+) -> Option<usize> {
+    let source = editor.document.indexed();
+    let mut count = 0;
+    let mut candidate = |node| {
+        count += 1;
+        if let Some(candidate) = editor.symbol(node)
+            && candidate.id == target.symbol.id
+        {
+            add(node, access(editor, node, &candidate));
+        }
+    };
+    let includes_special_tokens = target.symbol.kind == SymbolKind::Label
+        || matches!(target.spelling, "true" | "false" | "nil" | "iota");
+    let ready = if includes_special_tokens {
+        None
+    } else {
+        source.ready_name_offsets(target.spelling)
+    };
+    if let Some(scope) = target.scope
+        && ready.is_none()
+    {
+        walk(scope, cancelled, |node| {
+            if node.child_count() == 0 && editor.text(node) == target.spelling {
+                candidate(node);
+            }
+            true
+        })?;
+    } else {
+        let cold_offsets;
+        let offsets = if let Some(offsets) = ready {
+            offsets
+        } else {
+            cold_offsets = source.highlight_name_offsets(target.spelling, cancelled)?;
+            &*cold_offsets
+        };
+        let offsets = if let Some(scope) = target.scope {
+            let first = offsets.partition_point(|&offset| offset < scope.start_byte());
+            let last = offsets.partition_point(|&offset| offset < scope.end_byte());
+            &offsets[first..last]
+        } else {
+            offsets
+        };
+        for &offset in offsets {
+            check_cancelled(cancelled)?;
+            let end = offset + target.spelling.len();
+            let node = match target.scope {
+                Some(scope) => scope.descendant_for_byte_range(offset, end),
+                None => editor.node_for_bytes(offset, end),
+            };
+            if let Some(node) = node
+                && node.byte_range() == (offset..end)
+                && !node.is_extra()
+                && node.child_count() == 0
+            {
+                candidate(node);
+            }
+        }
+    }
+    Some(count)
+}
+
+fn check_cancelled(cancelled: Option<&AtomicBool>) -> Option<()> {
+    (!cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))).then_some(())
 }
 
 fn implicit_import_highlight(
@@ -75,9 +347,12 @@ fn implicit_import_highlight(
     spelling: &str,
     symbol: Occurrence<'_>,
 ) -> Option<DocumentHighlight> {
-    let binding = editor.imports.get(spelling).copied().flatten()?;
+    if symbol.kind != SymbolKind::Namespace {
+        return None;
+    }
+    let binding = editor.import_binding(spelling)?;
     if symbol.id != SymbolId::Declaration(binding.start_byte())
-        || binding.parent()?.child_by_field_name("path") != Some(binding)
+        || editor.parent(binding)?.child_by_field_name("path") != Some(binding)
     {
         return None;
     }
@@ -95,11 +370,10 @@ fn implicit_import_highlight(
 fn caret_leaf<'tree>(editor: &Editor<'tree>, position: Position) -> Option<Node<'tree>> {
     let offset = editor.offset(position)?;
     let text = editor.source();
-    let root = editor.root();
     let char_at = |offset| text.get(offset..)?.chars().next();
     let locate = |offset| {
         let end = offset + char_at(offset)?.len_utf8();
-        root.descendant_for_byte_range(offset, end)
+        editor.node_for_bytes(offset, end)
     };
 
     let current = locate(offset);
@@ -120,10 +394,14 @@ fn caret_character(ch: char) -> bool {
 }
 
 fn in_comment(node: Node<'_>) -> bool {
-    ancestors(node).any(|node| node.kind() == "comment")
+    node.kind() == "comment"
 }
 
-pub(super) fn access(node: Node<'_>, symbol: &Occurrence) -> DocumentHighlightKind {
+pub(super) fn access<'tree>(
+    editor: &Editor<'tree>,
+    node: Node<'tree>,
+    symbol: &Occurrence<'_>,
+) -> DocumentHighlightKind {
     if !matches!(
         symbol.kind,
         SymbolKind::Variable | SymbolKind::Parameter | SymbolKind::Property
@@ -131,29 +409,31 @@ pub(super) fn access(node: Node<'_>, symbol: &Occurrence) -> DocumentHighlightKi
         return DocumentHighlightKind::TEXT;
     }
 
+    let parent = editor.parent(node);
     let variable_definition = symbol.declaration
-        && node
-            .parent()
-            .is_some_and(|parent| matches!(parent.kind(), "var_spec" | "const_spec"));
+        && parent.is_some_and(|parent| matches!(parent.kind(), "var_spec" | "const_spec"));
     let struct_key = symbol.kind == SymbolKind::Property
-        && node
-            .parent()
+        && parent
             .filter(|parent| parent.kind() == "literal_element")
             .is_some_and(|key| {
-                key.parent().is_some_and(|element| {
+                editor.parent(key).is_some_and(|element| {
                     element.kind() == "keyed_element"
                         && element.child_by_field_name("key") == Some(key)
                 })
             });
-    if variable_definition || struct_key || is_write_target(node) {
+    if variable_definition || struct_key || is_write_target(editor, node, parent) {
         DocumentHighlightKind::WRITE
     } else {
         DocumentHighlightKind::READ
     }
 }
 
-fn is_write_target(mut expression: Node<'_>) -> bool {
-    while let Some(parent) = expression.parent() {
+fn is_write_target<'tree>(
+    editor: &Editor<'tree>,
+    mut expression: Node<'tree>,
+    mut enclosing: Option<Node<'tree>>,
+) -> bool {
+    while let Some(parent) = enclosing {
         match parent.kind() {
             "parenthesized_expression" => {}
             "unary_expression"
@@ -164,8 +444,8 @@ fn is_write_target(mut expression: Node<'_>) -> bool {
             "inc_statement" | "dec_statement" => return true,
             "send_statement" => return parent.child_by_field_name("channel") == Some(expression),
             "expression_list" => {
-                return parent
-                    .parent()
+                return editor
+                    .parent(parent)
                     .is_some_and(|statement| match statement.kind() {
                         "assignment_statement"
                         | "short_var_declaration"
@@ -182,14 +462,15 @@ fn is_write_target(mut expression: Node<'_>) -> bool {
             _ => return false,
         }
         expression = parent;
+        enclosing = editor.parent(parent);
     }
     false
 }
 
-fn is_panic_callee(editor: &Editor<'_>, callee: Node<'_>) -> bool {
+fn is_panic_callee<'tree>(editor: &Editor<'tree>, callee: Node<'tree>) -> bool {
     callee.kind() == "identifier"
         && editor.text(callee) == "panic"
-        && callee.parent().is_some_and(|call| {
+        && editor.parent(callee).is_some_and(|call| {
             call.kind() == "call_expression" && call.child_by_field_name("function") == Some(callee)
         })
         && editor
@@ -200,15 +481,16 @@ fn is_panic_callee(editor: &Editor<'_>, callee: Node<'_>) -> bool {
 fn function_exits<'tree>(
     editor: &Editor<'tree>,
     owner: Node<'tree>,
+    cancelled: Option<&AtomicBool>,
     mut add: impl FnMut(Node<'tree>),
-) {
+) -> Option<()> {
     if let Some(keyword) = keyword(owner, "func") {
         add(keyword);
     }
     let Some(body) = owner.child_by_field_name("body") else {
-        return;
+        return Some(());
     };
-    walk_function_body(body, |node| match node.kind() {
+    walk_function_body(body, cancelled, |node| match node.kind() {
         "return_statement" => {
             add(node);
             false
@@ -222,17 +504,30 @@ fn function_exits<'tree>(
             true
         }
         _ => true,
-    });
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum JumpTarget<'tree> {
+pub(super) enum JumpTarget<'tree> {
     Statement(Node<'tree>),
     Label(Node<'tree>),
 }
 
+impl<'tree> JumpTarget<'tree> {
+    fn scope(self, editor: &Editor<'tree>) -> Node<'tree> {
+        match self {
+            Self::Statement(statement) => statement,
+            Self::Label(label) => editor
+                .function_owner(label)
+                .and_then(|owner| owner.child_by_field_name("body"))
+                .or_else(|| editor.parent(label))
+                .unwrap_or(label),
+        }
+    }
+}
+
 fn jump_target_at<'tree>(editor: &Editor<'tree>, leaf: Node<'tree>) -> Option<JumpTarget<'tree>> {
-    let parent = leaf.parent()?;
+    let parent = editor.parent(leaf)?;
     if is_breakable(parent) {
         Some(JumpTarget::Statement(parent))
     } else {
@@ -254,7 +549,8 @@ fn jump_target<'tree>(editor: &Editor<'tree>, jump: Node<'tree>) -> Option<JumpT
             is_breakable(node)
         }
     };
-    ancestors(jump)
+    editor
+        .ancestors(jump)
         .skip(1)
         .take_while(|node| !is_function(*node))
         .find(|node| allowed(*node))
@@ -264,9 +560,10 @@ fn jump_target<'tree>(editor: &Editor<'tree>, jump: Node<'tree>) -> Option<JumpT
 fn jump_occurrences<'tree>(
     editor: &Editor<'tree>,
     target: JumpTarget<'tree>,
+    cancelled: Option<&AtomicBool>,
     mut add: impl FnMut(Node<'tree>),
-) {
-    let scope = match target {
+) -> Option<()> {
+    match target {
         JumpTarget::Statement(statement) => {
             let keyword_name = match statement.kind() {
                 "for_statement" => "for",
@@ -276,22 +573,15 @@ fn jump_occurrences<'tree>(
             if let Some(keyword) = keyword(statement, keyword_name) {
                 add(keyword);
             }
-            statement
         }
-        JumpTarget::Label(label) => {
-            add(label);
-            function_owner(label)
-                .and_then(|owner| owner.child_by_field_name("body"))
-                .or_else(|| label.parent())
-                .unwrap_or(label)
-        }
-    };
-    walk_function_body(scope, |node| {
+        JumpTarget::Label(label) => add(label),
+    }
+    walk_function_body(target.scope(editor), cancelled, |node| {
         if jump_target(editor, node) == Some(target) {
             add(node);
         }
         true
-    });
+    })
 }
 
 struct ResultSlot<'tree> {
@@ -318,38 +608,33 @@ fn result_slots(owner: Node<'_>) -> Vec<ResultSlot<'_>> {
 }
 
 fn return_occurrences<'tree>(
-    owner: Node<'tree>,
-    leaf: Node<'tree>,
+    target: ReturnTarget<'tree>,
+    cancelled: Option<&AtomicBool>,
     mut add: impl FnMut(Node<'tree>),
-) {
-    let Some(body) = owner.child_by_field_name("body") else {
-        return;
-    };
-    let slots = result_slots(owner);
-    let Some((index, signature)) = return_slot_at(leaf, owner, &slots) else {
-        return;
-    };
-    if let Some(signature) = signature {
+) -> Option<()> {
+    if let Some(signature) = target.signature {
         add(signature);
     }
-    walk_function_body(body, |node| {
+    walk_function_body(target.body, cancelled, |node| {
         if node.kind() != "return_statement" {
             return true;
         }
         let list = named_children(node).find(|part| part.kind() == "expression_list");
-        if let (Some(expression), _) = initializer_at(list, index) {
+        if let (Some(expression), _) = initializer_at(list, target.index) {
             add(expression);
         }
         false
-    });
+    })
 }
 
 fn return_slot_at<'tree>(
+    editor: &Editor<'tree>,
     leaf: Node<'tree>,
     owner: Node<'tree>,
     slots: &[ResultSlot<'tree>],
 ) -> Option<(usize, Option<Node<'tree>>)> {
-    for node in ancestors(leaf).take_while(|node| *node != owner) {
+    let mut node = leaf;
+    while node != owner {
         if let Some(index) = slots
             .iter()
             .position(|slot| slot.name.or(slot.ty) == Some(node))
@@ -362,16 +647,17 @@ fn return_slot_at<'tree>(
         ) {
             return None;
         }
-        let parent = node.parent()?;
+        let parent = editor.parent(node)?;
         if parent.kind() == "expression_list"
-            && parent
-                .parent()
+            && editor
+                .parent(parent)
                 .is_some_and(|statement| statement.kind() == "return_statement")
         {
             let index = named_children(parent).position(|expression| expression == node)?;
             let slot = slots.get(index)?;
             return Some((index, slot.ty.or(slot.name)));
         }
+        node = parent;
     }
     None
 }
@@ -381,13 +667,26 @@ fn keyword<'tree>(node: Node<'tree>, spelling: &str) -> Option<Node<'tree>> {
         .find(|child| child.kind() == spelling && !child.is_missing())
 }
 
-fn walk_function_body<'tree>(root: Node<'tree>, mut visit: impl FnMut(Node<'tree>) -> bool) {
+fn walk_function_body<'tree>(
+    root: Node<'tree>,
+    cancelled: Option<&AtomicBool>,
+    mut visit: impl FnMut(Node<'tree>) -> bool,
+) -> Option<()> {
+    walk(root, cancelled, |node| !is_function(node) && visit(node))
+}
+
+fn walk<'tree>(
+    root: Node<'tree>,
+    cancelled: Option<&AtomicBool>,
+    mut visit: impl FnMut(Node<'tree>) -> bool,
+) -> Option<()> {
     let mut cursor = root.walk();
     loop {
+        check_cancelled(cancelled)?;
         let node = cursor.node();
         if node.is_named()
             && !node.is_extra()
-            && !is_function(node)
+            && !node.is_missing()
             && visit(node)
             && cursor.goto_first_child()
         {
@@ -395,7 +694,7 @@ fn walk_function_body<'tree>(root: Node<'tree>, mut visit: impl FnMut(Node<'tree
         }
         while !cursor.goto_next_sibling() {
             if !cursor.goto_parent() {
-                return;
+                return Some(());
             }
         }
     }

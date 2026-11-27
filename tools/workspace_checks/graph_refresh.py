@@ -1,12 +1,19 @@
 """Check watched workspace changes, package graphs, and graph refresh."""
 
-from check_goland_symbols import WORKSPACE
-from lsp_harness import PausedGoList, expect_error, notify_changes, session, site, wait_for_response, write
+import time
+
+from check_goland_symbols import WORKSPACE, lsp_span
+from lsp_harness import (
+    PausedGoList, expect_error, next_message, notify_changes, session, site, wait_for_response, write,
+)
 
 from ._assertions import (
     check_location, check_references, check_type_location, expect_target,
     expect_workspace_symbols, no_definition, send_definition,
 )
+from ._gopath_configuration import check_gopath_configuration
+from .diagnostics import capability_session, expect_publications, full_report, pull
+from .gopath_fixture import check_gopath_initialization, dual_gopath, isolated_go_environment
 
 
 def check_mutations(executable_path, root, timeout):
@@ -219,9 +226,133 @@ def check_async_refresh(executable_path, root, timeout):
         check_location(client, graph_query, targets["latest"])
 
 
+def check_gopath_configuration_refresh(executable_path, root, timeout):
+    fixture = dual_gopath(root / "project")
+    full = {"env": {"GOPATH": fixture.gopath}}
+    reduced = {"env": {"GOPATH": str(fixture.server)}}
+    edited = fixture.reference.text + "\nfunc overlay() { local := 1; _ = /*😀*/ local }\n"
+    local_use = site(fixture.caller, "_ = /*😀*/ [[local]]", edited)
+    local_decl = site(fixture.caller, "{ [[local]] :=", edited)
+    main = site(fixture.caller, "/*😀*/ [[LegacyMain]]()")
+    import_ranges = sorted(
+        lsp_span(site(fixture.caller, f'[["{name}"]]').selection())
+        for name in ("base/glog", "cmdmsg")
+    )
+    missing_codes = ["import.invalid", "import.invalid", "package.load", "package.load"]
+    gate = PausedGoList(root / "control", timeout)
+    environment = {**isolated_go_environment(), **gate.environment}
+    caps = {
+        "textDocument": {"diagnostic": {}, "publishDiagnostics": {}},
+        "workspace": {"diagnostics": {"refreshSupport": True}},
+    }
+
+    def resolved(client):
+        check_location(client, fixture.reference, fixture.target)
+        check_references(client, fixture.reference, (fixture.reference, fixture.target),
+                         include_declaration=True)
+        check_references(client, fixture.reference, (fixture.reference,))
+        check_location(client, local_use, local_decl)
+
+    def unresolved(client):
+        no_definition(client, fixture.reference)
+        check_references(client, fixture.reference, (), include_declaration=True)
+        check_location(client, local_use, local_decl)
+
+    with capability_session(executable_path, fixture.server, timeout, caps,
+                            environment=environment, initialization_options=full) as (client, _):
+        refresh_ids = set()
+
+        def refresh():
+            request = next_message(client, time.monotonic() + timeout)
+            request_id = request.get("id")
+            if (request.get("method") != "workspace/diagnostic/refresh"
+                    or not isinstance(request_id, str) or request_id in refresh_ids):
+                raise RuntimeError(f"expected a diagnostic refresh with a fresh ID, got {request!r}")
+            refresh_ids.add(request_id)
+
+        # Load the test-inclusive graph before tracking refreshes and relay calls.
+        expect_workspace_symbols(client.request(WORKSPACE, query="LegacyMain"), main, kind=12, container="server")
+        refresh()
+        client.open_document(fixture.caller, edited)
+        resolved(client)
+        clean_id = full_report(pull(client, fixture.caller), [])
+        initial_calls = len(gate.calls())
+
+        with gate.pause():
+            client.change_configuration(reduced)
+            gate.wait_for_snapshot()
+            send_definition(client, "missing-dependency", fixture.reference)
+            for settings in ({}, None, {"settings": {"other": True}}, {"env": None},
+                             {"gopls": reduced}):
+                client.change_configuration(settings)
+            # A lexical request orders the notifications while the graph request is still waiting.
+            send_definition(client, "check-no-op", local_use)
+            expect_target(wait_for_response(client, "check-no-op", min(timeout, 5)), local_decl)
+        response = wait_for_response(client, "missing-dependency")
+        if "error" in response or response.get("result"):
+            raise RuntimeError(f"expected no definition after dropping the dependency, got {response!r}")
+        refresh()
+        unresolved(client)
+        if len(gate.calls()) != initial_calls + 1:
+            raise RuntimeError("equivalent or invalid configuration started another package load")
+        report = pull(client, fixture.caller, clean_id)
+        missing_id = full_report(report, missing_codes)
+        actual = sorted(lsp_span(item["range"]) for item in report["items"] if item["code"] == "import.invalid")
+        if actual != import_ranges or missing_id == clean_id:
+            raise RuntimeError(f"expected new missing imports at {import_ranges!r}, got {report!r}")
+
+        client.change_configuration(full)
+        refresh()
+        resolved(client)
+        restored_id = full_report(pull(client, fixture.caller, missing_id), [])
+        if restored_id == missing_id:
+            raise RuntimeError("restoring GOPATH kept the missing-import result ID")
+
+        before_pause = len(gate.calls())
+        with gate.pause():
+            client.change_configuration(reduced)
+            gate.wait_for_snapshot()
+            send_definition(client, "obsolete-config", fixture.reference)
+            client.change_configuration(full)
+            expect_error(wait_for_response(client, "obsolete-config", min(timeout, 5)), -32801)
+            send_definition(client, "current-config", fixture.reference)
+            send_definition(client, "check-pending", local_use)
+            expect_target(wait_for_response(client, "check-pending", min(timeout, 5)), local_decl)
+        expect_target(wait_for_response(client, "current-config"), fixture.target)
+        refresh()
+        resolved(client)
+        full_report(pull(client, fixture.caller), [])
+        if len(gate.calls()) != before_pause + 2:
+            raise RuntimeError("expected one obsolete load and one current load after the configuration race")
+        try:
+            unexpected = next_message(client, time.monotonic())
+        except RuntimeError as exc:
+            if not isinstance(exc.__cause__, TimeoutError):
+                raise
+        else:
+            raise RuntimeError(f"unexpected message after the current graph installed: {unexpected!r}")
+
+    caps = {"textDocument": {"publishDiagnostics": {}}}
+    with capability_session(executable_path, fixture.server, timeout, caps,
+                            environment=environment, initialization_options=full) as (client, _):
+        expect_workspace_symbols(client.request(WORKSPACE, query="LegacyMain"), main, kind=12, container="server")
+        client.open_document(fixture.caller, edited)
+        expect_publications(client, {fixture.caller: (1, [])})
+        resolved(client)
+        client.change_configuration(reduced)
+        expect_publications(client, {fixture.caller: (1, missing_codes)})
+        unresolved(client)
+        client.change_configuration(full)
+        expect_publications(client, {fixture.caller: (1, [])})
+        resolved(client)
+
+
 CASES = [
     ("mutations", check_mutations, 1),
     ("go-work", check_go_work, 2),
     ("gopath", check_gopath, 4),
     ("async-refresh", check_async_refresh, 5),
+    ("gopath-initialization", check_gopath_initialization),
+    ("gopath-configuration-refresh", check_gopath_configuration_refresh),
+    ("gopath-configuration", check_gopath_configuration),
 ]
