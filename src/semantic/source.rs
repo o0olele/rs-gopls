@@ -1,13 +1,17 @@
 use std::cell::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 use crate::symbols::{self, FileOutline};
+
+use super::editor::HighlightCache;
 
 #[derive(Clone, Copy)]
 pub(super) enum ReferenceQuery<'tree> {
@@ -41,11 +45,130 @@ pub(super) fn read_source(parser: &mut Parser, path: &Path) -> Result<Source> {
     Source::parse(parser, path.to_owned(), text, None)
 }
 
+pub(super) fn read_navigation_source(
+    parser: &mut Parser,
+    path: &Path,
+    probe: Option<&super::navigation_trace::NavigationProbe>,
+) -> Result<Source> {
+    use super::navigation_trace::{record, sample};
+
+    let Some(probe) = probe else {
+        return read_source(parser, path);
+    };
+    let text = {
+        let _read = sample(Some(probe), |counts| &mut counts.read);
+        record(Some(probe), |counts| {
+            counts.text_misses += 1;
+            counts.disk_reads += 1;
+        });
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    };
+    parse_navigation_source(parser, path, text, Some(probe))
+}
+
+pub(super) fn parse_navigation_source(
+    parser: &mut Parser,
+    path: &Path,
+    text: impl Into<Arc<String>>,
+    probe: Option<&super::navigation_trace::NavigationProbe>,
+) -> Result<Source> {
+    use super::navigation_trace::{record, sample};
+
+    record(probe, |counts| counts.ast_parses += 1);
+    let _parse = sample(probe, |counts| &mut counts.parse);
+    let text = text.into();
+    let lines = LineIndex::new(&text);
+    Source::parse_with_lines(parser, path.to_owned(), text, lines, None)
+}
+
 #[derive(Clone)]
 pub(super) struct Import {
     pub(super) alias: Option<String>,
     pub(super) path: String,
     pub(super) binding: Range,
+}
+
+#[derive(Default)]
+pub(super) struct EditorNames {
+    pub(super) raw_imports: Vec<Import>,
+    pub(super) imports: HashMap<String, Option<std::ops::Range<usize>>>,
+    files: HashMap<String, FileName>,
+    pub(super) methods: HashSet<String>,
+}
+
+enum FileName {
+    Declaration(std::ops::Range<usize>),
+    Incomplete,
+    Ambiguous,
+}
+
+impl EditorNames {
+    pub(super) fn ambiguous(&self, name: &str) -> bool {
+        matches!(self.files.get(name), Some(FileName::Ambiguous))
+    }
+
+    pub(super) fn declaration(&self, name: &str) -> Option<std::ops::Range<usize>> {
+        match self.files.get(name)? {
+            FileName::Declaration(bytes) => Some(bytes.clone()),
+            FileName::Incomplete | FileName::Ambiguous => None,
+        }
+    }
+
+    fn collect_declaration(&mut self, declaration: Node<'_>, text: &str) {
+        if declaration.is_extra() || declaration.is_missing() {
+            return;
+        }
+        let mut cursor = declaration.walk();
+        match declaration.kind() {
+            "method_declaration" => {
+                if let Some(name) = declaration.child_by_field_name("name") {
+                    self.methods.insert(node_text(name, text).to_owned());
+                }
+            }
+            "var_declaration" | "var_spec_list" | "const_declaration" | "type_declaration" => {
+                for child in declaration.named_children(&mut cursor) {
+                    self.collect_declaration(child, text);
+                }
+            }
+            "function_declaration" | "type_spec" | "type_alias" | "var_spec" | "const_spec" => {
+                let complete = !is_type_declaration(declaration)
+                    || declaration.child_by_field_name("type").is_some();
+                for name in declaration
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(Node::is_named)
+                {
+                    let spelling = node_text(name, text);
+                    let is_value = matches!(declaration.kind(), "var_spec" | "const_spec");
+                    let file_name = if complete
+                        && !spelling.is_empty()
+                        && spelling != "_"
+                        && (if is_value {
+                            name.kind() == "identifier"
+                        } else {
+                            declaration.child_by_field_name("name") == Some(name)
+                        }) {
+                        FileName::Declaration(name.byte_range())
+                    } else {
+                        FileName::Incomplete
+                    };
+                    self.files
+                        .entry(spelling.to_owned())
+                        .and_modify(|entry| *entry = FileName::Ambiguous)
+                        .or_insert(file_name);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(super) struct DiagnosticImport {
+    pub(super) alias: Option<String>,
+    pub(super) path: Option<String>,
+    pub(super) decoded_path: Option<String>,
+    pub(super) spec: std::ops::Range<usize>,
+    pub(super) literal: std::ops::Range<usize>,
+    pub(super) binding: std::ops::Range<usize>,
 }
 
 pub(super) struct TextEditDelta<'a> {
@@ -57,14 +180,55 @@ pub(super) struct TextEditDelta<'a> {
     pub(super) tree: &'a Tree,
 }
 
+#[derive(Default)]
+struct HighlightNames(Mutex<HashMap<String, Arc<[usize]>>>);
+
 pub(super) struct Source {
     pub(super) path: PathBuf,
-    pub(super) text: String,
+    pub(super) text: Arc<String>,
     pub(super) lines: LineIndex,
     pub(super) tree: Tree,
-    pub(super) imports: Vec<Import>,
+    pub(super) imports: std::sync::Arc<[Import]>,
+    pub(super) diagnostic_imports: std::sync::Arc<[DiagnosticImport]>,
+    pub(super) editor_names: Arc<EditorNames>,
+    pub(super) highlights: Arc<HighlightCache>,
     pub(super) outline: OnceCell<FileOutline>,
-    reference_names: OnceCell<HashMap<String, Vec<usize>>>,
+    reference_names: Arc<OnceLock<HashMap<String, Vec<usize>>>>,
+    highlight_names: Arc<HighlightNames>,
+    fingerprint: OnceCell<u64>,
+}
+
+pub(super) struct SourceRevision {
+    path: PathBuf,
+    text: Arc<String>,
+    lines: LineIndex,
+    tree: Tree,
+    imports: Arc<[Import]>,
+    diagnostic_imports: Arc<[DiagnosticImport]>,
+    editor_names: Arc<EditorNames>,
+    highlights: Arc<HighlightCache>,
+    reference_names: Arc<OnceLock<HashMap<String, Vec<usize>>>>,
+    highlight_names: Arc<HighlightNames>,
+    fingerprint: Option<u64>,
+}
+
+impl SourceRevision {
+    pub(super) fn into_source(self) -> Source {
+        Source {
+            path: self.path,
+            text: self.text,
+            lines: self.lines,
+            tree: self.tree,
+            imports: self.imports,
+            diagnostic_imports: self.diagnostic_imports,
+            editor_names: self.editor_names,
+            highlights: self.highlights,
+            outline: OnceCell::new(),
+            reference_names: self.reference_names,
+            highlight_names: self.highlight_names,
+            fingerprint: self.fingerprint.map_or_else(OnceCell::new, OnceCell::from),
+        }
+    }
 }
 
 impl Source {
@@ -75,17 +239,19 @@ impl Source {
         previous: Option<&Tree>,
     ) -> Result<Self> {
         let lines = LineIndex::new(&text);
-        Self::parse_with_lines(parser, path, text, lines, previous)
+        Self::parse_with_lines(parser, path, Arc::new(text), lines, previous)
     }
 
     fn parse_with_lines(
         parser: &mut Parser,
         path: PathBuf,
-        text: String,
+        text: Arc<String>,
         lines: LineIndex,
         previous: Option<&Tree>,
     ) -> Result<Self> {
-        let tree = parser.parse(&text, previous).context("parsing Go source")?;
+        let tree = parser
+            .parse(text.as_bytes(), previous)
+            .context("parsing Go source")?;
         Ok(Self::from_tree(path, text, lines, tree))
     }
 
@@ -122,24 +288,89 @@ impl Source {
                     .set_included_ranges(&[])
                     .expect("resetting Tree-sitter input ranges");
                 if let Some(tree) = tree.filter(|tree| !tree.root_node().has_error()) {
-                    return Ok((Self::from_tree(path, text, lines, tree), true));
+                    return Ok((Self::from_tree(path, Arc::new(text), lines, tree), true));
                 }
             }
         }
-        Self::parse_with_lines(parser, path, text, lines, None).map(|source| (source, false))
+        Self::parse_with_lines(parser, path, Arc::new(text), lines, None)
+            .map(|source| (source, false))
     }
 
-    fn from_tree(path: PathBuf, text: String, lines: LineIndex, tree: Tree) -> Self {
-        let imports = imports(tree.root_node(), &text, &lines);
+    fn from_tree(path: PathBuf, text: Arc<String>, lines: LineIndex, tree: Tree) -> Self {
+        let (imports, diagnostic_imports, editor_names) =
+            source_names(tree.root_node(), &text, &lines);
         Self {
             path,
             text,
             lines,
             tree,
-            imports,
+            imports: imports.into(),
+            diagnostic_imports: diagnostic_imports.into(),
+            editor_names: Arc::new(editor_names),
+            highlights: Arc::default(),
             outline: OnceCell::new(),
-            reference_names: OnceCell::new(),
+            reference_names: Arc::default(),
+            highlight_names: Arc::default(),
+            fingerprint: OnceCell::new(),
         }
+    }
+
+    pub(super) fn fingerprint(&self) -> u64 {
+        *self
+            .fingerprint
+            .get_or_init(|| super::index::text_fingerprint(&self.text))
+    }
+
+    pub(super) fn revision(&self) -> SourceRevision {
+        SourceRevision {
+            path: self.path.clone(),
+            text: Arc::clone(&self.text),
+            lines: self.lines.clone(),
+            tree: self.tree.clone(),
+            imports: self.imports.clone(),
+            diagnostic_imports: self.diagnostic_imports.clone(),
+            editor_names: self.editor_names.clone(),
+            highlights: self.highlights.clone(),
+            reference_names: self.reference_names.clone(),
+            highlight_names: self.highlight_names.clone(),
+            fingerprint: self.fingerprint.get().copied(),
+        }
+    }
+
+    pub(super) fn read_cancellable(
+        parser: &mut Parser,
+        path: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        check_cancelled(cancelled)?;
+        let text =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::parse_cancellable(parser, path, Arc::new(text), cancelled)
+    }
+
+    pub(super) fn parse_cancellable(
+        parser: &mut Parser,
+        path: &Path,
+        text: Arc<String>,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        check_cancelled(cancelled)?;
+        let mut progress = |_: &tree_sitter::ParseState| cancelled.load(Ordering::Relaxed);
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+        let tree = parser.parse_with_options(
+            &mut |offset, _| &text.as_bytes()[offset.min(text.len())..],
+            None,
+            Some(options),
+        );
+        if tree.is_none() {
+            parser.reset();
+        }
+        let tree = tree.context("parsing Go source")?;
+        check_cancelled(cancelled)?;
+        let lines = LineIndex::new(&text);
+        let source = Self::from_tree(path.to_owned(), text, lines, tree);
+        check_cancelled(cancelled)?;
+        Ok(source)
     }
 
     // The observer sees each validated change against the current working copy.
@@ -150,7 +381,7 @@ impl Source {
         changes: &[TextDocumentContentChangeEvent],
         mut observe: Option<&mut dyn FnMut(TextEditDelta<'_>) -> bool>,
     ) -> Result<()> {
-        let mut text = self.text.clone();
+        let mut text = self.text.as_ref().clone();
         let mut tree = self.tree.clone();
         let mut lines = self.lines.clone();
         for change in changes {
@@ -203,7 +434,13 @@ impl Source {
             text.replace_range(start..end, &change.text);
         }
 
-        *self = Self::parse_with_lines(parser, self.path.clone(), text, lines, Some(&tree))?;
+        *self = Self::parse_with_lines(
+            parser,
+            self.path.clone(),
+            Arc::new(text),
+            lines,
+            Some(&tree),
+        )?;
         Ok(())
     }
 
@@ -218,13 +455,63 @@ impl Source {
         self.reference_from_leaf(leaf, offset)
     }
 
+    pub(super) fn reference_at_spelling(
+        &self,
+        offset: usize,
+        spelling: &str,
+    ) -> Option<ReferenceQuery<'_>> {
+        let end = offset.checked_add(spelling.len())?;
+        let root = self.tree.root_node();
+        let ascii_letters = |byte: u8| byte.is_ascii_alphabetic() || byte == b'_';
+        if spelling.bytes().all(ascii_letters)
+            && !root.has_error()
+            && let Some(leaf) = root.named_descendant_for_byte_range(offset, offset)
+            && is_offset_identifier(leaf)
+            && leaf.child_count() == 0
+            && leaf.start_byte() <= offset
+            && end <= leaf.end_byte()
+            && node_text(leaf, &self.text).bytes().all(ascii_letters)
+        {
+            // A parser-confirmed identifier token has no nested identifiers.
+            // Reject its ASCII substrings without making assumptions about
+            // token boundaries in a recovery node or around a number.
+            return (leaf.start_byte() == offset
+                && leaf.end_byte() == end
+                && node_text(leaf, &self.text) == spelling)
+                .then(|| self.reference_from_leaf(leaf, offset))
+                .flatten();
+        }
+        let node = root.named_descendant_for_byte_range(offset, end)?;
+        // Match the same node kinds and spelling as the full offsets table.
+        // Looking up the full range rejects substrings and matches in strings
+        // before entering the existing point-based binding lookup.
+        if node.start_byte() == offset
+            && node.end_byte() == end
+            && is_offset_identifier(node)
+            && node_text(node, &self.text) == spelling
+        {
+            return self.reference_at_offset(offset);
+        }
+        None
+    }
+
     pub(super) fn for_each_name<'tree>(
         &self,
         root: Node<'tree>,
         spelling: &str,
+        visit: impl FnMut(Node<'tree>),
+    ) {
+        self.for_each_name_cancellable(root, spelling, None, visit);
+    }
+
+    pub(super) fn for_each_name_cancellable<'tree>(
+        &self,
+        root: Node<'tree>,
+        spelling: &str,
+        cancelled: Option<&AtomicBool>,
         mut visit: impl FnMut(Node<'tree>),
     ) {
-        Self::for_each_identifier(root, |node| {
+        Self::for_each_identifier(root, cancelled, |node| {
             if node_text(node, &self.text) == spelling {
                 visit(node);
             }
@@ -232,10 +519,19 @@ impl Source {
     }
 
     pub(super) fn name_offsets(&self, spelling: &str) -> &[usize] {
+        self.navigation_name_offsets(spelling, None)
+    }
+
+    pub(super) fn navigation_name_offsets(
+        &self,
+        spelling: &str,
+        probe: Option<&super::navigation_trace::NavigationProbe>,
+    ) -> &[usize] {
         self.reference_names
             .get_or_init(|| {
+                super::navigation_trace::record(probe, |counts| counts.offset_tables += 1);
                 let mut names = HashMap::<String, Vec<usize>>::new();
-                Self::for_each_identifier(self.tree.root_node(), |node| {
+                Self::for_each_identifier(self.tree.root_node(), None, |node| {
                     let name = node_text(node, &self.text);
                     if let Some(offsets) = names.get_mut(name) {
                         offsets.push(node.start_byte());
@@ -249,14 +545,89 @@ impl Source {
             .map_or(&[], Vec::as_slice)
     }
 
-    fn for_each_identifier<'tree>(root: Node<'tree>, mut visit: impl FnMut(Node<'tree>)) {
+    pub(super) fn ready_name_offsets(&self, spelling: &str) -> Option<&[usize]> {
+        let names = self.reference_names.get()?;
+        Some(names.get(spelling).map_or(&[], Vec::as_slice))
+    }
+
+    pub(super) fn highlight_name_offsets(
+        &self,
+        spelling: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Option<Arc<[usize]>> {
+        if let Some(offsets) = self
+            .highlight_names
+            .0
+            .lock()
+            .unwrap()
+            .get(spelling)
+            .cloned()
+        {
+            return Some(offsets);
+        }
+        // Seed just the requested spelling on a cold revision. The caller
+        // verifies each slice against the syntax tree and canonical binding.
+        const CHUNK_BYTES: usize = 64 * 1024;
+        let text = self.text.as_str();
+        let Some(first) = spelling.chars().next() else {
+            return Some(Arc::default());
+        };
+        let next_boundary = |mut byte| {
+            while !text.is_char_boundary(byte) {
+                byte += 1;
+            }
+            byte
+        };
+        let mut offsets = Vec::new();
+        let check_cancelled = || !cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed));
+        for start in (0..text.len()).step_by(CHUNK_BYTES) {
+            if !check_cancelled() {
+                return None;
+            }
+            let end = (start + CHUNK_BYTES).min(text.len());
+            // Include matches that straddle a cancellation checkpoint once.
+            let overlap = next_boundary(
+                end.saturating_add(spelling.len().saturating_sub(1))
+                    .min(text.len()),
+            );
+            let mut next = next_boundary(start);
+            while let Some(found) = text[next..overlap].find(spelling) {
+                let offset = next + found;
+                if offset >= end {
+                    break;
+                }
+                if !check_cancelled() {
+                    return None;
+                }
+                offsets.push(offset);
+                next = offset + first.len_utf8();
+            }
+        }
+        let offsets: Arc<[usize]> = offsets.into();
+        const MAX_OFFSETS: usize = 131_072;
+        if check_cancelled() && offsets.len() <= MAX_OFFSETS {
+            let mut cache = self.highlight_names.0.lock().unwrap();
+            let cached: usize = cache.values().map(|offsets| offsets.len()).sum();
+            if cache.len() >= 32 || cached + offsets.len() > MAX_OFFSETS {
+                cache.clear();
+            }
+            cache.insert(spelling.to_owned(), offsets.clone());
+        }
+        Some(offsets)
+    }
+
+    fn for_each_identifier<'tree>(
+        root: Node<'tree>,
+        cancelled: Option<&AtomicBool>,
+        mut visit: impl FnMut(Node<'tree>),
+    ) {
         let mut cursor = root.walk();
         loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return;
+            }
             let node = cursor.node();
-            if matches!(
-                node.kind(),
-                "identifier" | "type_identifier" | "field_identifier" | "package_identifier"
-            ) {
+            if is_offset_identifier(node) {
                 visit(node);
             }
             if cursor.goto_first_child() {
@@ -343,22 +714,19 @@ impl Source {
     }
 }
 
+fn is_offset_identifier(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "field_identifier" | "package_identifier"
+    )
+}
+
 pub(super) fn import_path(literal: &str) -> Option<String> {
     if let Some(raw) = literal.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
         Some(raw.replace('\r', ""))
     } else {
         serde_json::from_str(literal).ok()
     }
-}
-
-pub(super) fn import_specs(declaration: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    let mut cursor = declaration.walk();
-    let container = declaration
-        .named_children(&mut cursor)
-        .find(|child| child.kind() == "import_spec_list")
-        .unwrap_or(declaration);
-    std::iter::successors(container.named_child(0), Node::next_named_sibling)
-        .filter(|child| child.kind() == "import_spec")
 }
 
 // String escapes in Go include byte escapes, which can encode one piece of a
@@ -415,62 +783,102 @@ pub(super) fn decoded_import_path(literal: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-pub(super) fn raw_imports<'a>(
-    root: Node<'a>,
-    text: &'a str,
-    lines: &'a LineIndex,
-) -> impl Iterator<Item = Import> + 'a {
-    std::iter::successors(root.named_child(0), Node::next_named_sibling)
-        .filter(|child| child.kind() == "import_declaration")
-        .flat_map(import_specs)
-        .filter(|spec| !spec.has_error())
-        .filter_map(move |spec| import_from_spec(spec, text, lines, decoded_import_path))
-}
-
-fn import_from_spec(
-    spec: Node<'_>,
+fn source_names(
+    root: Node<'_>,
     text: &str,
     lines: &LineIndex,
-    decode: fn(&str) -> Option<String>,
-) -> Option<Import> {
-    let path = spec.child_by_field_name("path")?;
-    let alias = spec.child_by_field_name("name");
-    let name = alias.unwrap_or(path);
-    Some(Import {
-        alias: alias.map(|node| node_text(node, text).to_owned()),
-        path: decode(node_text(path, text))?,
-        binding: Range::new(
-            lines.position(text, name.start_byte()),
-            lines.position(text, name.end_byte()),
-        ),
-    })
-}
-
-fn imports(root: Node<'_>, text: &str, lines: &LineIndex) -> Vec<Import> {
-    fn collect(node: Node<'_>, text: &str, lines: &LineIndex, result: &mut Vec<Import>) {
-        match node.kind() {
-            "import_declaration" | "import_spec_list" => {
-                for child in node.named_children(&mut node.walk()) {
-                    collect(child, text, lines, result);
+) -> (Vec<Import>, Vec<DiagnosticImport>, EditorNames) {
+    let mut navigation = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut editor = EditorNames::default();
+    let mut cursor = root.walk();
+    for declaration in root.named_children(&mut cursor) {
+        if declaration.kind() != "import_declaration" {
+            editor.collect_declaration(declaration, text);
+            continue;
+        }
+        let mut cursor = declaration.walk();
+        let container = declaration
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "import_spec_list")
+            .unwrap_or(declaration);
+        let mut cursor = container.walk();
+        for spec in container
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "import_spec")
+        {
+            let Some(literal) = spec.child_by_field_name("path") else {
+                continue;
+            };
+            let alias = spec.child_by_field_name("name");
+            let binding = alias.unwrap_or(literal);
+            let alias = alias.map(|node| node_text(node, text).to_owned());
+            let spelling = node_text(literal, text);
+            let path = import_path(spelling);
+            let range = Range::new(
+                lines.position(text, binding.start_byte()),
+                lines.position(text, binding.end_byte()),
+            );
+            // Raw imports recognize Go's byte and octal escapes, including for
+            // blank and dot imports. Navigation uses its existing path rules.
+            let decoded_path = decoded_import_path(spelling);
+            if let Some(decoded) = decoded_path.as_ref().filter(|_| !spec.has_error()) {
+                let name = match alias.as_deref() {
+                    Some("." | "_") => None,
+                    Some(name) => Some(name),
+                    None => implicit_import_name(decoded),
+                };
+                if let Some(name) = name {
+                    editor
+                        .imports
+                        .entry(name.to_owned())
+                        .and_modify(|entry| *entry = None)
+                        .or_insert_with(|| Some(binding.byte_range()));
                 }
+                editor.raw_imports.push(Import {
+                    alias: alias.clone(),
+                    path: decoded.clone(),
+                    binding: range,
+                });
             }
-            "import_spec" => {
-                if let Some(import) = import_from_spec(node, text, lines, import_path)
-                    && import.alias.as_deref() != Some("_")
-                {
-                    result.push(import);
-                }
+            if let Some(path) = path.as_ref().filter(|_| alias.as_deref() != Some("_")) {
+                navigation.push(Import {
+                    alias: alias.clone(),
+                    path: path.clone(),
+                    binding: range,
+                });
             }
-            _ => {}
+            diagnostics.push(DiagnosticImport {
+                alias,
+                decoded_path: decoded_path.filter(|_| path.is_none()),
+                path,
+                spec: spec.byte_range(),
+                literal: literal.byte_range(),
+                binding: binding.byte_range(),
+            });
         }
     }
+    (navigation, diagnostics, editor)
+}
 
-    let mut result = Vec::new();
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        collect(node, text, lines, &mut result);
+fn implicit_import_name(path: &str) -> Option<&str> {
+    let mut parts = path.rsplit('/');
+    let mut name = parts.next()?;
+    if name.strip_prefix('v').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
+    }) {
+        name = parts.next()?;
     }
-    result
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+        || name == "_"
+    {
+        return None;
+    }
+    Some(name)
 }
 
 pub(super) fn is_type_declaration(node: Node<'_>) -> bool {
@@ -481,6 +889,10 @@ pub(super) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
+    is_declaration_name_in(node, parent)
+}
+
+pub(super) fn is_declaration_name_in(node: Node<'_>, parent: Node<'_>) -> bool {
     if parent.kind() == "import_spec" {
         return parent.child_by_field_name("path") == Some(node);
     }
@@ -510,9 +922,14 @@ pub(super) fn node_text<'text>(node: Node<'_>, text: &'text str) -> &'text str {
     &text[node.byte_range()]
 }
 
+pub(super) fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
+    anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "diagnostics cancelled");
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct LineIndex {
-    starts: Vec<usize>,
+    starts: Arc<Vec<usize>>,
 }
 
 impl LineIndex {
@@ -520,7 +937,9 @@ impl LineIndex {
         let starts = std::iter::once(0)
             .chain(text.match_indices('\n').map(|(index, _)| index + 1))
             .collect();
-        Self { starts }
+        Self {
+            starts: Arc::new(starts),
+        }
     }
 
     pub(super) fn offset(&self, text: &str, position: Position) -> Option<usize> {
@@ -559,12 +978,13 @@ impl LineIndex {
     }
 
     pub(super) fn edit(&mut self, start: usize, end: usize, inserted: &str) {
-        let first = self.starts.partition_point(|offset| *offset <= start);
-        let last = self.starts.partition_point(|offset| *offset <= end);
-        for offset in &mut self.starts[last..] {
+        let starts = Arc::make_mut(&mut self.starts);
+        let first = starts.partition_point(|offset| *offset <= start);
+        let last = starts.partition_point(|offset| *offset <= end);
+        for offset in &mut starts[last..] {
             *offset = *offset - (end - start) + inserted.len();
         }
-        self.starts.splice(
+        starts.splice(
             first..last,
             inserted
                 .match_indices('\n')
@@ -735,7 +1155,7 @@ mod tests {
             .unwrap();
         assert_eq!(observed, changes.len());
         assert_eq!(
-            source.text,
+            source.text.as_str(),
             "package p\r\n// top 😀\r\nvar S = \"x\" // tail\r\nvar Tail int\r\n"
         );
         assert!(!source.tree.root_node().has_error());
@@ -766,7 +1186,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "invalid edit start");
         assert_eq!(observed, 1);
-        assert_eq!(source.text, original);
+        assert_eq!(source.text.as_str(), original);
         assert_eq!(source.tree.root_node().id(), original_root);
         assert_eq!(std::ptr::from_ref(source.outline()), original_outline);
         assert_eq!(source.lines.starts, LineIndex::new(original).starts);
@@ -801,7 +1221,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(observed, 1);
-        assert_eq!(source.text, "package p\nvar Final int\n");
+        assert_eq!(source.text.as_str(), "package p\nvar Final int\n");
         assert!(!source.tree.root_node().has_error());
     }
 }

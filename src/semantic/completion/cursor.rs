@@ -475,7 +475,7 @@ fn repair(
     } else {
         ""
     };
-    let mut text = source.text.clone();
+    let mut text = source.text.as_ref().clone();
     let marker = format!("{PLACEHOLDER}{separator}");
     text.replace_range(replace.clone(), &marker);
     let mut tree = source.tree.clone();
@@ -500,7 +500,7 @@ fn repair(
     {
         // An unclosed literal can absorb the next assignment as part of
         // another literal whose apparent type is the completion marker.
-        let mut text = repaired.text;
+        let mut text = std::sync::Arc::unwrap_or_clone(repaired.text);
         text.insert(replace.start + marker.len(), '}');
         if let Some(trace) = trace {
             trace.parse();
@@ -511,7 +511,7 @@ fn repair(
     if root.has_error() && ancestors(leaf(root, replace.start)).any(|node| node.is_error()) {
         let closers = missing_closers(root);
         if !closers.is_empty() {
-            let mut text = repaired.text;
+            let mut text = std::sync::Arc::unwrap_or_clone(repaired.text);
             if root
                 .named_child(root.named_child_count().saturating_sub(1))
                 .is_some_and(|node| node.kind() == "comment")

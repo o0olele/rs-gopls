@@ -5,17 +5,17 @@ use crate::semantic::resolver::{
 };
 use crate::symbols::OutlineKind;
 
-fn type_annotation(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| match parent.kind() {
+fn type_annotation(node: Node<'_>, parents: Parents<'_, '_>) -> bool {
+    parents.at(1).is_some_and(|parent| match parent.kind() {
         "var_spec"
         | "const_spec"
         | "type_spec"
         | "type_alias"
         | "parameter_declaration"
         | "variadic_parameter_declaration"
-        | "field_declaration"
         | "type_assertion_expression"
         | "composite_literal" => parent.child_by_field_name("type") == Some(node),
+        "field_declaration" => true,
         "function_declaration"
         | "method_declaration"
         | "func_literal"
@@ -25,25 +25,27 @@ fn type_annotation(node: Node<'_>) -> bool {
     })
 }
 
-pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
+pub(super) fn check(
+    analysis: &mut Analysis<'_, '_, '_>,
+    node: Node<'_>,
+    parents: Parents<'_, '_>,
+    value_name: bool,
+    local: Option<declarations::Local<'_>>,
+    qualifier: bool,
+) -> Result<()> {
     if matches!(node.kind(), "qualified_type" | "selector_expression") {
         return selector(analysis, node);
     }
-    if !declarations::is_identifier(node) || !unused::value_name(analysis, node) {
+    if !value_name {
         return Ok(());
     }
     let name = analysis.text(node);
     if node.kind() == "type_identifier"
-        && type_annotation(node)
+        && type_annotation(node, parents)
         && !analysis.locals.incomplete_package
     {
-        let actual_type = if let Some(local) = analysis.locals.lookup(node, name) {
-            Some(local.name.parent().is_some_and(|n| {
-                matches!(
-                    n.kind(),
-                    "type_alias" | "type_spec" | "type_parameter_declaration" | "type_elem"
-                )
-            }))
+        let actual_type = if let Some(local) = local {
+            Some(local.is_type())
         } else if let Some(kind) = analysis.locals.globals.get(name) {
             Some(matches!(
                 kind,
@@ -65,54 +67,20 @@ pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
         || name == "_"
         || analysis.locals.globals.contains_key(name)
         || analysis.locals.incomplete_package
-        || analysis.locals.lookup(node, name).is_some()
+        || local.is_some()
     {
         return Ok(());
     }
-    if types::literal_key(node).is_some() && !types::is_container_key(analysis, node)? {
+    if types::literal_key(parents).is_some() && !types::is_container_key(analysis, parents)? {
         return Ok(());
     }
-    let qualifier = imports::qualifier(node);
-    for import in &analysis.source.imports {
-        let pkg = analysis
-            .resolver
-            .workspace
-            .resolve_import(analysis.package, &import.path);
-        if import
-            .alias
-            .as_deref()
-            .or_else(|| pkg.map(|p| p.name.as_str()))
-            == Some(name)
-            || (qualifier && pkg.is_none() && import.alias.is_none())
-            || (import.alias.as_deref() == Some(".")
-                && is_exported(name)
-                && match pkg {
-                    Some(pkg) if !pkg.load_error => {
-                        analysis.resolver.find_symbol(pkg, name, None)?.is_some()
-                    }
-                    _ => true,
-                })
-        {
-            return Ok(());
-        }
+    if analysis
+        .imports
+        .can_bind(&mut analysis.resolver, name, qualifier)?
+    {
+        return Ok(());
     }
     let is_type = node.kind() == "type_identifier" && !qualifier;
-    // A Go-escaped import path may not have an entry in the navigation index.
-    if (qualifier || is_exported(name))
-        && imports::specs(analysis.source.tree.root_node())
-            .into_iter()
-            .any(|spec| {
-                let alias = spec.child_by_field_name("name").map(|n| analysis.text(n));
-                let could_bind = (qualifier && alias.is_none_or(|s| s == name))
-                    || (is_exported(name) && alias == Some("."));
-                could_bind
-                    && spec.child_by_field_name("path").is_some_and(|n| {
-                        crate::semantic::source::import_path(analysis.text(n)).is_none()
-                    })
-            })
-    {
-        return Ok(());
-    }
     let code = if is_type {
         DiagnosticCode::TypeUnresolved
     } else {
@@ -124,10 +92,7 @@ pub(super) fn check(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Resu
         format!("Undefined {}{name}", if is_type { "type " } else { "" }),
     );
     if qualifier {
-        item.fix_data = DiagnosticFixData::ImportMissingPackage {
-            qualifier: name.to_owned(),
-            ident_range: item.range,
-        };
+        item.fix = Fix::ImportPackage(name.to_owned());
     }
     Ok(())
 }
@@ -146,11 +111,7 @@ fn selector(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
             .locals
             .lookup(receiver, analysis.text(receiver))
             .is_none()
-        && let Some((_, package)) = analysis.source.imported_package(
-            analysis.resolver.workspace,
-            analysis.package,
-            analysis.text(receiver),
-        )
+        && let Some(package) = analysis.imports.package(analysis.text(receiver))
     {
         if package.load_error {
             return Ok(());

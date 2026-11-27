@@ -1,13 +1,17 @@
 mod dispatch;
+mod go_environment;
 mod protocol;
+mod rpc_telemetry;
 mod scheduler;
 mod scope;
 mod semantic;
 #[cfg(test)]
 mod symbol_request_tests;
 mod symbols;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
+mod transport;
 mod workspace;
 mod workspace_roots;
 
@@ -28,18 +32,19 @@ use lsp_types::{
     TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
     WorkspaceFolder, WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
     notification::{
-        Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidChangeWorkspaceFolders,
-        DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument, Exit, Initialized,
-        Notification as _, PublishDiagnostics,
+        Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
+        DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+        Exit, Initialized, Notification as _, PublishDiagnostics,
     },
     request::{Initialize, Request as _, Shutdown, WorkspaceDiagnosticRefresh},
 };
 use serde_json::Value;
 
+use go_environment::{EnvironmentOverrides, GoEnvironment, environment_overrides};
 use protocol::{
     RequestResult, file_path, invalid_params, path_uri, send_notification, send_response,
 };
-use scheduler::{Scheduler, WorkspaceResult};
+use scheduler::{DiagnosticConsumer, Scheduler, WorkspaceResult};
 use semantic::Engine;
 use workspace::path_key;
 
@@ -49,9 +54,15 @@ use lsp_server::{RequestId, Response};
 use lsp_types::request::{DocumentSymbolRequest, WorkspaceSymbolRequest};
 
 enum State {
-    Starting,
+    Starting(GoEnvironment),
     Running(Box<Running>),
     Shutdown,
+}
+
+impl State {
+    fn starting() -> Self {
+        Self::Starting(GoEnvironment::capture())
+    }
 }
 
 struct Running {
@@ -83,17 +94,12 @@ impl Running {
         if matches!(self.diagnostic_updates, DiagnosticUpdates::Publish)
             && self.engine.is_open(path)
         {
-            let (report, load) = self.engine.diagnostics_report(path)?;
-            if let Some(load) = load {
-                self.scheduler.request_workspace(load);
-            }
-            send_notification::<PublishDiagnostics>(
+            self.scheduler.submit_diagnostics(
+                &mut self.engine,
                 connection,
-                PublishDiagnosticsParams::new(
-                    uri,
-                    report.to_lsp_diagnostics(),
-                    report.snapshot.version,
-                ),
+                path.to_owned(),
+                DiagnosticConsumer::Push(uri),
+                "publish_diagnostics",
             )?;
         }
         Ok(())
@@ -164,7 +170,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let (connection, threads) = Connection::stdio();
+    let _telemetry = telemetry::Session::start();
+    let (connection, threads) = transport::stdio()?;
     let result = serve(&connection);
     drop(connection);
     result?;
@@ -172,26 +179,52 @@ fn main() -> Result<()> {
 }
 
 fn serve(connection: &Connection) -> Result<()> {
-    let mut state = State::Starting;
+    let mut state = State::starting();
     let (load_sender, load_receiver) = unbounded();
     let (search_token, search_ready) = bounded(1);
     let search_idle = never();
+    let diagnostic_idle = never();
+    let highlight_idle = never();
     search_token
         .send(())
         .context("scheduling navigation searches")?;
     loop {
-        let (search_receiver, completion_wake) = match &state {
+        let (
+            search_receiver,
+            completion_wake,
+            reference_wake,
+            implementation_wake,
+            diagnostic_receiver,
+            highlight_receiver,
+        ) = match &state {
             State::Running(running) => (
                 if running.scheduler.ready_search(&running.engine).is_some()
-                    || running.engine.implementation_index_pending()
+                    || running.engine.implementation_index_ready()
                 {
                     &search_ready
                 } else {
                     &search_idle
                 },
                 running.engine.completion_wake(),
+                running.engine.reference_wake(),
+                running.engine.implementation_wake(),
+                running
+                    .scheduler
+                    .diagnostic_completions()
+                    .unwrap_or(&diagnostic_idle),
+                running
+                    .scheduler
+                    .highlight_completions()
+                    .unwrap_or(&highlight_idle),
             ),
-            _ => (&search_idle, &search_idle),
+            _ => (
+                &search_idle,
+                &search_idle,
+                &search_idle,
+                &search_idle,
+                &diagnostic_idle,
+                &highlight_idle,
+            ),
         };
         select_biased! {
             recv(connection.receiver) -> message => {
@@ -200,7 +233,7 @@ fn serve(connection: &Connection) -> Result<()> {
                 };
                 match message {
                     Message::Request(request) => {
-                        let initializing = matches!(state, State::Starting) && request.method == Initialize::METHOD;
+                        let initializing = matches!(state, State::Starting(_)) && request.method == Initialize::METHOD;
                         handle_request(connection, &mut state, request)?;
                         if initializing && let State::Running(running) = &state {
                             running.engine.prewarm_completion_sdk(false);
@@ -231,14 +264,28 @@ fn serve(connection: &Connection) -> Result<()> {
                     running.workspace_loaded(connection, update.context("receiving Go package metadata")?)?;
                 }
             }
+            recv(diagnostic_receiver) -> completed => {
+                if let State::Running(running) = &mut state {
+                    let completed = completed.context("receiving Go diagnostics")?;
+                    running.scheduler.complete_diagnostics(&mut running.engine, connection, completed)?;
+                }
+            }
+            recv(highlight_receiver) -> completed => {
+                if let State::Running(running) = &mut state {
+                    let completed = completed.context("receiving Go document highlights")?;
+                    running.scheduler.complete_highlight(&mut running.engine, connection, completed)?;
+                }
+            }
             recv(completion_wake) -> _ => {}
+            recv(reference_wake) -> _ => {}
+            recv(implementation_wake) -> _ => {}
             recv(search_receiver) -> ready => {
                 ready.context("receiving navigation search work")?;
                 if let State::Running(running) = &mut state {
                     if running.scheduler.ready_search(&running.engine).is_some() {
                         running.advance_search(connection)?;
                     } else {
-                        running.engine.advance_implementation_index();
+                        running.engine.advance_implementation_index()?;
                     }
                 }
                 search_token.send(()).context("scheduling further navigation searches")?;
@@ -247,22 +294,44 @@ fn serve(connection: &Connection) -> Result<()> {
         if let State::Running(running) = &mut state {
             running
                 .scheduler
-                .start_workspace_load(&running.engine, &load_sender)?;
+                .start_workspace_load(&mut running.engine, &load_sender)?;
         }
     }
     Ok(())
 }
 
 fn handle_request(connection: &Connection, state: &mut State, request: Request) -> Result<()> {
+    let mut overrides = None;
+    if matches!(state, State::Starting(_)) && request.method == Initialize::METHOD {
+        overrides = request
+            .params
+            .get("initializationOptions")
+            .and_then(environment_overrides);
+        if let Some(overrides) = &mut overrides {
+            telemetry::start_options(overrides);
+        }
+    }
+    let _trace = if telemetry::enabled() {
+        let method = match request.method.as_str() {
+            Initialize::METHOD => Initialize::METHOD,
+            Shutdown::METHOD => Shutdown::METHOD,
+            method => dispatch::telemetry_method(method).unwrap_or("unknown"),
+        };
+        Some(rpc_telemetry::begin(&request, method))
+    } else {
+        None
+    };
     let Request { id, method, params } = request;
-    let result: RequestResult = match (state, method.as_str()) {
-        (state @ State::Starting, Initialize::METHOD) => initialize(params)
-            .map(|(running, capabilities)| {
-                *state = State::Running(Box::new(running));
-                capabilities
-            })
-            .map_err(invalid_params),
-        (State::Starting, _) => Err((
+    let result: RequestResult = match (&mut *state, method.as_str()) {
+        (State::Starting(environment), Initialize::METHOD) => {
+            initialize(params, environment.clone(), overrides)
+                .map(|(running, capabilities)| {
+                    *state = State::Running(Box::new(running));
+                    capabilities
+                })
+                .map_err(invalid_params)
+        }
+        (State::Starting(_), _) => Err((
             ErrorCode::ServerNotInitialized,
             "initialize must be called first".into(),
         )),
@@ -274,10 +343,8 @@ fn handle_request(connection: &Connection, state: &mut State, request: Request) 
             ErrorCode::InvalidRequest,
             "server is already initialized".into(),
         )),
-        (state @ State::Running(..), Shutdown::METHOD) => {
-            if let State::Running(running) = state {
-                running.scheduler.shutdown(connection)?;
-            }
+        (State::Running(running), Shutdown::METHOD) => {
+            running.scheduler.shutdown(connection)?;
             *state = State::Shutdown;
             Ok(Value::Null)
         }
@@ -294,7 +361,11 @@ fn handle_request(connection: &Connection, state: &mut State, request: Request) 
     send_response(connection, id, result)
 }
 
-fn initialize(params: Value) -> Result<(Running, Value)> {
+fn initialize(
+    params: Value,
+    mut environment: GoEnvironment,
+    overrides: Option<EnvironmentOverrides>,
+) -> Result<(Running, Value)> {
     // lsp-types 0.97 deserializes workspace.diagnostic, while LSP 3.17 uses workspace.diagnostics.
     let refresh_support = params
         .pointer("/capabilities/workspace/diagnostics/refreshSupport")
@@ -326,7 +397,11 @@ fn initialize(params: Value) -> Result<(Running, Value)> {
         (false, _, true) => DiagnosticUpdates::Publish,
         _ => DiagnosticUpdates::None,
     };
+    if let Some(overrides) = overrides {
+        environment = environment.with_overrides(overrides);
+    }
     let roots = workspace_roots(params)?;
+    telemetry::session_config(&roots, &environment);
 
     let capabilities = ServerCapabilities {
         position_encoding: Some(PositionEncodingKind::UTF16),
@@ -347,19 +422,21 @@ fn initialize(params: Value) -> Result<(Running, Value)> {
         }),
         ..Default::default()
     };
-    let result = serde_json::json!({
-        "capabilities": dispatch::capabilities(capabilities, client_features),
-        "serverInfo": ServerInfo {
-            name: env!("CARGO_PKG_NAME").into(),
-            version: Some(env!("CARGO_PKG_VERSION").into()),
-        }
+    let result = rpc_telemetry::serialize(|| {
+        serde_json::json!({
+            "capabilities": dispatch::capabilities(capabilities, client_features),
+            "serverInfo": ServerInfo {
+                name: env!("CARGO_PKG_NAME").into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            }
+        })
     });
     Ok((
         Running {
             watch_files,
             client_features,
             diagnostic_updates,
-            engine: Engine::with_roots(roots),
+            engine: Engine::with_environment(roots, environment),
             scheduler: Scheduler::default(),
         },
         result,
@@ -437,8 +514,35 @@ fn handle_notification(
     params: Value,
 ) -> Result<()> {
     match method {
+        DidChangeConfiguration::METHOD => {
+            let overrides = params
+                .get("settings")
+                .and_then(environment_overrides)
+                .and_then(|mut overrides| {
+                    let explicit_empty = overrides.is_empty();
+                    overrides.remove(telemetry::FILE_ENV);
+                    overrides.remove(telemetry::REDACT_ENV);
+                    (explicit_empty || !overrides.is_empty()).then_some(overrides)
+                });
+            let env_changed =
+                overrides.is_some_and(|overrides| running.engine.update_environment(overrides));
+            telemetry::event!("notification", {
+                "method": DidChangeConfiguration::METHOD, "environment_changed": env_changed,
+            });
+            if env_changed {
+                telemetry::session_config(running.engine.roots(), running.engine.environment());
+                running
+                    .scheduler
+                    .environment_modified(connection, running.engine.workspace_load())?;
+            }
+            Ok(())
+        }
         DidChangeWorkspaceFolders::METHOD => {
             let params: DidChangeWorkspaceFoldersParams = serde_json::from_value(params)?;
+            telemetry::event!("notification", {
+                "method": DidChangeWorkspaceFolders::METHOD,
+                "added_count": params.event.added.len(), "removed_count": params.event.removed.len(),
+            });
             let removed = params
                 .event
                 .removed
@@ -449,19 +553,34 @@ fn handle_notification(
             roots.retain(|root| !removed.contains(&path_key(root)));
             add_workspace_folders(&mut roots, params.event.added)?;
             if running.engine.update_roots(roots) {
+                telemetry::session_config(running.engine.roots(), running.engine.environment());
+                running.scheduler.workspace_modified(
+                    connection,
+                    running.engine.workspace_load(),
+                    "didChangeWorkspaceFolders",
+                )?;
                 running
                     .scheduler
-                    .workspace_modified(connection, running.engine.workspace_load())?;
+                    .revalidate_diagnostics(&mut running.engine, connection)?;
                 running.workspace_diagnostics_changed(connection)?;
             }
             Ok(())
         }
         DidChangeWatchedFiles::METHOD => {
             let params: DidChangeWatchedFilesParams = serde_json::from_value(params)?;
+            let changed_file_count = params.changes.len();
+            telemetry::event!("notification", {
+                "method": DidChangeWatchedFiles::METHOD, "changed_file_count": changed_file_count,
+            });
             let before = running.engine.workspace_load();
             for change in params.changes {
                 if let Ok(path) = file_path(&change.uri) {
-                    running.engine.file_changed(&path, change.typ);
+                    running.engine.file_changed_from(
+                        &path,
+                        change.typ,
+                        "watched_files",
+                        changed_file_count,
+                    );
                     if !running.engine.is_open(&path) {
                         running.scheduler.document_modified(connection, &path)?;
                     }
@@ -469,35 +588,60 @@ fn handle_notification(
             }
             let after = running.engine.workspace_load();
             if after != before {
-                running.scheduler.workspace_modified(connection, after)?;
+                running
+                    .scheduler
+                    .workspace_modified(connection, after, "watched_files")?;
             }
+            running
+                .scheduler
+                .revalidate_diagnostics(&mut running.engine, connection)?;
             running.publish_open_documents(connection)
         }
         DidOpenTextDocument::METHOD => {
             let params: DidOpenTextDocumentParams = serde_json::from_value(params)?;
             let document = params.text_document;
             let path = file_path(&document.uri)?;
+            telemetry::event!("notification", {
+                "method": DidOpenTextDocument::METHOD, "document": telemetry::path(&path),
+                "version": document.version,
+            });
             running
                 .engine
                 .open(path.clone(), document.text, document.version)?;
             running.scheduler.document_modified(connection, &path)?;
+            running
+                .scheduler
+                .revalidate_diagnostics(&mut running.engine, connection)?;
             running.publish_document(connection, &path, document.uri)
         }
         DidChangeTextDocument::METHOD => {
             let params: DidChangeTextDocumentParams = serde_json::from_value(params)?;
             let path = file_path(&params.text_document.uri)?;
+            telemetry::event!("notification", {
+                "method": DidChangeTextDocument::METHOD, "document": telemetry::path(&path),
+                "version": params.text_document.version, "change_count": params.content_changes.len(),
+            });
             running
                 .engine
                 .edit(&path, &params.content_changes, params.text_document.version)?;
             running.scheduler.document_modified(connection, &path)?;
+            running
+                .scheduler
+                .revalidate_diagnostics(&mut running.engine, connection)?;
             running.publish_document(connection, &path, params.text_document.uri)
         }
         DidCloseTextDocument::METHOD => {
             let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
             let path = file_path(&params.text_document.uri)?;
+            telemetry::event!("notification", {
+                "method": DidCloseTextDocument::METHOD, "document": telemetry::path(&path),
+            });
             let was_open = running.engine.is_open(&path);
             running.engine.close(&path);
             running.scheduler.document_modified(connection, &path)?;
+            running
+                .scheduler
+                .revalidate_diagnostics(&mut running.engine, connection)?;
             if was_open && matches!(running.diagnostic_updates, DiagnosticUpdates::Publish) {
                 send_notification::<PublishDiagnostics>(
                     connection,
@@ -509,15 +653,26 @@ fn handle_notification(
         DidSaveTextDocument::METHOD => {
             let params: DidSaveTextDocumentParams = serde_json::from_value(params)?;
             let path = file_path(&params.text_document.uri)?;
+            telemetry::event!("notification", {
+                "method": DidSaveTextDocument::METHOD, "document": telemetry::path(&path),
+            });
             let before = running.engine.workspace_load();
-            running
-                .engine
-                .file_changed(&path, lsp_types::FileChangeType::CHANGED);
+            running.engine.file_changed_from(
+                &path,
+                lsp_types::FileChangeType::CHANGED,
+                "didSave",
+                1,
+            );
             running.scheduler.document_modified(connection, &path)?;
             let after = running.engine.workspace_load();
             if after != before {
-                running.scheduler.workspace_modified(connection, after)?;
+                running
+                    .scheduler
+                    .workspace_modified(connection, after, "didSave")?;
             }
+            running
+                .scheduler
+                .revalidate_diagnostics(&mut running.engine, connection)?;
             Ok(())
         }
         Cancel::METHOD => {
@@ -526,6 +681,9 @@ fn handle_notification(
                 NumberOrString::Number(value) => value.into(),
                 NumberOrString::String(value) => value.into(),
             };
+            telemetry::event!("notification", {
+                "method": Cancel::METHOD, "req_id": rpc_telemetry::request_id(&id),
+            });
             running.scheduler.cancel(connection, &id)
         }
         _ => Ok(()),

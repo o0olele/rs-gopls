@@ -274,21 +274,30 @@ struct Subject<'w> {
 }
 
 impl Engine {
-    pub(crate) fn implementation_index_pending(&self) -> bool {
+    pub(crate) fn implementation_index_ready(&self) -> bool {
         self.state
             .workspace
             .as_ref()
             .is_some_and(|workspace| workspace.total_load_failure().is_none())
             && matches!(self.state.graph_changes, super::GraphChanges::Clean)
             && self.implementation_sources.pending()
+            && self.implementation_sources.ready()
     }
 
-    pub(crate) fn advance_implementation_index(&mut self) {
+    pub(crate) fn implementation_wake(&self) -> &crossbeam_channel::Receiver<()> {
+        self.implementation_sources.wake()
+    }
+
+    pub(crate) fn advance_implementation_index(&mut self) -> Result<()> {
+        let Some(shared_workspace) = self.state.workspace.clone() else {
+            return Ok(());
+        };
         let mut snapshot = self.state.snapshot(self.include_tests);
         if let QueryProgress::Ready(workspace) = snapshot.active_graph(false) {
             self.implementation_sources
-                .advance(&mut snapshot.resolver(workspace));
+                .advance(&shared_workspace, &mut snapshot.resolver(workspace))?;
         }
+        Ok(())
     }
 
     pub(crate) fn implementations(
@@ -493,7 +502,16 @@ impl Engine {
 }
 
 impl SemanticTask<Vec<Location>> for ImplementationSearch {
+    fn ready(&self, engine: &Engine) -> bool {
+        self.package_filter.is_none() || engine.implementation_sources.ready()
+    }
+
     fn advance(&mut self, engine: &mut Engine) -> Result<bool> {
+        let shared_workspace = engine
+            .state
+            .workspace
+            .clone()
+            .context("implementation search needs a workspace")?;
         let mut snapshot = engine.state.snapshot(engine.include_tests);
         let workspace = snapshot
             .workspace()
@@ -507,7 +525,7 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
             let sources = &mut engine.implementation_sources;
             if sources.pending() {
                 let started = self.stats.as_ref().map(|_| Instant::now());
-                let ready = sources.advance(&mut resolver);
+                let ready = sources.advance(&shared_workspace, &mut resolver)?;
                 if let (Some(stats), Some(started)) = (&mut self.stats, started) {
                     stats.index_wait += started.elapsed();
                 }

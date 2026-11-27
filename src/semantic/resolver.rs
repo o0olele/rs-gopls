@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, btree_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,9 +7,10 @@ use lsp_types::{Position, Range};
 use tree_sitter::Node;
 
 use super::index::IndexReader;
+use super::navigation_trace::record;
 use super::source::{
     Import, ReferenceQuery, Source, is_declaration_name, is_type_declaration, node_text,
-    read_source,
+    read_navigation_source,
 };
 use crate::scope::{
     declaration_binding, lexical_binding, receiver_type_parameters, reference_binding,
@@ -100,6 +101,7 @@ impl<'w> TypeIdentity<'w> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ResolvedSymbol<'w> {
     pub(super) package: &'w Package,
     pub(super) file: PathBuf,
@@ -175,6 +177,23 @@ enum DeclarationSelection<'a> {
 pub(super) struct Resolver<'w, 'idx> {
     pub(super) workspace: &'w Workspace,
     pub(super) indexes: IndexReader<'idx>,
+    diagnostic_symbols: Option<SymbolMemo<'w>>,
+}
+
+type SymbolMemo<'w> = HashMap<(&'w str, String, Option<String>), Option<ResolvedSymbol<'w>>>;
+
+impl<'w, 'idx> Resolver<'w, 'idx> {
+    pub(super) fn new(
+        workspace: &'w Workspace,
+        indexes: IndexReader<'idx>,
+        diagnostics: bool,
+    ) -> Self {
+        Self {
+            workspace,
+            indexes,
+            diagnostic_symbols: diagnostics.then(HashMap::new),
+        }
+    }
 }
 
 impl<'w> Resolver<'w, '_> {
@@ -190,6 +209,15 @@ impl<'w> Resolver<'w, '_> {
             ReferenceQuery::Member { receiver, name } => {
                 let member =
                     self.selector(from, source, receiver, node_text(name, &source.text), 0)?;
+                if let Some(member) = &member {
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = if member.receiver.is_some() {
+                            "member"
+                        } else {
+                            "cross_package"
+                        };
+                    });
+                }
                 Ok(member.map(ResolvedSymbol::location))
             }
             ReferenceQuery::LiteralKey { value, name } => {
@@ -202,6 +230,11 @@ impl<'w> Resolver<'w, '_> {
                 let member = self.member(from, &ty, node_text(name, &source.text), false)?;
                 let member =
                     member.filter(|found| matches!(found.symbol.kind, SymbolKind::Value(_)));
+                if member.is_some() {
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = "member"
+                    });
+                }
                 Ok(member.map(ResolvedSymbol::location))
             }
         }
@@ -238,6 +271,11 @@ impl<'w> Resolver<'w, '_> {
                 let Some(symbol) = self.selector(from, source, receiver, spelling, 0)? else {
                     return Ok(None);
                 };
+                if symbol.receiver.is_some() {
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = "member"
+                    });
+                }
                 if let Some(location) = self.field_type_parameter(&symbol)? {
                     return Ok(Some(location));
                 }
@@ -254,6 +292,9 @@ impl<'w> Resolver<'w, '_> {
                     let Some(symbol) = self.member(from, &owner, spelling, false)? else {
                         return Ok(None);
                     };
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = "member"
+                    });
                     self.symbol_type(source, &symbol, spelling, 0)?
                 }
             }
@@ -313,10 +354,16 @@ impl<'w> Resolver<'w, '_> {
             .or_else(|| lexical_binding(name, spelling, &source.text));
         let ty = if let Some(binding) = binding {
             if binding.name.parent().is_some_and(is_lexical_type_owner) {
+                record(self.indexes.navigation, |counts| {
+                    counts.definition_route = "local"
+                });
                 return Ok(location(binding.name));
             }
             if let Some(explicit) = binding.explicit_type {
                 if let Some(local) = lexical_type_declaration(source, explicit) {
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = "local"
+                    });
                     return Ok(location(local));
                 }
                 self.source_type(from, source, explicit)
@@ -324,6 +371,9 @@ impl<'w> Resolver<'w, '_> {
                 if binding.result_index == 0
                     && let Some(local) = lexical_expression_type(source, initializer)
                 {
+                    record(self.indexes.navigation, |counts| {
+                        counts.definition_route = "local"
+                    });
                     return Ok(location(local));
                 }
                 let ty = self.infer_type(from, source, initializer, 0, binding.result_index)?;
@@ -368,7 +418,11 @@ impl<'w> Resolver<'w, '_> {
         root: &Path,
     ) -> Result<Option<(PathBuf, Range)>> {
         let file = self.workspace.builtin_source(root)?;
+        let probe = self.indexes.navigation;
         let found = self.indexes.file_index(file)?.symbols.declaration(name);
+        if found.is_some() {
+            record(probe, |counts| counts.definition_route = "builtin");
+        }
         Ok(found.map(|symbol| (file.to_owned(), symbol.range)))
     }
 
@@ -459,11 +513,15 @@ impl<'w> Resolver<'w, '_> {
             return Ok(location);
         }
         let file = self.workspace.builtin_source(root)?;
+        let probe = self.indexes.navigation;
         let definition = self
             .indexes
             .file_index(file)?
             .symbols
             .declaration(identifier);
+        if definition.is_some() {
+            record(probe, |counts| counts.definition_route = "builtin");
+        }
         Ok(definition.map(|symbol| (file.to_owned(), symbol.range)))
     }
 
@@ -475,6 +533,9 @@ impl<'w> Resolver<'w, '_> {
     ) -> Result<Option<(PathBuf, Range)>> {
         let identifier = node_text(name, &source.text);
         if let Some(binding) = lexical_binding(name, identifier, &source.text) {
+            record(self.indexes.navigation, |counts| {
+                counts.definition_route = "local"
+            });
             return Ok(Some((source.path.clone(), source.range(binding.name))));
         }
         if let Some((import, _)) = source.imported_package(self.workspace, from, identifier) {
@@ -565,6 +626,15 @@ impl<'w> Resolver<'w, '_> {
         let Some(ty) = self.infer_type(from, source, receiver, depth + 1, 0)? else {
             return Ok(None);
         };
+        self.member_selector(from, ty, name)
+    }
+
+    pub(super) fn member_selector(
+        &mut self,
+        from: &Package,
+        ty: TypeIdentity<'w>,
+        name: &str,
+    ) -> Result<Option<ResolvedSymbol<'w>>> {
         let mut member = self.member(from, &ty, name, true)?;
         if ty.type_expression
             && let Some(member) = &mut member
@@ -1083,6 +1153,7 @@ impl<'w> Resolver<'w, '_> {
                 file.clone(),
                 TypeDetails {
                     interface: shape.interface,
+                    structure: !shape.interface,
                     method_names: if shape.interface {
                         shape.members.keys().cloned().collect()
                     } else {
@@ -1157,6 +1228,31 @@ impl<'w> Resolver<'w, '_> {
     }
 
     pub(super) fn find_symbol(
+        &mut self,
+        package: &'w Package,
+        name: &str,
+        receiver: Option<&str>,
+    ) -> Result<Option<ResolvedSymbol<'w>>> {
+        if self.diagnostic_symbols.is_some() {
+            let key = (
+                package.id.as_str(),
+                name.to_owned(),
+                receiver.map(str::to_owned),
+            );
+            if let Some(cached) = self.diagnostic_symbols.as_ref().unwrap().get(&key) {
+                return Ok(cached.clone());
+            }
+            let result = self.find_symbol_in_files(package, name, receiver)?;
+            self.diagnostic_symbols
+                .as_mut()
+                .unwrap()
+                .insert(key, result.clone());
+            return Ok(result);
+        }
+        self.find_symbol_in_files(package, name, receiver)
+    }
+
+    fn find_symbol_in_files(
         &mut self,
         package: &'w Package,
         name: &str,
@@ -2097,10 +2193,30 @@ impl<'w> Resolver<'w, '_> {
         source: &Source,
         ty: Node<'_>,
     ) -> Option<TypeIdentity<'w>> {
+        self.source_type_with_scope(from, source, ty, true)
+    }
+
+    pub(super) fn source_type_unscoped(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        ty: Node<'_>,
+    ) -> Option<TypeIdentity<'w>> {
+        self.source_type_with_scope(from, source, ty, false)
+    }
+
+    fn source_type_with_scope(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        ty: Node<'_>,
+        lexical: bool,
+    ) -> Option<TypeIdentity<'w>> {
         let parse = |node| symbols::type_ref(node, &source.text, &|node| source.range(node));
         let mut reference = parse(ty)?;
         let mut constrained = false;
-        if let TypeRefKind::Named(named) = &reference.kind
+        if lexical
+            && let TypeRefKind::Named(named) = &reference.kind
             && named.qualifier.is_none()
             && let Some(binding) = lexical_binding(ty, &named.name, &source.text)
         {
@@ -2201,7 +2317,13 @@ impl<'w> Resolver<'w, '_> {
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
                     cached.as_ref()
                 } else {
-                    disk_source = read_source(self.indexes.parser, &resolved.file)?;
+                    let probe = self.indexes.navigation;
+                    record(probe, |counts| {
+                        counts.scanned_files += 1;
+                        counts.ast_access(false);
+                    });
+                    disk_source =
+                        read_navigation_source(self.indexes.parser, &resolved.file, probe)?;
                     &disk_source
                 };
                 let Some(expression) = source

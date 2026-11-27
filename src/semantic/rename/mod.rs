@@ -41,8 +41,13 @@ impl Engine {
     fn rename_load(&mut self) -> Result<Option<crate::workspace::WorkspaceLoad>> {
         self.include_tests = true;
         self.track_rename_inputs = true;
-        match self.snapshot().active_graph(true) {
-            QueryProgress::Ready(graph) if graph.rename_inputs_current()? => Ok(None),
+        let snapshot = self.snapshot();
+        match snapshot.active_graph(true) {
+            QueryProgress::Ready(graph)
+                if graph.rename_inputs_current(snapshot.environment())? =>
+            {
+                Ok(None)
+            }
             QueryProgress::Ready(_) => {
                 self.invalidate(None);
                 Ok(Some(self.workspace_load()))
@@ -200,7 +205,8 @@ impl RenameTask {
             active.into_values().collect()
         };
         files.sort_unstable();
-        let mut preview = Engine::with_roots(engine.roots().to_vec());
+        let mut preview =
+            Engine::with_environment(engine.roots().to_vec(), engine.environment().clone());
         preview.state.workspace = Some(graph.clone());
         preview.include_tests = true;
         preview.state.new_documents = engine.state.new_documents.clone();
@@ -456,12 +462,10 @@ impl RenameTask {
     }
 
     fn inputs_current(&self, engine: &Engine) -> bool {
-        if !engine
-            .state
-            .workspace
-            .as_ref()
-            .is_some_and(|w| w.rename_inputs_current().unwrap_or(false))
-        {
+        if !engine.state.workspace.as_ref().is_some_and(|w| {
+            w.rename_inputs_current(engine.environment())
+                .unwrap_or(false)
+        }) {
             return false;
         }
         for (key, input) in &self.inputs {
@@ -546,7 +550,7 @@ impl SemanticTask<RenameResult> for RenameTask {
                 .workspace
                 .as_ref()
                 .zip(self.preview.state.workspace.as_ref())
-                .is_some_and(|(live, captured)| std::rc::Rc::ptr_eq(live, captured))
+                .is_some_and(|(live, captured)| std::sync::Arc::ptr_eq(live, captured))
         {
             self.result = Some(Err(RenameError::ContentModified));
         } else if let Err(error) = self.step(engine) {

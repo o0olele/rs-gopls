@@ -1,27 +1,32 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result, bail, ensure};
 use lsp_types::TextEdit;
 
+use crate::go_environment::GoEnvironment;
 use crate::semantic::snapshot::DocumentSnapshot;
 use crate::workspace::path_key;
 
 pub(crate) fn format_document(
     document: &DocumentSnapshot<'_>,
     workdir: Option<&Path>,
+    environment: &GoEnvironment,
+    cache: &mut GofmtCache,
 ) -> Result<Vec<TextEdit>> {
     if document.root_node().has_error() {
         return Ok(Vec::new());
     }
-    let executable = gofmt_path(workdir);
-    let mut command = Command::new(&executable);
+    let executable = cache.resolve(workdir, environment, |dir| sdk_root(dir, environment));
+    let mut command = environment
+        .command(&executable)
+        .with_context(|| format!("finding gofmt ({})", executable.display()))?;
     if let Some(dir) = workdir {
         command.current_dir(dir);
     }
@@ -58,35 +63,38 @@ pub(crate) fn format_document(
     )
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Eq, Hash, PartialEq)]
 struct GofmtContext {
     workdir: PathBuf,
-    goroot: Option<PathBuf>,
-    path: Option<OsString>,
-    toolchain: Option<OsString>,
+    environment: Arc<BTreeMap<OsString, OsString>>,
 }
 
-impl GofmtContext {
-    fn new(workdir: Option<&Path>) -> Self {
-        let dir = workdir.unwrap_or(Path::new("."));
-        Self {
-            workdir: path_key(&dir.canonicalize().unwrap_or_else(|_| dir.to_owned())),
-            goroot: env::var_os("GOROOT").map(PathBuf::from),
-            path: env::var_os("PATH"),
-            toolchain: env::var_os("GOTOOLCHAIN"),
-        }
+#[derive(Default)]
+pub(crate) struct GofmtCache {
+    paths: HashMap<GofmtContext, PathBuf>,
+}
+
+impl GofmtCache {
+    pub(crate) fn clear(&mut self) {
+        self.paths.clear();
     }
 
     fn resolve(
-        self,
-        paths: &mut HashMap<Self, PathBuf>,
+        &mut self,
+        workdir: Option<&Path>,
+        environment: &GoEnvironment,
         query_root: impl FnOnce(&Path) -> Option<PathBuf>,
     ) -> PathBuf {
-        if let Some(path) = self.goroot.as_deref().and_then(sdk_gofmt) {
+        if let Some(path) = environment.get("GOROOT").map(Path::new).and_then(sdk_gofmt) {
             return path;
         }
-        paths
-            .entry(self)
+        let dir = workdir.unwrap_or(Path::new("."));
+        let context = GofmtContext {
+            workdir: path_key(&dir.canonicalize().unwrap_or_else(|_| dir.to_owned())),
+            environment: Arc::clone(environment.variables()),
+        };
+        self.paths
+            .entry(context)
             .or_insert_with_key(|context| {
                 query_root(&context.workdir)
                     .as_deref()
@@ -104,22 +112,21 @@ fn sdk_gofmt(root: &Path) -> Option<PathBuf> {
     (root.is_absolute() && path.is_file()).then_some(path)
 }
 
-fn gofmt_path(workdir: Option<&Path>) -> PathBuf {
-    static PATHS: LazyLock<Mutex<HashMap<GofmtContext, PathBuf>>> = LazyLock::new(Mutex::default);
-    GofmtContext::new(workdir).resolve(&mut PATHS.lock().unwrap(), |dir| {
-        let output = Command::new("go")
-            .args(["env", "GOROOT"])
-            .current_dir(dir)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let root = std::str::from_utf8(&output.stdout)
-            .ok()?
-            .trim_end_matches(['\r', '\n']);
-        Some(PathBuf::from(root))
-    })
+fn sdk_root(dir: &Path, environment: &GoEnvironment) -> Option<PathBuf> {
+    let output = environment
+        .command("go")
+        .ok()?
+        .args(["env", "GOROOT"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    Some(PathBuf::from(root))
 }
 
 pub(super) fn formatting_edits(
@@ -178,68 +185,74 @@ mod tests {
     use crate::test_support::TestProject;
 
     #[test]
-    fn gofmt_resolution_is_cached_per_directory_and_toolchain_environment() {
+    fn gofmt_resolution_is_cached_per_directory_and_effective_environment() {
         let project = TestProject::new();
         let tool = format!("bin/gofmt{}", env::consts::EXE_SUFFIX);
         let first = project.write(&format!("first/{tool}"), "");
         let second = project.write(&format!("second/{tool}"), "");
-        let context = GofmtContext {
-            goroot: None,
-            ..GofmtContext::new(Some(&project.root))
+        let startup = GoEnvironment::capture();
+        let configured = |overrides: &[(&str, &str)]| {
+            startup.with_overrides(
+                std::iter::once(("GOROOT", ""))
+                    .chain(overrides.iter().copied())
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+            )
         };
-        let mut paths = HashMap::new();
+        let environment = configured(&[]);
+        let dir = Some(project.root.as_path());
+        let mut cache = GofmtCache::default();
         let resolve_once = |_: &Path| -> Option<PathBuf> { panic!("unexpected go env GOROOT") };
 
         assert_eq!(
-            context.clone().resolve(&mut paths, |dir| {
+            cache.resolve(dir, &environment, |dir| {
                 assert_eq!(dir, path_key(&project.root));
                 Some(project.root.join("first"))
             }),
             first
         );
-        let same_dir = GofmtContext {
-            workdir: GofmtContext::new(Some(&project.root.join("first/.."))).workdir,
-            ..context.clone()
-        };
-        assert_eq!(same_dir.resolve(&mut paths, resolve_once), first);
-
-        let explicit = GofmtContext {
-            goroot: Some(project.root.join("second")),
-            ..context.clone()
-        };
-        assert_eq!(explicit.resolve(&mut paths, resolve_once), second);
-        let missing = GofmtContext {
-            goroot: Some(project.root.join("missing")),
-            ..context.clone()
-        };
         assert_eq!(
-            missing.clone().resolve(&mut paths, |_| None),
+            cache.resolve(
+                Some(&project.root.join("first/..")),
+                &configured(&[]),
+                resolve_once
+            ),
+            first
+        );
+
+        let explicit = configured(&[("GOROOT", project.root.join("second").to_str().unwrap())]);
+        assert_eq!(cache.resolve(dir, &explicit, resolve_once), second);
+        let missing = configured(&[("GOROOT", project.root.join("missing").to_str().unwrap())]);
+        assert_eq!(cache.resolve(dir, &missing, |_| None), Path::new("gofmt"));
+        assert_eq!(
+            cache.resolve(dir, &missing, resolve_once),
             Path::new("gofmt")
         );
-        assert_eq!(
-            missing.resolve(&mut paths, resolve_once),
-            Path::new("gofmt")
-        );
-        assert_eq!(context.clone().resolve(&mut paths, resolve_once), first);
 
-        for changed in [
-            GofmtContext {
-                workdir: project.root.join("second"),
-                ..context.clone()
-            },
-            GofmtContext {
-                path: Some(project.root.clone().into_os_string()),
-                ..context.clone()
-            },
-            GofmtContext {
-                toolchain: Some("test-toolchain".into()),
-                ..context
-            },
+        assert_eq!(
+            cache.resolve(Some(&project.root.join("second")), &environment, |_| Some(
+                project.root.join("second")
+            )),
+            second
+        );
+        for (key, value) in [
+            ("PATH", project.root.to_str().unwrap()),
+            ("GOTOOLCHAIN", "test-toolchain"),
+            ("GOENV", "test-config"),
+            ("GOWORK", "test-workspace"),
         ] {
+            let changed = configured(&[(key, value)]);
             assert_eq!(
-                changed.resolve(&mut paths, |_| Some(project.root.join("second"))),
+                cache.resolve(dir, &changed, |_| Some(project.root.join("second"))),
                 second
             );
+            assert_eq!(cache.resolve(dir, &changed, resolve_once), second);
         }
+        assert_eq!(cache.resolve(dir, &environment, resolve_once), first);
+        cache.clear();
+        assert_eq!(
+            cache.resolve(dir, &environment, |_| Some(project.root.join("second"))),
+            second
+        );
     }
 }

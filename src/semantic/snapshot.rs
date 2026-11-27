@@ -1,27 +1,33 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use lsp_types::{Position, Range};
 use tree_sitter::{Node, Parser};
 
 use super::completion::{InferredMemo, prefilter::FileNames};
+use super::diagnostics::DiagnosticKeys;
 use super::index::{
     CompletionRead, DiskIndex, IndexReader, IndexedSource, NavigationText, active_package,
     draft_files,
 };
+use super::navigation_trace::{NavigationProbe, record};
 use super::query::QueryProgress;
 use super::resolver::{Resolver, TypeIdentity};
-use super::source::{Import, Source, is_test_source, node_text, raw_imports, read_source};
+use super::source::{Import, Source, is_test_source, node_text, read_navigation_source};
 use super::{Engine, EngineState, GraphChanges};
+use crate::go_environment::GoEnvironment;
 use crate::scope::{Binding, lexical_binding};
 use crate::symbols::{FileOutline, FileSymbols};
-use crate::workspace::{Package, Workspace, WorkspaceLoad, path_key};
+use crate::workspace::{DiagnosticFileObservation, Package, Workspace, WorkspaceLoad, path_key};
 
 /// A query's view of the open documents and the installed package graph.
 /// The parser and disk indexes are borrowed for lazy reads.
 pub(crate) struct EngineSnapshot<'a> {
     roots: &'a [PathBuf],
+    environment: &'a GoEnvironment,
     workspace: Option<&'a Workspace>,
     graph_changes: &'a GraphChanges,
     documents: &'a HashMap<PathBuf, IndexedSource>,
@@ -33,6 +39,9 @@ pub(crate) struct EngineSnapshot<'a> {
     parser: &'a mut Parser,
     load: WorkspaceLoad,
     completion_source_generation: u64,
+    diagnostic_graph_epoch: u64,
+    diagnostic_file_changes: &'a HashMap<PathBuf, DiagnosticFileObservation>,
+    diagnostic_keys: &'a RefCell<DiagnosticKeys>,
 }
 
 pub(crate) struct DocumentSnapshot<'a> {
@@ -57,6 +66,7 @@ impl EngineState {
     pub(super) fn snapshot(&mut self, include_tests: bool) -> EngineSnapshot<'_> {
         EngineSnapshot {
             roots: &self.roots,
+            environment: &self.environment,
             workspace: self.workspace.as_deref(),
             graph_changes: &self.graph_changes,
             documents: &self.documents,
@@ -71,22 +81,48 @@ impl EngineState {
                 include_tests,
             },
             completion_source_generation: self.completion_source_generation,
+            diagnostic_graph_epoch: self.completion_graph_generation,
+            diagnostic_file_changes: &self.diagnostic_file_changes,
+            diagnostic_keys: &self.diagnostic_keys,
         }
     }
 }
 
 impl<'a> EngineSnapshot<'a> {
+    pub(crate) fn environment(&self) -> &'a GoEnvironment {
+        self.environment
+    }
+
     pub(crate) fn document<'d>(&mut self, path: &'d Path) -> Result<Option<DocumentSnapshot<'d>>>
     where
         'a: 'd,
     {
+        self.navigation_document(path, None)
+    }
+
+    pub(super) fn navigation_document<'d>(
+        &mut self,
+        path: &'d Path,
+        probe: Option<&NavigationProbe>,
+    ) -> Result<Option<DocumentSnapshot<'d>>>
+    where
+        'a: 'd,
+    {
         if let Some(source) = self.docs().get(&path_key(path)) {
+            record(probe, |counts| {
+                counts.scanned_files += 1;
+                counts.ast_access(true);
+            });
             return Ok(Some(DocumentSnapshot::borrowed(path, source)));
         }
         if path.extension().is_none_or(|extension| extension != "go") {
             return Ok(None);
         }
-        let source = read_source(self.parser, path)?;
+        record(probe, |counts| {
+            counts.scanned_files += 1;
+            counts.ast_access(false);
+        });
+        let source = read_navigation_source(self.parser, path, probe)?;
         Ok(Some(DocumentSnapshot {
             path,
             source: DocumentSource::Disk(IndexedSource::new(source, None)),
@@ -111,6 +147,45 @@ impl<'a> EngineSnapshot<'a> {
                 QueryProgress::Ready(workspace)
             }
             _ => QueryProgress::Pending(self.load_for(require_tests)),
+        }
+    }
+
+    pub(super) fn diagnostic_workspace(
+        &self,
+        path: &Path,
+        source: Option<&Source>,
+    ) -> Option<&'a Workspace> {
+        let workspace = self.workspace?;
+        if is_test_source(path) && !workspace.includes_tests() {
+            return None;
+        }
+        let package = self.diagnostic_package(workspace, path, source);
+        let stale = match self.graph_changes {
+            GraphChanges::Clean => false,
+            GraphChanges::Global => true,
+            GraphChanges::Packages(_) => source.map_or_else(
+                || package.is_none_or(|package| self.graph_changes.affects(package)),
+                |source| {
+                    self.graph_changes
+                        .affects_source(workspace, package, source)
+                },
+            ),
+        };
+        (!stale).then_some(workspace)
+    }
+
+    pub(super) fn diagnostic_package(
+        &self,
+        workspace: &'a Workspace,
+        path: &Path,
+        source: Option<&Source>,
+    ) -> Option<&'a Package> {
+        if workspace.total_load_failure().is_some() {
+            return None;
+        }
+        match source {
+            Some(source) => active_package(workspace, source, self.new_documents),
+            None => workspace.package_of_file(path),
         }
     }
 
@@ -181,6 +256,21 @@ impl<'a> EngineSnapshot<'a> {
         self.completion_source_generation
     }
 
+    pub(super) fn diagnostic_inputs_epoch(&self) -> (u64, u64) {
+        (
+            self.diagnostic_graph_epoch,
+            self.completion_source_generation,
+        )
+    }
+
+    pub(super) fn diagnostic_file_change(&self, path: &Path) -> Option<&DiagnosticFileObservation> {
+        self.diagnostic_file_changes.get(path)
+    }
+
+    pub(super) fn diagnostic_keys(&self) -> &RefCell<DiagnosticKeys> {
+        self.diagnostic_keys
+    }
+
     pub(super) fn workspace(&self) -> Option<&'a Workspace> {
         self.workspace
     }
@@ -206,19 +296,41 @@ impl<'a> EngineSnapshot<'a> {
         workspace: &'a Workspace,
         completion: Option<&'s mut CompletionRead>,
     ) -> Resolver<'a, 's> {
+        self.resolver_for(workspace, completion, None, false)
+    }
+
+    pub(super) fn diagnostic_resolver<'s>(
+        &'s mut self,
+        workspace: &'a Workspace,
+        cancelled: Option<&'s AtomicBool>,
+    ) -> Resolver<'a, 's> {
+        self.resolver_for(workspace, None, cancelled, true)
+    }
+
+    fn resolver_for<'s>(
+        &'s mut self,
+        workspace: &'a Workspace,
+        completion: Option<&'s mut CompletionRead>,
+        cancelled: Option<&'s AtomicBool>,
+        diagnostics: bool,
+    ) -> Resolver<'a, 's> {
         let indexes = IndexReader {
             workspace,
             parser: self.parser,
             documents: self.documents,
             disk_index: self.disk_index,
             navigation_texts: self.navigation_texts,
+            navigation: None,
+            deferred_reference: None,
             implementation_parse_time: None,
             drafts: draft_files(workspace, self.documents, self.new_documents),
             disk_names: self.disk_names,
             completion,
             inferred_weights: self.inferred_weights,
+            cancelled,
+            diagnostic_types: diagnostics.then(HashMap::new),
         };
-        Resolver { workspace, indexes }
+        Resolver::new(workspace, indexes, diagnostics)
     }
 
     pub(super) fn active_package(
@@ -266,7 +378,7 @@ impl<'a> DocumentSnapshot<'a> {
     /// The syntactic import list in source order, including dot and blank imports.
     #[allow(dead_code, reason = "consumed by completion in Wave 2")]
     pub(super) fn raw_imports(&self) -> impl Iterator<Item = Import> + '_ {
-        raw_imports(self.root_node(), self.text(), &self.indexed().lines)
+        self.indexed().editor_names.raw_imports.iter().cloned()
     }
 
     pub(crate) fn outline(&self) -> &FileOutline {

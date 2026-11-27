@@ -4,12 +4,13 @@ use std::path::Path;
 use lsp_types::{CodeAction, CodeActionKind, CodeActionOrCommand, Position, Range, TextEdit, Uri};
 use serde_json::{Value, json};
 
-use super::{code_actions, format_document, formatting::formatting_edits};
+use super::{GofmtCache, code_actions, format_document, formatting::formatting_edits};
+use crate::go_environment::GoEnvironment;
 use crate::protocol::path_uri;
 use crate::semantic::Engine;
 use crate::semantic::diagnostics::{
     DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, DiagnosticSeverity,
-    DiagnosticSnapshotKey,
+    snapshot_key,
 };
 use crate::semantic::snapshot::{DocumentSnapshot, EngineSnapshot};
 use crate::test_support::TestProject;
@@ -42,6 +43,16 @@ fn apply(document: &DocumentSnapshot<'_>, edits: &[TextEdit]) -> String {
     result
 }
 
+fn format(document: &DocumentSnapshot<'_>, workdir: Option<&Path>) -> Vec<TextEdit> {
+    format_document(
+        document,
+        workdir,
+        &GoEnvironment::capture(),
+        &mut GofmtCache::default(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn formats_the_unsaved_fixture_and_returns_no_edits_for_the_clean_fixture() {
     let project = TestProject::new();
@@ -49,7 +60,7 @@ fn formats_the_unsaved_fixture_and_returns_no_edits_for_the_clean_fixture() {
     let clean = fixture("formatting_clean.go");
     let mut engine = open(&path, &fixture("formatting_unformatted.go"));
     let document = engine.snapshot().document(&path).unwrap().unwrap();
-    let edits = format_document(&document, Some(&project.root)).unwrap();
+    let edits = format(&document, Some(&project.root));
     assert_eq!(edits.len(), 1);
     assert_eq!(
         apply(&document, &edits),
@@ -58,7 +69,7 @@ fn formats_the_unsaved_fixture_and_returns_no_edits_for_the_clean_fixture() {
     assert_eq!(fs::read_to_string(&path).unwrap(), "package disk\n");
     engine.open(path.clone(), clean, 8).unwrap();
     let document = engine.snapshot().document(&path).unwrap().unwrap();
-    assert!(format_document(&document, None).unwrap().is_empty());
+    assert!(format(&document, None).is_empty());
 }
 
 #[test]
@@ -90,7 +101,7 @@ fn formatting_uses_exact_utf16_columns_and_keeps_crlf_atomic() {
     ] {
         let mut engine = open(&path, before);
         let document = engine.snapshot().document(&path).unwrap().unwrap();
-        let edits = format_document(&document, None).unwrap();
+        let edits = format(&document, None);
         assert_eq!(
             edits,
             [TextEdit::new(Range::new(start, end), replacement.into())]
@@ -106,11 +117,7 @@ fn tree_errors_gofmt_parse_errors_and_empty_output_protect_the_buffer() {
     let mut engine = open(&path, "package p\nfunc f( {\n");
     let document = engine.snapshot().document(&path).unwrap().unwrap();
     assert!(document.root_node().has_error());
-    assert!(
-        format_document(&document, Some(&project.root.join("absent")))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(format(&document, Some(&project.root.join("absent"))).is_empty());
 
     engine
         .open(
@@ -121,14 +128,14 @@ fn tree_errors_gofmt_parse_errors_and_empty_output_protect_the_buffer() {
         .unwrap();
     let document = engine.snapshot().document(&path).unwrap().unwrap();
     assert!(!document.root_node().has_error());
-    assert!(format_document(&document, None).unwrap().is_empty());
+    assert!(format(&document, None).is_empty());
     for empty in ["", " \n"] {
         assert!(formatting_edits(&document, empty.into()).is_err());
     }
 
     engine.open(path.clone(), " \n\r\n\r\n".into(), 9).unwrap();
     let document = engine.snapshot().document(&path).unwrap().unwrap();
-    assert!(format_document(&document, None).unwrap().is_empty());
+    assert!(format(&document, None).is_empty());
     assert_eq!(
         apply(
             &document,
@@ -176,12 +183,9 @@ fn report(
     document: &DocumentSnapshot<'_>,
     items: Vec<DiagnosticItem>,
 ) -> DiagnosticReport {
-    let load = snapshot.load_for(false);
-    DiagnosticReport::new(
-        DiagnosticSnapshotKey::new(document, load.generation, load.include_tests),
-        items,
-        false,
-    )
+    let key = snapshot_key(snapshot, document).unwrap();
+    let is_partial = key.partial;
+    DiagnosticReport::new(key, items, is_partial)
 }
 
 fn token(document: &DocumentSnapshot<'_>, text: &str) -> Range {
@@ -474,29 +478,13 @@ fn only_filters_on_kind_boundaries_and_stale_reports_cannot_remove_imports() {
                     .is_empty()
             );
 
-            let key = report.snapshot.clone();
-            for stale in [
-                DiagnosticSnapshotKey {
-                    version: Some(6),
-                    ..key.clone()
-                },
-                DiagnosticSnapshotKey {
-                    text_fingerprint: key.text_fingerprint ^ 1,
-                    ..key.clone()
-                },
-                DiagnosticSnapshotKey {
-                    graph_generation: key.graph_generation + 1,
-                    ..key.clone()
-                },
-                DiagnosticSnapshotKey {
-                    includes_tests: true,
-                    ..key.clone()
-                },
-                DiagnosticSnapshotKey {
-                    path_key: "other.go".into(),
-                    ..key
-                },
-            ] {
+            let mut wrong_version = report.snapshot.clone();
+            wrong_version.version = Some(6);
+            let mut wrong_scope = report.snapshot.clone();
+            wrong_scope.partial = !wrong_scope.partial;
+            let mut wrong_path = report.snapshot.clone();
+            wrong_path.path_key = "other.go".into();
+            for stale in [wrong_version, wrong_scope, wrong_path] {
                 report.snapshot = stale;
                 assert!(
                     code_actions(snapshot, document, uri, range, None, Some(&report))

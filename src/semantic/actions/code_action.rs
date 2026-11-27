@@ -8,11 +8,10 @@ use lsp_types::{
 
 use super::{ImportEditError, ImportOperation, import_edits};
 use crate::semantic::diagnostics::{
-    DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport,
+    DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, snapshot_key,
 };
-use crate::semantic::query::QueryProgress;
 use crate::semantic::snapshot::{DocumentSnapshot, EngineSnapshot};
-use crate::semantic::source::{is_test_source, node_at_range, node_text};
+use crate::semantic::source::{node_at_range, node_text};
 use crate::workspace::{Package, Workspace, path_key};
 
 pub(crate) fn code_actions(
@@ -29,17 +28,12 @@ pub(crate) fn code_actions(
         return Ok(Vec::new());
     }
 
-    let test_source = is_test_source(document.path());
-    let load = snapshot.load_for(test_source);
-    let workspace = match snapshot.active_graph(test_source) {
-        QueryProgress::Ready(workspace) => Some(workspace),
-        QueryProgress::Pending(_) => None,
-        QueryProgress::Searching(task) => match task {},
-    };
-    let includes_tests = workspace.map_or(load.include_tests, Workspace::includes_tests);
-    let report = report.filter(|r| {
-        r.snapshot
-            .matches(document, load.generation, includes_tests)
+    let source = document.version().is_some().then(|| &**document.indexed());
+    let workspace = snapshot
+        .diagnostic_workspace(document.path(), source)
+        .filter(|workspace| workspace.total_load_failure().is_none());
+    let report = report.filter(|report| {
+        snapshot_key(snapshot, document).is_ok_and(|current| current == report.snapshot)
     });
     let local_prefixes: Vec<_> = workspace
         .into_iter()
@@ -99,7 +93,8 @@ pub(crate) fn code_actions(
         );
     }
     if quickfix && let Some(report) = report {
-        let owner = workspace.and_then(|w| snapshot.active_package(w, document.indexed()));
+        let owner = workspace
+            .and_then(|workspace| snapshot.diagnostic_package(workspace, document.path(), source));
         let mut searched = HashSet::new();
         for item in report.items_overlapping(range) {
             let mut fix = |title, edits| add(title, edits, Some(item));
@@ -180,6 +175,11 @@ fn wants_kind(only: Option<&[CodeActionKind]>, target: &CodeActionKind) -> bool 
                     .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('.'))
         })
     })
+}
+
+pub(crate) fn needs_diagnostics(only: Option<&[CodeActionKind]>) -> bool {
+    wants_kind(only, &CodeActionKind::QUICKFIX)
+        || wants_kind(only, &CodeActionKind::SOURCE_ORGANIZE_IMPORTS)
 }
 
 fn action_import_edits(

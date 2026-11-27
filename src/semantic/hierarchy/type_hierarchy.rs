@@ -354,7 +354,6 @@ impl EmbeddingSearch {
             && let Some(spec) = declaration_at(origin.as_ref(), range.start)
             && let Some(name) = spec.child_by_field_name("name")
             && let Some(indexed) = sources.embedding_files(
-                workspace,
                 path,
                 node_text(name, &origin.as_ref().text),
                 self.target.kind == SymbolKind::INTERFACE,
@@ -540,6 +539,13 @@ fn related_types(
 }
 
 impl SemanticTask<Option<Vec<TypeHierarchyItem>>> for TypeHierarchyTask {
+    fn ready(&self, engine: &Engine) -> bool {
+        self.implementations
+            .search
+            .as_ref()
+            .is_none_or(|search| search.ready(engine))
+    }
+
     fn advance(&mut self, engine: &mut Engine) -> Result<bool> {
         ensure!(
             engine.workspace_load().generation == self.generation,

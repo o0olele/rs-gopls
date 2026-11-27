@@ -1,14 +1,27 @@
+mod diagnostics;
+mod highlights;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Connection, ErrorCode, RequestId};
+use lsp_types::Position;
 
 use crate::protocol::{RequestResult, internal_error, send_response};
-use crate::semantic::{Engine, QueryProgress};
-use crate::workspace::{Workspace, WorkspaceLoad, path_key};
+use crate::semantic::{Engine, LoadedWorkspace, QueryProgress};
+use crate::workspace::{LoadTrace, Workspace, WorkspaceLoad, path_key};
+use crate::{rpc_telemetry, telemetry};
+
+use self::diagnostics::Diagnostics;
+pub(super) use self::diagnostics::{
+    Completed as DiagnosticCompletion, Consumer as DiagnosticConsumer,
+};
+pub(super) use self::highlights::Completed as HighlightCompletion;
+use self::highlights::Highlights;
 
 const WORKSPACE_CHANGED: &str = "the workspace changed during search";
 const SHUTTING_DOWN: &str = "the server is shutting down";
@@ -58,7 +71,22 @@ pub(super) struct Searching {
 
 pub(super) struct WorkspaceResult {
     pub(super) load: WorkspaceLoad,
-    pub(super) result: Result<Workspace>,
+    pub(super) result: Result<LoadedWorkspace>,
+}
+
+#[cfg(test)]
+impl WorkspaceResult {
+    pub(crate) fn for_test(
+        engine: &Engine,
+        load: WorkspaceLoad,
+        result: Result<Workspace>,
+    ) -> Self {
+        Self {
+            load,
+            result: result
+                .map(|workspace| engine.workspace_cache_snapshot(load).validate(workspace)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -67,18 +95,23 @@ pub(super) struct Scheduler {
     pub(super) searches: VecDeque<Searching>,
     pub(super) loading: Option<WorkspaceLoad>,
     pub(super) requested: Option<WorkspaceLoad>,
+    requested_from: &'static str,
+    load_trace: Option<(Instant, &'static str)>,
+    diagnostics: Diagnostics,
+    highlights: Highlights,
 }
 
 impl Scheduler {
-    pub(super) fn request_workspace(&mut self, load: WorkspaceLoad) {
+    pub(super) fn request_workspace_from(&mut self, load: WorkspaceLoad, trigger: &'static str) {
         if self.loading != Some(load) {
             self.requested = Some(load);
+            self.requested_from = trigger;
         }
     }
 
     pub(super) fn start_workspace_load(
         &mut self,
-        engine: &Engine,
+        engine: &mut Engine,
         results: &Sender<WorkspaceResult>,
     ) -> Result<()> {
         if self.loading.is_some() {
@@ -89,19 +122,40 @@ impl Scheduler {
         };
         engine.prewarm_completion_sdk(true);
         let roots = engine.roots().to_vec();
+        let environment = engine.environment().clone();
         let track_rename_inputs = engine.track_rename_inputs;
+        let cache_snapshot = engine.begin_workspace_cache_validation(load);
         let results = results.clone();
-        thread::Builder::new()
+        let trigger = self.requested_from;
+        let in_flight_generation = Some(load.generation);
+        self.load_trace = telemetry::now().map(|start| {
+            telemetry::emit(
+                "workspace_load_start",
+                serde_json::json!({
+                    "trigger": trigger,
+                    "target_generation": load.generation,
+                    "in_flight_generation": in_flight_generation,
+                    "include_tests": load.include_tests,
+                }),
+            );
+            (start, trigger)
+        });
+        let worker = thread::Builder::new()
             .name("go-package-loader".into())
             .spawn(move || {
+                let _trace = LoadTrace::enter(trigger, load, in_flight_generation);
                 let result = if track_rename_inputs {
-                    Workspace::load_roots_for_rename(&roots, load.include_tests)
+                    Workspace::load_roots_for_rename(&roots, load.include_tests, &environment)
                 } else {
-                    Workspace::load_roots(&roots, load.include_tests)
+                    Workspace::load_roots_in_environment(&roots, load.include_tests, &environment)
                 };
+                let result = result.map(|workspace| cache_snapshot.validate(workspace));
                 let _ = results.send(WorkspaceResult { load, result });
-            })
-            .context("starting Go package loader")?;
+            });
+        if let Err(error) = worker {
+            engine.discard_workspace_cache_validation(load);
+            return Err(error).context("starting Go package loader");
+        }
         self.loading = Some(load);
         Ok(())
     }
@@ -112,45 +166,89 @@ impl Scheduler {
         connection: &Connection,
         update: WorkspaceResult,
     ) -> Result<bool> {
+        if self.loading.is_some() && self.loading != Some(update.load) {
+            return Ok(false);
+        }
         if self.loading == Some(update.load) {
+            if let Some((start, trigger)) = self.load_trace.take() {
+                let current = engine.workspace_load();
+                let failure = match &update.result {
+                    Ok(loaded) => loaded.workspace.total_load_failure().is_some(),
+                    Err(_) => true,
+                };
+                telemetry::emit(
+                    "workspace_load_done",
+                    serde_json::json!({
+                        "trigger": trigger,
+                        "target_generation": update.load.generation,
+                        "in_flight_generation": update.load.generation,
+                        "include_tests": update.load.include_tests,
+                        "load_ms": telemetry::elapsed(start),
+                        "failed": failure,
+                        "stale": current.generation != update.load.generation || failure && current != update.load,
+                    }),
+                );
+            }
             self.loading = None;
         }
         let mut installed = false;
         match update.result {
-            Ok(workspace) => {
-                let failure = workspace.total_load_failure().map(str::to_owned);
+            Ok(loaded) => {
+                let failure = loaded.workspace.total_load_failure().map(str::to_owned);
                 if (failure.is_none() || update.load == engine.workspace_load())
-                    && engine.install_workspace(update.load, workspace)
+                    && engine.install_loaded_workspace(update.load, loaded)
                 {
                     installed = true;
+                    self.revalidate_diagnostics(engine, connection)?;
                     if let Some(message) = failure {
                         // Diagnostics can use the installed failures. Graph
                         // queries retain their load error and can retry later.
                         self.fail_pending_load(engine, connection, &message)?;
                     } else {
+                        let replay_start = telemetry::now();
+                        let replay_count = self.pending.len() + self.diagnostics.pending_count();
+                        if let Some(load) = self.diagnostics.replay(engine, connection, false)? {
+                            self.request_workspace_from(load, "pending_diagnostics");
+                        }
                         for pending in std::mem::take(&mut self.pending) {
                             let Pending {
                                 id,
                                 document_key,
                                 query,
                             } = pending;
-                            let progress = query.run(engine);
+                            let _trace = rpc_telemetry::step(&id, true);
+                            let progress = {
+                                let _navigation = rpc_telemetry::navigation_step();
+                                query.run(engine)
+                            };
                             self.resolve(engine, connection, id, progress, |id| Pending {
                                 id,
                                 document_key,
                                 query,
                             })?;
                         }
+                        if let Some(start) = replay_start {
+                            telemetry::emit(
+                                "workspace_replay",
+                                serde_json::json!({
+                                    "target_generation": update.load.generation,
+                                    "replay_count": replay_count,
+                                    "replay_ms": telemetry::elapsed(start),
+                                }),
+                            );
+                        }
                     }
                 }
+                engine.discard_workspace_cache_validation(update.load);
             }
             Err(error) if update.load == engine.workspace_load() => {
+                engine.discard_workspace_cache_validation(update.load);
                 self.fail_pending_load(engine, connection, &format!("{error:#}"))?;
             }
-            Err(_) => {}
+            Err(_) => engine.discard_workspace_cache_validation(update.load),
         }
         if !self.pending.is_empty() {
-            self.request_workspace(engine.workspace_load());
+            self.request_workspace_from(engine.workspace_load(), "pending_requests");
         }
         Ok(installed)
     }
@@ -161,12 +259,81 @@ impl Scheduler {
         connection: &Connection,
         message: &str,
     ) -> Result<()> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.diagnostics.pending_count() == 0 {
             eprintln!("rs-gopls: loading Go packages: {message}");
         }
+        self.diagnostics.replay(engine, connection, true)?;
         for pending in std::mem::take(&mut self.pending) {
+            let _trace = rpc_telemetry::step(&pending.id, false);
+            rpc_telemetry::wait(|| "graph_load_failed");
             let result = pending.query.load_failed(engine, message);
             send_response(connection, pending.id, result)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn submit_diagnostics(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        path: PathBuf,
+        consumer: DiagnosticConsumer,
+        trigger: &'static str,
+    ) -> Result<()> {
+        if let Some(load) = self
+            .diagnostics
+            .submit(engine, connection, path, consumer, false)?
+        {
+            self.request_workspace_from(load, trigger);
+        }
+        Ok(())
+    }
+
+    pub(super) fn diagnostic_completions(&self) -> Option<&Receiver<DiagnosticCompletion>> {
+        self.diagnostics.receiver()
+    }
+
+    pub(super) fn submit_highlight(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        id: RequestId,
+        path: PathBuf,
+        position: Position,
+    ) -> Result<()> {
+        self.highlights
+            .submit(engine, connection, id, path, position)
+    }
+
+    pub(super) fn highlight_completions(&self) -> Option<&Receiver<HighlightCompletion>> {
+        self.highlights.receiver()
+    }
+
+    pub(super) fn complete_highlight(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        completed: HighlightCompletion,
+    ) -> Result<()> {
+        self.highlights.complete(engine, connection, completed)
+    }
+
+    pub(super) fn complete_diagnostics(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        completed: DiagnosticCompletion,
+    ) -> Result<()> {
+        self.diagnostics.complete(engine, connection, completed)
+    }
+
+    pub(super) fn revalidate_diagnostics(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+    ) -> Result<()> {
+        if let Some(load) = self.diagnostics.revalidate(engine, connection)? {
+            self.request_workspace_from(load, "publish_diagnostics");
         }
         Ok(())
     }
@@ -178,7 +345,10 @@ impl Scheduler {
         id: RequestId,
         query: impl DeferredQuery + 'static,
     ) -> Result<()> {
-        let progress = query.run(engine);
+        let progress = {
+            let _navigation = rpc_telemetry::navigation_step();
+            query.run(engine)
+        };
         self.resolve(engine, connection, id, progress, |id| Pending {
             id,
             document_key: query.document_path().map(path_key),
@@ -196,8 +366,9 @@ impl Scheduler {
     ) -> Result<()> {
         let result = match progress {
             Ok(QueryProgress::Pending(load)) => {
+                let trigger = rpc_telemetry::wait(|| engine.workspace_wait_reason(load));
                 self.pending.push(defer(id));
-                self.request_workspace(load);
+                self.request_workspace_from(load, trigger);
                 return Ok(());
             }
             Ok(QueryProgress::Searching(task)) => {
@@ -223,9 +394,13 @@ impl Scheduler {
             return Ok(());
         };
         let mut search = self.searches.remove(next).unwrap();
+        let _trace = rpc_telemetry::step(&search.id, false);
         let current_generation = engine.workspace_load().generation;
         let result = if current_generation == search.generation {
-            let progress = search.task.advance(engine);
+            let progress = {
+                let _navigation = rpc_telemetry::navigation_step();
+                search.task.advance(engine)
+            };
             if engine.workspace_load().generation != search.generation {
                 search.task.discard(ErrorCode::ContentModified);
                 Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
@@ -291,6 +466,9 @@ impl Scheduler {
     }
 
     pub(super) fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<()> {
+        rpc_telemetry::cancelled(id);
+        self.highlights.cancel(connection, id)?;
+        self.diagnostics.cancel(connection, id)?;
         self.cancel_pending(
             connection,
             |request| &request.id == id,
@@ -306,6 +484,8 @@ impl Scheduler {
     }
 
     pub(super) fn document_modified(&mut self, connection: &Connection, path: &Path) -> Result<()> {
+        self.highlights.document_modified(connection, path)?;
+        self.diagnostics.document_modified(connection, path)?;
         if !self.pending.is_empty() {
             let key = path_key(path);
             self.cancel_pending(
@@ -330,6 +510,7 @@ impl Scheduler {
         &mut self,
         connection: &Connection,
         load: WorkspaceLoad,
+        trigger: &'static str,
     ) -> Result<()> {
         self.cancel_pending(
             connection,
@@ -343,26 +524,38 @@ impl Scheduler {
             ErrorCode::ContentModified,
             WORKSPACE_CHANGED,
         )?;
-        self.request_workspace(load);
+        self.request_workspace_from(load, trigger);
         Ok(())
     }
 
     pub(super) fn shutdown(&mut self, connection: &Connection) -> Result<()> {
-        self.cancel_pending(
-            connection,
-            |_| true,
-            ErrorCode::RequestFailed,
-            SHUTTING_DOWN,
-        )?;
-        self.cancel_searches(
-            connection,
-            |_| true,
-            ErrorCode::RequestFailed,
-            SHUTTING_DOWN,
-        )?;
+        self.cancel_all(connection, ErrorCode::RequestFailed, SHUTTING_DOWN)?;
         self.requested = None;
         self.loading = None;
+        self.load_trace = None;
         Ok(())
+    }
+
+    pub(super) fn environment_modified(
+        &mut self,
+        connection: &Connection,
+        load: WorkspaceLoad,
+    ) -> Result<()> {
+        self.cancel_all(connection, ErrorCode::ContentModified, WORKSPACE_CHANGED)?;
+        self.request_workspace_from(load, "didChangeConfiguration");
+        Ok(())
+    }
+
+    fn cancel_all(
+        &mut self,
+        connection: &Connection,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<()> {
+        self.cancel_pending(connection, |_| true, code, message)?;
+        self.cancel_searches(connection, |_| true, code, message)?;
+        self.highlights.cancel_all(connection, code, message)?;
+        self.diagnostics.cancel_all(connection, code, message)
     }
 }
 
@@ -371,19 +564,22 @@ mod tests {
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use anyhow::anyhow;
     use lsp_server::{Message, Notification, Request, Response, ResponseError};
     use lsp_types::{
         FileChangeType, Uri,
         notification::{
-            Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidChangeWorkspaceFolders,
-            DidCloseTextDocument, DidOpenTextDocument, Exit, Initialized, Notification as _,
+            Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
+            DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, Exit,
+            Initialized, Notification as _,
         },
         request::{
-            DocumentHighlightRequest, FoldingRangeRequest, GotoImplementation, HoverRequest,
-            Initialize, InlayHintRequest, References, Request as _, SemanticTokensFullRequest,
-            Shutdown, SignatureHelpRequest, WorkspaceSymbolRequest,
+            CodeActionRequest, DocumentDiagnosticRequest, DocumentHighlightRequest,
+            FoldingRangeRequest, GotoImplementation, HoverRequest, Initialize, InlayHintRequest,
+            References, Request as _, SemanticTokensFullRequest, Shutdown, SignatureHelpRequest,
+            WorkspaceSymbolRequest,
         },
     };
     use serde_json::{Value, json};
@@ -406,18 +602,28 @@ mod tests {
         }
 
         fn with_capabilities(project: &TestProject, capabilities: Value) -> Self {
+            Self::initialize(project, capabilities, Value::Null)
+        }
+
+        fn initialize(
+            project: &TestProject,
+            capabilities: Value,
+            initialization_options: Value,
+        ) -> Self {
             let (server, client) = Connection::memory();
             let mut session = Self {
                 server,
                 client,
-                state: State::Starting,
+                state: State::starting(),
                 replies: HashMap::new(),
             };
             session.request(
                 0,
                 Initialize::METHOD,
                 json!({
-                    "rootUri": path_uri(&project.root).unwrap(), "capabilities": capabilities
+                    "rootUri": path_uri(&project.root).unwrap(),
+                    "capabilities": capabilities,
+                    "initializationOptions": initialization_options
                 }),
             );
             assert!(session.reply(0).result.is_some());
@@ -486,9 +692,8 @@ mod tests {
             let State::Running(running) = &mut self.state else {
                 panic!("expected a running session");
             };
-            running
-                .workspace_loaded(&self.server, WorkspaceResult { load, result })
-                .unwrap();
+            let update = WorkspaceResult::for_test(&running.engine, load, result);
+            running.workspace_loaded(&self.server, update).unwrap();
         }
 
         fn begin_load(&mut self) -> WorkspaceLoad {
@@ -501,14 +706,17 @@ mod tests {
 
         fn finish_requested_load(&mut self) {
             let (sender, receiver) = crossbeam_channel::bounded(1);
-            let running = self.running();
+            let State::Running(running) = &mut self.state else {
+                panic!("expected a running session");
+            };
             running
                 .scheduler
-                .start_workspace_load(&running.engine, &sender)
+                .start_workspace_load(&mut running.engine, &sender)
                 .unwrap();
             drop(sender);
             let update = receiver.recv().unwrap();
-            self.deliver(update.load, Ok(update.result.unwrap()));
+            assert!(update.result.is_ok());
+            running.workspace_loaded(&self.server, update).unwrap();
         }
 
         fn step(&mut self) {
@@ -518,12 +726,37 @@ mod tests {
             running.advance_search(&self.server).unwrap();
         }
 
+        fn finish_diagnostic_job(&mut self) {
+            let completed = self
+                .scheduler()
+                .diagnostic_completions()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            let State::Running(running) = &mut self.state else {
+                panic!("expected a running session");
+            };
+            running
+                .scheduler
+                .complete_diagnostics(&mut running.engine, &self.server, completed)
+                .unwrap();
+        }
+
         fn finish_searches(&mut self) {
             for _ in 0..4096 {
-                if self.scheduler().searches.is_empty() {
+                let running = self.running();
+                if running.scheduler.searches.is_empty() {
                     return;
                 }
-                self.step();
+                if running.scheduler.ready_search(&running.engine).is_some() {
+                    self.step();
+                    continue;
+                }
+                crossbeam_channel::select! {
+                    recv(running.engine.reference_wake()) -> signal => signal.unwrap(),
+                    recv(running.engine.completion_wake()) -> signal => signal.unwrap(),
+                    default(Duration::from_secs(10)) => panic!("search worker did not wake"),
+                }
             }
             panic!("searches did not finish");
         }
@@ -573,6 +806,297 @@ mod tests {
         let mut params = position(path, line, character);
         params["context"] = json!({ "includeDeclaration": true });
         params
+    }
+
+    #[test]
+    fn configuration_reload_cancels_old_queries_once_and_retains_unsaved_documents() {
+        struct CountingSearch(Rc<Cell<usize>>);
+
+        impl SearchTask for CountingSearch {
+            fn discard(&mut self, code: ErrorCode) {
+                assert!(matches!(code, ErrorCode::ContentModified));
+                self.0.set(self.0.get() + 1);
+            }
+
+            fn advance(&mut self, _: &mut Engine) -> Result<bool> {
+                panic!("an obsolete search advanced")
+            }
+
+            fn finish(self: Box<Self>) -> RequestResult {
+                panic!("an obsolete search returned a result")
+            }
+        }
+
+        let project = TestProject::new();
+        let path = project.write("api.go", "package sample\nvar Disk int\n");
+        let settings = json!({ "env": { "GOWORK": "", "RS_GOPLS_TEST_ENV": "initial" } });
+        let mut session = Session::initialize(&project, json!({}), settings.clone());
+        let inherited = crate::go_environment::GoEnvironment::capture();
+        assert_eq!(
+            session.running().engine.environment().get("GOWORK"),
+            Some("".as_ref())
+        );
+        session.open(&path, "package sample\nvar Open int\n");
+        let buffer = "package sample\nvar Unsaved int\n";
+        session.edit(&path, 2, buffer);
+        session.request(
+            1,
+            WorkspaceSymbolRequest::METHOD,
+            json!({ "query": "Unsaved" }),
+        );
+        let old = session.begin_load();
+        let discarded = Rc::new(Cell::new(0));
+        session.scheduler().searches.push_back(Searching {
+            id: 2.into(),
+            generation: old.generation,
+            task: Box::new(CountingSearch(Rc::clone(&discarded))),
+        });
+
+        for params in [
+            json!({ "settings": settings }),
+            json!({ "settings": {} }),
+            json!({ "settings": null }),
+            json!({ "settings": { "env": false } }),
+            json!({}),
+        ] {
+            session.notify(DidChangeConfiguration::METHOD, params);
+            assert_eq!(session.running().engine.workspace_load(), old);
+            assert_eq!(session.scheduler().pending.len(), 1);
+            assert_eq!(session.scheduler().searches.len(), 1);
+            assert!(session.scheduler().requested.is_none());
+            session.count(1);
+        }
+
+        session.notify(
+            DidChangeConfiguration::METHOD,
+            json!({
+                "settings": { "rs-gopls": { "env": { "RS_GOPLS_TEST_ENV": "changed" } } }
+            }),
+        );
+        let current = session.running().engine.workspace_load();
+        assert_eq!(current.generation, old.generation + 1);
+        let engine = &mut session.running().engine;
+        assert_eq!(
+            engine.environment().get("RS_GOPLS_TEST_ENV"),
+            Some("changed".as_ref())
+        );
+        assert_eq!(engine.environment().get("GOWORK"), inherited.get("GOWORK"));
+        let mut snapshot = engine.snapshot();
+        let document = snapshot.document(&path).unwrap().unwrap();
+        assert_eq!(document.text(), buffer);
+        assert_eq!(document.version(), Some(2));
+        assert_eq!(session.scheduler().requested, Some(current));
+        assert_eq!(discarded.get(), 1);
+        for id in [1, 2] {
+            session.error(id, ErrorCode::ContentModified, WORKSPACE_CHANGED);
+            session.cancel(id);
+        }
+        session.request(
+            3,
+            WorkspaceSymbolRequest::METHOD,
+            json!({ "query": "Unsaved" }),
+        );
+        session.deliver(old, Ok(project.workspace(&["api.go"], old.include_tests)));
+        assert_eq!(session.scheduler().pending.len(), 1);
+        assert!(session.scheduler().searches.is_empty());
+        assert_eq!(session.begin_load(), current);
+        session.deliver(
+            current,
+            Ok(project.workspace(&["api.go"], current.include_tests)),
+        );
+        session.finish_searches();
+        assert_eq!(
+            session.reply(3).result.as_ref().unwrap()[0]["name"],
+            "Unsaved"
+        );
+        assert_eq!(discarded.get(), 1);
+        session.count(4);
+
+        session.notify(
+            DidChangeConfiguration::METHOD,
+            json!({ "settings": { "env": {} } }),
+        );
+        assert!(*session.running().engine.environment() == inherited);
+        assert_eq!(
+            session.running().engine.workspace_load().generation,
+            current.generation + 1
+        );
+    }
+
+    #[test]
+    fn configuration_reload_emits_diagnostics_only_for_the_installed_generation() {
+        let project = TestProject::new();
+        let text = "package sample\nvar Ready int\n";
+        let path = project.write("api.go", text);
+        for (capabilities, pull) in [
+            (
+                json!({ "textDocument": { "publishDiagnostics": {} } }),
+                false,
+            ),
+            (
+                json!({
+                    "textDocument": { "diagnostic": {} },
+                    "workspace": { "diagnostics": { "refreshSupport": true } }
+                }),
+                true,
+            ),
+        ] {
+            let mut session = Session::with_capabilities(&project, capabilities);
+            session.open(&path, text);
+            if !pull {
+                session.finish_diagnostic_job();
+                assert!(matches!(
+                    session.client.receiver.try_recv().unwrap(),
+                    Message::Notification(_)
+                ));
+            }
+            let initial = session.running().engine.workspace_load();
+            session.scheduler().request_workspace_from(initial, "test");
+            let old = session.begin_load();
+            session.notify(
+                DidChangeConfiguration::METHOD,
+                json!({
+                    "settings": { "env": { "RS_GOPLS_TEST_ENV": "changed" } }
+                }),
+            );
+            session.deliver(old, Ok(project.workspace(&["api.go"], old.include_tests)));
+            assert!(session.client.receiver.is_empty());
+            let current = session.begin_load();
+            session.deliver(
+                current,
+                Ok(project.workspace(&["api.go"], current.include_tests)),
+            );
+            if !pull {
+                session.finish_diagnostic_job();
+            }
+            match session.client.receiver.try_recv().unwrap() {
+                Message::Request(request) if pull => {
+                    assert_eq!(
+                        request.method,
+                        lsp_types::request::WorkspaceDiagnosticRefresh::METHOD
+                    );
+                }
+                Message::Notification(notification) if !pull => {
+                    assert_eq!(notification.method, "textDocument/publishDiagnostics");
+                    assert_eq!(notification.params["version"], 1);
+                }
+                other => panic!("unexpected diagnostics message: {other:?}"),
+            }
+            assert!(session.client.receiver.is_empty());
+        }
+    }
+
+    #[test]
+    fn replays_pending_diagnostics_and_actions_in_one_background_job() {
+        let project = TestProject::new();
+        let text = "package sample\nfunc f() { unused := 1 }\n";
+        let path = project.write("api.go", text);
+        let mut session = Session::start(&project);
+        session.open(&path, text);
+        let document = json!({ "uri": path_uri(&path).unwrap() });
+        session.request(
+            1,
+            DocumentDiagnosticRequest::METHOD,
+            json!({ "textDocument": document }),
+        );
+        session.request(
+            2,
+            CodeActionRequest::METHOD,
+            json!({
+                "textDocument": document,
+                "range": {
+                    "start": { "line": 1, "character": 0 },
+                    "end": { "line": 2, "character": 0 },
+                },
+                "context": { "diagnostics": [], "only": ["quickfix"] },
+            }),
+        );
+        assert_eq!(session.scheduler().diagnostics.pending_count(), 2);
+        assert!(session.scheduler().diagnostic_completions().is_none());
+        let load = session.begin_load();
+        session.deliver(load, Ok(project.workspace(&["api.go"], load.include_tests)));
+        assert!(session.client.receiver.is_empty());
+        assert_eq!(session.scheduler().diagnostics.pending_count(), 0);
+        session.finish_diagnostic_job();
+        let report = session.reply(1).result.as_ref().unwrap();
+        assert_eq!(report["items"][0]["code"], "var.unused");
+        let previous = report["resultId"].as_str().unwrap().to_owned();
+        assert_eq!(
+            session.reply(2).result.as_ref().unwrap()[0]["title"],
+            "Replace unused variable 'unused' with '_'",
+        );
+        session.request(
+            3,
+            DocumentDiagnosticRequest::METHOD,
+            json!({ "textDocument": document, "previousResultId": previous }),
+        );
+        assert_eq!(
+            session.reply(3).result.as_ref().unwrap(),
+            &json!({ "kind": "unchanged", "resultId": previous }),
+        );
+        session.count(4);
+    }
+
+    #[test]
+    fn production_pull_is_unchanged_immediately_after_test_view_upgrade() {
+        let project = TestProject::new();
+        let text = "package sample\nvar _ = Missing\n";
+        let path = project.write("api.go", text);
+        let test = project.write("api_test.go", "package sample\nvar _ = MissingTest\n");
+        let mut session = Session::start(&project);
+        session.open(&path, text);
+        let document = json!({ "uri": path_uri(&path).unwrap() });
+        session.request(
+            1,
+            DocumentDiagnosticRequest::METHOD,
+            json!({ "textDocument": document }),
+        );
+        let initial = session.begin_load();
+        assert!(!initial.include_tests);
+        session.deliver(initial, Ok(project.workspace(&["api.go"], false)));
+        session.finish_diagnostic_job();
+        let result_id = session.reply(1).result.as_ref().unwrap()["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        session.request(
+            2,
+            DocumentDiagnosticRequest::METHOD,
+            json!({ "textDocument": { "uri": path_uri(&test).unwrap() } }),
+        );
+        let upgrade = session.begin_load();
+        assert!(upgrade.include_tests);
+        let production = json!({
+            "Dir": project.root, "ImportPath": "example.test/sample",
+            "Name": "sample", "GoFiles": ["api.go"],
+        });
+        let variant = json!({
+            "Dir": project.root, "ImportPath": "example.test/sample [example.test/sample.test]",
+            "ForTest": "example.test/sample", "Name": "sample", "GoFiles": ["api.go", "api_test.go"],
+        });
+        session.deliver(
+            upgrade,
+            Ok(Workspace::from_test_listing(
+                std::slice::from_ref(&project.root),
+                &format!("{production}\n{variant}"),
+                true,
+            )),
+        );
+        session.request(
+            3,
+            DocumentDiagnosticRequest::METHOD,
+            json!({ "textDocument": document, "previousResultId": result_id }),
+        );
+        assert_eq!(
+            session.reply(3).result.as_ref().unwrap(),
+            &json!({ "kind": "unchanged", "resultId": result_id }),
+        );
+        session.finish_diagnostic_job();
+        assert_eq!(
+            session.reply(2).result.as_ref().unwrap()["items"][0]["code"],
+            "name.unresolved",
+        );
+        session.count(4);
     }
 
     #[test]
@@ -747,7 +1271,12 @@ mod tests {
         let b = json!({"name": "two", "uri": path_uri(&second.root).unwrap()});
         let roots = |mut params: Value| {
             params["capabilities"] = json!({});
-            crate::initialize(params).map(|(session, _)| session.engine.roots().to_vec())
+            crate::initialize(
+                params,
+                crate::go_environment::GoEnvironment::capture(),
+                None,
+            )
+            .map(|(session, _)| session.engine.roots().to_vec())
         };
         assert_eq!(
             roots(json!({"workspaceFolders": [b, a, b], "rootUri": "untitled:ignored"})).unwrap(),
@@ -1419,7 +1948,7 @@ mod tests {
 
     fn editor_session(project: &TestProject, lines_only: Option<bool>) -> (TestSession, State) {
         let session = TestSession::new();
-        let mut state = State::Starting;
+        let mut state = State::starting();
         let capabilities = lines_only.map_or_else(
             || json!({}),
             |lines_only| json!({ "textDocument": { "foldingRange": { "lineFoldingOnly": lines_only } } }),
@@ -1468,6 +1997,21 @@ mod tests {
                 params,
                 |connection, request| handle_request(connection, state, request),
             );
+            if method == DocumentHighlightRequest::METHOD
+                && let State::Running(running) = state
+                && running.scheduler.highlights.has_active()
+            {
+                let completed = running
+                    .scheduler
+                    .highlight_completions()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                running
+                    .scheduler
+                    .complete_highlight(&mut running.engine, session.server(), completed)
+                    .unwrap();
+            }
         }
         let results = std::array::from_fn(|index| {
             let response = session.response(first_id + index as i32);
@@ -1633,10 +2177,11 @@ mod tests {
         running
             .workspace_loaded(
                 session.server(),
-                WorkspaceResult {
+                WorkspaceResult::for_test(
+                    &running.engine,
                     load,
-                    result: Ok(project.workspace(&["editor.go"], load.include_tests)),
-                },
+                    Ok(project.workspace(&["editor.go"], load.include_tests)),
+                ),
             )
             .unwrap();
         assert!(matches!(

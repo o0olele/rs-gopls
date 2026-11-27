@@ -927,16 +927,10 @@ pub(super) fn resolved_candidate<'w>(
             kind,
             caps.deprecated_support,
         ))
-    } else if let Some(description) = resolver
-        .indexes
-        .known_index(&path_key(&resolved.file))
-        .and_then(|index| index.presentation.get(&symbol.range))
-    {
-        Some(description.clone().with_kind(kind, caps.deprecated_support))
     } else {
         definition = resolver
             .indexes
-            .reference_source(&resolved.file)
+            .declaration_source(&resolved.file)
             .ok()
             .flatten();
         definition.as_ref().map(|source| {

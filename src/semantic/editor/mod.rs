@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::VecDeque;
 
-use lsp_types::{DocumentHighlight, InlayHint, Position, Range, SemanticTokens};
+use lsp_types::{InlayHint, Position, Range, SemanticTokens};
 use tree_sitter::Node;
 
 use crate::scope::{self, Binding};
@@ -8,10 +9,11 @@ use crate::scope::{self, Binding};
 use super::presentation::builtin_function;
 use super::resolver::is_predeclared_type;
 use super::snapshot::DocumentSnapshot;
-use super::source::{is_declaration_name, node_at_range};
+use super::source::{is_declaration_name_in, node_at_range};
 
 mod document_highlight;
 mod folding_range;
+mod highlight_request;
 mod inlay_hint;
 mod semantic_tokens;
 
@@ -19,6 +21,8 @@ mod semantic_tokens;
 mod tests;
 
 pub(super) use folding_range::folding_ranges;
+pub(super) use highlight_request::HighlightCache;
+pub(crate) use highlight_request::{HighlightInput, HighlightOutput, HighlightPreparation};
 pub(crate) use semantic_tokens::legend;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -28,13 +32,6 @@ pub(crate) struct EditorFoldingOptions {
 
 pub(super) fn semantic_tokens_full(document: &DocumentSnapshot<'_>) -> SemanticTokens {
     semantic_tokens::tokens(&Editor::new(document))
-}
-
-pub(super) fn document_highlight(
-    document: &DocumentSnapshot<'_>,
-    position: Position,
-) -> Vec<DocumentHighlight> {
-    document_highlight::highlights(&Editor::new(document), position)
 }
 
 pub(super) fn inlay_hints(document: &DocumentSnapshot<'_>, range: Range) -> Vec<InlayHint> {
@@ -73,61 +70,157 @@ struct Occurrence<'tree> {
 
 struct Editor<'tree> {
     document: &'tree DocumentSnapshot<'tree>,
-    imports: HashMap<String, Option<Node<'tree>>>,
-    ambiguous_file_names: HashSet<&'tree str>,
+    anchors: RefCell<VecDeque<Node<'tree>>>,
 }
 
 impl<'tree> Editor<'tree> {
     fn new(document: &'tree DocumentSnapshot<'tree>) -> Self {
-        let mut imports = HashMap::new();
-        for import in document.raw_imports() {
-            let name = match import.alias {
-                Some(alias) if matches!(alias.as_str(), "." | "_") => continue,
-                Some(alias) => alias,
-                None => {
-                    let Some(name) = implicit_import_name(&import.path) else {
-                        continue;
-                    };
-                    name.to_owned()
-                }
-            };
-            let node = node_at_range(document.indexed(), import.binding);
-            imports
-                .entry(name)
-                .and_modify(|entry| *entry = None)
-                .or_insert(node);
-        }
-        let mut seen = HashSet::new();
-        let mut ambiguous_file_names = HashSet::new();
-        let mut declarations: Vec<_> = named_children(document.root_node()).collect();
-        while let Some(declaration) = declarations.pop() {
-            match declaration.kind() {
-                "var_declaration" | "var_spec_list" | "const_declaration" | "type_declaration" => {
-                    declarations.extend(named_children(declaration));
-                }
-                "function_declaration" | "type_spec" | "type_alias" | "var_spec" | "const_spec" => {
-                    for name in declaration
-                        .children_by_field_name("name", &mut declaration.walk())
-                        .filter(Node::is_named)
-                    {
-                        let name = &document.text()[name.byte_range()];
-                        if !seen.insert(name) {
-                            ambiguous_file_names.insert(name);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
         Self {
             document,
-            imports,
-            ambiguous_file_names,
+            anchors: RefCell::default(),
         }
     }
 
     fn root(&self) -> Node<'tree> {
         self.document.root_node()
+    }
+
+    fn remember_anchor(&self, anchor: Node<'tree>) {
+        let mut anchors = self.anchors.borrow_mut();
+        const RECENT_DECLARATIONS: usize = 8;
+        if anchors.len() == RECENT_DECLARATIONS {
+            anchors.pop_front();
+        }
+        anchors.push_back(anchor);
+    }
+
+    fn anchor(&self, start: usize, end: usize) -> Option<Node<'tree>> {
+        self.anchors.borrow().iter().rev().copied().find(|anchor| {
+            anchor.start_byte() <= start && start < anchor.end_byte() && end <= anchor.end_byte()
+        })
+    }
+
+    fn node_for_bytes(&self, start: usize, end: usize) -> Option<Node<'tree>> {
+        if let Some(anchor) = self.anchor(start, end) {
+            return anchor.descendant_for_byte_range(start, end);
+        }
+        let root = self.root();
+        if let Some(anchor) = root.first_child_for_byte(start)
+            && anchor.start_byte() <= start
+            && end <= anchor.end_byte()
+        {
+            self.remember_anchor(anchor);
+            return anchor.descendant_for_byte_range(start, end);
+        }
+        root.descendant_for_byte_range(start, end)
+    }
+
+    fn parent(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let root = self.root();
+        if node == root {
+            return None;
+        }
+        let anchor = self.anchor(node.start_byte(), node.end_byte()).or_else(|| {
+            let anchor = root.child_with_descendant(node)?;
+            self.remember_anchor(anchor);
+            Some(anchor)
+        });
+        if let Some(mut ancestor) = anchor {
+            if ancestor == node {
+                return Some(root);
+            }
+            // Tree-sitter's Node::parent starts at the file root on each call.
+            // Descend only through the enclosing declaration after the first lookup.
+            while let Some(child) = ancestor.child_with_descendant(node) {
+                if child == node {
+                    return Some(ancestor);
+                }
+                if child == ancestor {
+                    break;
+                }
+                ancestor = child;
+            }
+        }
+        node.parent()
+    }
+
+    fn ancestors(&self, node: Node<'tree>) -> impl Iterator<Item = Node<'tree>> {
+        std::iter::successors(Some(node), |node| self.parent(*node))
+    }
+
+    fn function_owner(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        self.ancestors(node).find(|node| is_function(*node))
+    }
+
+    fn declaration_kind(&self, node: Node<'tree>) -> Option<SymbolKind> {
+        use SymbolKind::*;
+
+        if self.embedded_field(node).is_some() {
+            return Some(Property);
+        }
+        let parent = self.parent(node)?;
+        Some(match parent.kind() {
+            "function_declaration" => Function,
+            "method_declaration" | "method_elem" => Method,
+            "type_alias" => Type,
+            "type_spec" => match parent
+                .child_by_field_name("type")
+                .map(unwrap_parens)
+                .map(|ty| ty.kind())
+            {
+                Some("struct_type") => Struct,
+                Some("interface_type") => Interface,
+                _ => Type,
+            },
+            "parameter_declaration" | "variadic_parameter_declaration" => Parameter,
+            "type_parameter_declaration" | "type_elem" => TypeParameter,
+            "var_spec" | "const_spec" | "expression_list" => Variable,
+            "field_declaration" => Property,
+            _ => return None,
+        })
+    }
+
+    fn embedded_field(&self, name: Node<'tree>) -> Option<Node<'tree>> {
+        let field = self
+            .ancestors(name)
+            .find(|node| node.kind() == "field_declaration")?;
+        (field.child_by_field_name("name").is_none()
+            && field
+                .child_by_field_name("type")
+                .and_then(terminal_type_name)
+                == Some(name))
+        .then_some(field)
+    }
+
+    fn in_file_scope(&self, node: Node<'tree>) -> bool {
+        self.ancestors(node)
+            .skip(1)
+            .skip_while(|parent| {
+                matches!(
+                    parent.kind(),
+                    "var_spec"
+                        | "var_spec_list"
+                        | "var_declaration"
+                        | "const_spec"
+                        | "const_declaration"
+                        | "type_spec"
+                        | "type_alias"
+                        | "type_declaration"
+                        | "function_declaration"
+                )
+            })
+            .next()
+            .is_some_and(|scope| scope.kind() == "source_file")
+    }
+
+    fn literal_key_owner(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let element = self
+            .parent(node)
+            .filter(|parent| parent.kind() == "literal_element")?;
+        let keyed = self
+            .parent(element)
+            .filter(|parent| parent.kind() == "keyed_element")?;
+        (keyed.child_by_field_name("key") == Some(element)).then(|| self.parent(keyed))?
     }
 
     fn source(&self) -> &'tree str {
@@ -154,15 +247,27 @@ impl<'tree> Editor<'tree> {
     }
 
     fn file_name(&self, name: &str) -> Option<Node<'tree>> {
-        if self.ambiguous_file_names.contains(name) {
-            return None;
-        }
-        let symbol = self.document.declarations().declaration(name)?;
-        node_at_range(self.document.indexed(), symbol.range)
+        let range = self.document.indexed().editor_names.declaration(name)?;
+        self.node_for_bytes(range.start, range.end)
+    }
+
+    fn ambiguous_file_name(&self, name: &str) -> bool {
+        self.document.indexed().editor_names.ambiguous(name)
+    }
+
+    fn import_binding(&self, name: &str) -> Option<Node<'tree>> {
+        let range = self
+            .document
+            .indexed()
+            .editor_names
+            .imports
+            .get(name)?
+            .as_ref()?;
+        self.node_for_bytes(range.start, range.end)
     }
 
     fn lexical_name(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        scope::reference_binding(node, self.source())
+        scope::reference_binding_with(node, self.source(), &|node| self.parent(node))
             .map(|target| {
                 if target == node {
                     self.labelled_short_reuse(node).unwrap_or(target)
@@ -171,13 +276,14 @@ impl<'tree> Editor<'tree> {
                 }
             })
             .filter(|target| {
-                !self.ambiguous_file_names.contains(self.text(*target)) || !in_file_scope(*target)
+                !self.ambiguous_file_name(self.text(*target)) || !self.in_file_scope(*target)
             })
             .or_else(|| {
                 // A detached, unfinished function body can still expose its
                 // preceding signature and locals through scope's recovery path.
-                if !ancestors(node)
-                    .any(|parent| parent.is_error() && parent.parent() == Some(self.root()))
+                if !self
+                    .ancestors(node)
+                    .any(|parent| parent.is_error() && self.parent(parent) == Some(self.root()))
                 {
                     return None;
                 }
@@ -190,29 +296,35 @@ impl<'tree> Editor<'tree> {
     }
 
     fn labelled_short_reuse(&self, node: Node<'tree>) -> Option<Node<'tree>> {
-        let statement = node.parent()?.parent()?;
+        let statement = self.parent(self.parent(node)?)?;
         if statement.kind() != "short_var_declaration"
-            || statement.parent()?.kind() != "labeled_statement"
+            || self.parent(statement)?.kind() != "labeled_statement"
         {
             return None;
         }
-        let list = ancestors(statement)
+        let list = self
+            .ancestors(statement)
             .skip(1)
             .find(|parent| parent.kind() != "labeled_statement")?;
-        let previous = self.document.lexical_binding(node)?.name;
-        let scope = ancestors(previous).skip(1).find(|parent| {
+        let previous =
+            scope::lexical_binding_with(node, self.text(node), self.source(), &|node| {
+                self.parent(node)
+            })?
+            .name;
+        let scope = self.ancestors(previous).skip(1).find(|parent| {
             parent.kind() == "statement_list"
                 || is_function(*parent)
                 || parent.kind() == "source_file"
         })?;
-        (scope == list || scope.child_by_field_name("body") == list.parent()).then_some(previous)
+        (scope == list || scope.child_by_field_name("body") == self.parent(list))
+            .then_some(previous)
     }
 
     fn declaration(&self, node: Node<'tree>) -> Option<Node<'tree>> {
         let SymbolId::Declaration(offset) = self.symbol(node)?.id else {
             return None;
         };
-        self.root().descendant_for_byte_range(offset, offset + 1)
+        self.node_for_bytes(offset, offset + 1)
     }
 
     fn symbol(&self, node: Node<'tree>) -> Option<Occurrence<'tree>> {
@@ -236,7 +348,7 @@ impl<'tree> Editor<'tree> {
         ) {
             return None;
         }
-        let parent = node.parent()?;
+        let parent = self.parent(node)?;
         let occurrence = |target: Node<'tree>, kind, readonly| Occurrence {
             id: SymbolId::Declaration(target.start_byte()),
             kind,
@@ -244,7 +356,7 @@ impl<'tree> Editor<'tree> {
             readonly,
             default_library: false,
         };
-        if embedded_field(node).is_some() {
+        if self.embedded_field(node).is_some() {
             return Some(occurrence(node, Property, false));
         }
         match parent.kind() {
@@ -259,7 +371,7 @@ impl<'tree> Editor<'tree> {
             }
             "selector_expression" if parent.child_by_field_name("field") == Some(node) => {
                 let member = self.selector_member(parent, 0)?;
-                return Some(occurrence(member, declaration_kind(member)?, false));
+                return Some(occurrence(member, self.declaration_kind(member)?, false));
             }
             "qualified_type" if parent.child_by_field_name("name") == Some(node) => {
                 // The name belongs to another package.
@@ -267,7 +379,7 @@ impl<'tree> Editor<'tree> {
             }
             _ => {}
         }
-        if let Some(literal) = literal_key_owner(node) {
+        if let Some(literal) = self.literal_key_owner(node) {
             let shape = self.literal_shape(literal, 0)?;
             if let LocalType::Syntax(ty) = shape
                 && ty.kind() == "struct_type"
@@ -280,11 +392,11 @@ impl<'tree> Editor<'tree> {
                 return Some(occurrence(field, Property, false));
             }
         }
-        if is_declaration_name(node) || self.is_receiver_type_parameter(node) {
+        if is_declaration_name_in(node, parent) || self.is_receiver_type_parameter(node) {
             return Some(occurrence(
                 node,
-                declaration_kind(node)?,
-                is_const_name(node),
+                self.declaration_kind(node)?,
+                parent.kind() == "const_spec",
             ));
         }
         if node.kind() == "field_identifier" {
@@ -294,15 +406,22 @@ impl<'tree> Editor<'tree> {
         if let Some(target) = self.lexical_name(node).or_else(|| self.file_name(name)) {
             return Some(occurrence(
                 target,
-                declaration_kind(target)?,
-                is_const_name(target),
+                self.declaration_kind(target)?,
+                self.parent(target)
+                    .is_some_and(|parent| parent.kind() == "const_spec"),
             ));
         }
-        if self.ambiguous_file_names.contains(name) {
+        if self.ambiguous_file_name(name) {
             return None;
         }
-        if let Some(import) = self.imports.get(name) {
-            return Some(occurrence((*import)?, Namespace, false));
+        if self
+            .document
+            .indexed()
+            .editor_names
+            .imports
+            .contains_key(name)
+        {
+            return Some(occurrence(self.import_binding(name)?, Namespace, false));
         }
         let (kind, readonly) = if is_predeclared_type(name) {
             (Type, false)
@@ -312,7 +431,11 @@ impl<'tree> Editor<'tree> {
             match name {
                 "nil" => (Variable, false),
                 "true" | "false" => (Variable, true),
-                "iota" if ancestors(node).any(|parent| parent.kind() == "const_spec") => {
+                "iota"
+                    if self
+                        .ancestors(node)
+                        .any(|parent| parent.kind() == "const_spec") =>
+                {
                     (Variable, true)
                 }
                 _ => return None,
@@ -329,18 +452,22 @@ impl<'tree> Editor<'tree> {
     }
 
     fn is_receiver_type_parameter(&self, node: Node<'tree>) -> bool {
-        if node.kind() != "type_identifier"
-            || node
-                .parent()
-                .is_none_or(|parent| parent.kind() != "type_elem")
-        {
+        if node.kind() != "type_identifier" {
             return false;
         }
-        let Some((_, arguments)) = function_owner(node).and_then(scope::receiver_type_parameters)
+        let Some(element) = self
+            .parent(node)
+            .filter(|parent| parent.kind() == "type_elem")
         else {
             return false;
         };
-        node.parent().and_then(|element| element.parent()) == Some(arguments)
+        let Some((_, arguments)) = self
+            .function_owner(node)
+            .and_then(scope::receiver_type_parameters)
+        else {
+            return false;
+        };
+        self.parent(element) == Some(arguments)
     }
 
     fn label_definition(&self, reference: Node<'tree>) -> Option<Node<'tree>> {
@@ -348,14 +475,15 @@ impl<'tree> Editor<'tree> {
         if name == "_" {
             return None;
         }
-        let statement = reference.parent()?;
-        for scope in ancestors(statement)
+        let statement = self.parent(reference)?;
+        for scope in self
+            .ancestors(statement)
             .skip(1)
             .take_while(|scope| !is_function(*scope))
         {
             if statement.kind() == "break_statement" {
                 if is_breakable(scope)
-                    && let Some(label) = scope.parent().and_then(label_name)
+                    && let Some(label) = self.parent(scope).and_then(label_name)
                     && self.text(label) == name
                 {
                     return Some(label);
@@ -455,7 +583,8 @@ impl<'tree> Editor<'tree> {
         let name = self.text(selector.child_by_field_name("field")?);
         let ty = self.expression_type(operand, 0, depth + 1)?;
         let member = self.member(ty, name, depth + 1)?;
-        if self.is_type_expression(operand) && declaration_kind(member) != Some(SymbolKind::Method)
+        if self.is_type_expression(operand)
+            && self.declaration_kind(member) != Some(SymbolKind::Method)
         {
             return None;
         }
@@ -518,14 +647,15 @@ impl<'tree> Editor<'tree> {
                 break;
             };
             let owner_name = owner.child_by_field_name("name")?;
-            if self.file_name(self.text(owner_name)) == Some(owner_name)
+            if self.document.indexed().editor_names.methods.contains(name)
+                && self.file_name(self.text(owner_name)) == Some(owner_name)
                 && let Some(member) = self
                     .document
                     .declarations()
                     .member(self.text(owner_name), name)
                 && let Some(member_node) = node_at_range(self.document.indexed(), member.range)
-                && member_node
-                    .parent()
+                && self
+                    .parent(member_node)
                     .is_some_and(|parent| parent.kind() == "method_declaration")
             {
                 return Some(Some(member_node));
@@ -556,7 +686,7 @@ impl<'tree> Editor<'tree> {
                 embedded.extend(
                     fields
                         .into_iter()
-                        .filter_map(embedded_field)
+                        .filter_map(|field| self.embedded_field(field))
                         .filter_map(field_type),
                 );
             }
@@ -591,9 +721,10 @@ impl<'tree> Editor<'tree> {
         if !matches!(name.kind(), "type_identifier" | "identifier") {
             return None;
         }
-        self.lexical_name(name)
-            .or_else(|| self.file_name(self.text(name)))?
-            .parent()
+        let target = self
+            .lexical_name(name)
+            .or_else(|| self.file_name(self.text(name)))?;
+        self.parent(target)
             .filter(|owner| matches!(owner.kind(), "type_spec" | "type_alias"))
     }
 
@@ -615,7 +746,7 @@ impl<'tree> Editor<'tree> {
                     } else if is_predeclared_type(self.text(node))
                         && self.lexical_name(node).is_none()
                         && self.file_name(self.text(node)).is_none()
-                        && !self.ambiguous_file_names.contains(self.text(node))
+                        && !self.ambiguous_file_name(self.text(node))
                     {
                         return Some(LocalType::Syntax(node));
                     } else {
@@ -648,18 +779,25 @@ impl<'tree> Editor<'tree> {
                 let name = self
                     .lexical_name(node)
                     .or_else(|| self.file_name(self.text(node)))?;
-                let parent = name.parent()?;
+                let parent = self.parent(name)?;
                 match parent.kind() {
                     "function_declaration" => Some(LocalType::Callable(Callable::new(parent))),
                     "type_spec" | "type_alias" => Some(LocalType::Syntax(node)),
                     _ => {
+                        let parent = |node| self.parent(node);
                         let binding = if name == node {
-                            scope::declaration_binding(name, self.source())
+                            scope::declaration_binding_with(name, self.source(), &parent)
                         } else {
-                            self.document
-                                .lexical_binding(node)
-                                .filter(|binding| binding.name == name)
-                                .or_else(|| scope::declaration_binding(name, self.source()))
+                            scope::lexical_binding_with(
+                                node,
+                                self.text(node),
+                                self.source(),
+                                &parent,
+                            )
+                            .filter(|binding| binding.name == name)
+                            .or_else(|| {
+                                scope::declaration_binding_with(name, self.source(), &parent)
+                            })
                         }?;
                         self.binding_type(binding, next)
                     }
@@ -667,7 +805,7 @@ impl<'tree> Editor<'tree> {
             }
             "selector_expression" if index == 0 => {
                 let member = self.selector_member(node, next)?;
-                let parent = member.parent()?;
+                let parent = self.parent(member)?;
                 match parent.kind() {
                     "field_declaration" => field_type(parent),
                     "method_declaration" | "method_elem" => Some(LocalType::Callable(Callable {
@@ -675,9 +813,10 @@ impl<'tree> Editor<'tree> {
                         explicit_receiver: self
                             .is_type_expression(node.child_by_field_name("operand")?),
                     })),
-                    _ if declaration_kind(member) == Some(SymbolKind::Property) => {
-                        let field =
-                            ancestors(member).find(|node| node.kind() == "field_declaration")?;
+                    _ if self.declaration_kind(member) == Some(SymbolKind::Property) => {
+                        let field = self
+                            .ancestors(member)
+                            .find(|node| node.kind() == "field_declaration")?;
                         field_type(field)
                     }
                     _ => None,
@@ -761,9 +900,8 @@ impl<'tree> Editor<'tree> {
         if let Some(ty) = binding.explicit_type {
             let ty = LocalType::Syntax(ty);
             return Some(
-                if binding
-                    .name
-                    .parent()
+                if self
+                    .parent(binding.name)
                     .is_some_and(|parent| parent.kind() == "variadic_parameter_declaration")
                 {
                     LocalType::Slice(Box::new(ty))
@@ -825,14 +963,14 @@ impl<'tree> Editor<'tree> {
         if depth >= MAX_LOCAL_DEPTH {
             return None;
         }
-        let element = literal.parent()?;
+        let element = self.parent(literal)?;
         if element.kind() == "composite_literal" {
             return element.child_by_field_name("type").map(LocalType::Syntax);
         }
-        let parent = element.parent()?;
+        let parent = self.parent(element)?;
         let keyed = (parent.kind() == "keyed_element").then_some(parent);
         let outer = match keyed {
-            Some(keyed) => keyed.parent()?,
+            Some(keyed) => self.parent(keyed)?,
             None => parent,
         };
         let mut ty = self.shape(self.literal_type(outer, depth + 1)?, depth + 1)?;
@@ -855,7 +993,8 @@ impl<'tree> Editor<'tree> {
                         .copied()?
                 };
                 return field_type(
-                    ancestors(field).find(|node| node.kind() == "field_declaration")?,
+                    self.ancestors(field)
+                        .find(|node| node.kind() == "field_declaration")?,
                 );
             }
             if shape.kind() == "map_type"
@@ -932,64 +1071,6 @@ fn parameter_slots(list: Node<'_>) -> impl Iterator<Item = (Node<'_>, Option<Nod
         })
 }
 
-fn implicit_import_name(path: &str) -> Option<&str> {
-    let mut parts = path.rsplit('/');
-    let mut name = parts.next()?;
-    if name.strip_prefix('v').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
-    }) {
-        name = parts.next()?;
-    }
-    let mut chars = name.chars();
-    if !chars
-        .next()
-        .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
-        || !chars.all(|ch| ch == '_' || ch.is_alphanumeric())
-        || name == "_"
-    {
-        return None;
-    }
-    Some(name)
-}
-
-fn declaration_kind(node: Node<'_>) -> Option<SymbolKind> {
-    use SymbolKind::*;
-
-    if embedded_field(node).is_some() {
-        return Some(Property);
-    }
-    let parent = node.parent()?;
-    Some(match parent.kind() {
-        "function_declaration" => Function,
-        "method_declaration" | "method_elem" => Method,
-        "type_alias" => Type,
-        "type_spec" => match parent
-            .child_by_field_name("type")
-            .map(unwrap_parens)
-            .map(|ty| ty.kind())
-        {
-            Some("struct_type") => Struct,
-            Some("interface_type") => Interface,
-            _ => Type,
-        },
-        "parameter_declaration" | "variadic_parameter_declaration" => Parameter,
-        "type_parameter_declaration" | "type_elem" => TypeParameter,
-        "var_spec" | "const_spec" | "expression_list" => Variable,
-        "field_declaration" => Property,
-        _ => return None,
-    })
-}
-
-fn embedded_field(name: Node<'_>) -> Option<Node<'_>> {
-    let field = ancestors(name).find(|node| node.kind() == "field_declaration")?;
-    (field.child_by_field_name("name").is_none()
-        && field
-            .child_by_field_name("type")
-            .and_then(terminal_type_name)
-            == Some(name))
-    .then_some(field)
-}
-
 fn field_type(field: Node<'_>) -> Option<LocalType<'_>> {
     let ty = LocalType::Syntax(field.child_by_field_name("type")?);
     Some(
@@ -1002,42 +1083,6 @@ fn field_type(field: Node<'_>) -> Option<LocalType<'_>> {
             ty
         },
     )
-}
-
-fn is_const_name(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "const_spec")
-}
-
-fn in_file_scope(node: Node<'_>) -> bool {
-    ancestors(node)
-        .skip(1)
-        .skip_while(|parent| {
-            matches!(
-                parent.kind(),
-                "var_spec"
-                    | "var_spec_list"
-                    | "var_declaration"
-                    | "const_spec"
-                    | "const_declaration"
-                    | "type_spec"
-                    | "type_alias"
-                    | "type_declaration"
-                    | "function_declaration"
-            )
-        })
-        .next()
-        .is_some_and(|scope| scope.kind() == "source_file")
-}
-
-fn literal_key_owner(node: Node<'_>) -> Option<Node<'_>> {
-    let element = node
-        .parent()
-        .filter(|parent| parent.kind() == "literal_element")?;
-    let keyed = element
-        .parent()
-        .filter(|parent| parent.kind() == "keyed_element")?;
-    (keyed.child_by_field_name("key") == Some(element)).then(|| keyed.parent())?
 }
 
 fn direct_fields(ty: Node<'_>) -> Vec<Node<'_>> {
@@ -1095,10 +1140,6 @@ fn is_function(node: Node<'_>) -> bool {
     )
 }
 
-fn function_owner(node: Node<'_>) -> Option<Node<'_>> {
-    ancestors(node).find(|node| is_function(*node))
-}
-
 fn is_breakable(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -1114,28 +1155,33 @@ fn label_name(node: Node<'_>) -> Option<Node<'_>> {
         .filter(|label| label.kind() == "label_name")
 }
 
-fn ancestors(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    std::iter::successors(Some(node), Node::parent)
-}
-
 fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
     std::iter::successors(node.named_child(0), Node::next_named_sibling)
         .filter(|node| !node.is_extra() && !node.is_missing())
 }
 
 fn descendants(root: Node<'_>) -> impl Iterator<Item = Node<'_>> {
-    let mut next = Some(root);
+    let mut cursor = root.walk();
+    let mut visit_root = true;
+    let mut descend = true;
     std::iter::from_fn(move || {
-        let node = next?;
-        next = named_children(node).next().or_else(|| {
-            ancestors(node)
-                .take_while(|node| *node != root)
-                .find_map(|node| {
-                    std::iter::successors(node.next_named_sibling(), Node::next_named_sibling)
-                        .find(|sibling| !sibling.is_extra() && !sibling.is_missing())
-                })
-        });
-        Some(node)
+        if std::mem::take(&mut visit_root) {
+            return Some(root);
+        }
+        loop {
+            if !descend || !cursor.goto_first_child() {
+                while !cursor.goto_next_sibling() {
+                    if !cursor.goto_parent() {
+                        return None;
+                    }
+                }
+            }
+            let node = cursor.node();
+            descend = node.is_named() && !node.is_extra() && !node.is_missing();
+            if descend {
+                return Some(node);
+            }
+        }
     })
 }
 

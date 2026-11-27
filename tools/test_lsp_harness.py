@@ -11,7 +11,7 @@ from unittest import mock
 
 from lsp_harness import (
     GO_WATCH_PATTERNS, LspClient, PausedGoList, WATCHED_FILES_METHOD, acknowledge_file_watches,
-    await_watcher_registration, collect_responses, expect_error, next_message, wait_for_response,
+    await_watcher_registration, collect_responses, expect_error, next_message, session, wait_for_response,
 )
 from workspace_checks.symbols import check_no_extra_symbol_responses
 
@@ -144,6 +144,7 @@ class LspHarnessTests(unittest.TestCase):
             {"id": "progress", "method": "window/workDoneProgress/create", "params": {"token": "build"}},
             watch_registration("watch", [{"globPattern": pattern} for pattern in sorted(GO_WATCH_PATTERNS)]),
             {"id": "unregister", "method": "client/unregisterCapability", "params": {}},
+            {"id": "refresh", "method": "workspace/diagnostic/refresh"},
             {"id": "unsupported", "method": "test/unknown"},
         ]
         client.notify("script", messages=requests, replyCount=len(requests))
@@ -152,7 +153,7 @@ class LspHarnessTests(unittest.TestCase):
         self.assertEqual(notice["method"], "test/serverReplies")
         replies = notice["params"]
         self.assertEqual([row["id"] for row in replies], [row["id"] for row in requests])
-        self.assertEqual([row["result"] for row in replies[:-1]], [client.folders, [None, None], None, None, None])
+        self.assertEqual([row["result"] for row in replies[:-1]], [client.folders, [None, None], None, None, None, None])
         expect_error(replies[-1], -32601)
 
         self.assertEqual(client.wait_for_registration(WATCHED_FILES_METHOD), {"jsonrpc": "2.0", **requests[3]})
@@ -201,6 +202,30 @@ class LspHarnessTests(unittest.TestCase):
         self.assertEqual(initialized["method"], "initialized")
         client.shutdown()
         self.assertEqual(client.process.returncode, 0)
+
+    def test_session_forwards_initialization_options_and_explicit_environment(self):
+        options = {"rs-gopls": {"env": {"GOPATH": "gopath", "GOWORK": ""}}}
+        environment = {"GOENV": "off"}
+        with mock.patch("lsp_harness.LspClient", return_value=self.client) as client_type:
+            with session("server", self.root, 5, initialization_options=options, environment=environment) as client:
+                initialize, initialized = client.request("transcript")
+                self.assertEqual(initialize["params"]["initializationOptions"], options)
+                self.assertEqual(initialized["method"], "initialized")
+        client_type.assert_called_once_with(["server"], self.root, 5, environment=environment)
+
+    def test_initialize_accepts_explicit_null_options(self):
+        self.client.initialize(initialization_options=None)
+        initialize, _ = self.client.request("transcript")
+        self.assertIsNone(initialize["params"]["initializationOptions"])
+
+    def test_change_configuration_sends_settings_as_a_notification(self):
+        settings = [{"env": {"GOPATH": "gopath"}}, {}, None, {"env": {}}]
+        for value in settings:
+            self.client.change_configuration(value)
+        self.assertEqual(self.client.request("transcript"), [
+            {"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration", "params": {"settings": value}}
+            for value in settings
+        ])
 
     def test_protocol_errors_stay_raw_for_wait_response(self):
         client = self.client

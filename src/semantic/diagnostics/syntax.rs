@@ -1,8 +1,10 @@
 use std::ops::Range as Bytes;
+use std::sync::atomic::AtomicBool;
 
+use anyhow::Result;
 use lsp_types::Range;
 
-use super::{DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DocumentSnapshot};
+use super::{DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DocumentSnapshot, checkpoint};
 
 pub(super) fn has_reliable_declarations(root: tree_sitter::Node<'_>) -> bool {
     !root.has_error()
@@ -19,19 +21,27 @@ pub(super) fn has_reliable_declarations(root: tree_sitter::Node<'_>) -> bool {
             }))
 }
 
-pub(super) fn collect_syntax_diagnostics(document: &DocumentSnapshot<'_>) -> Vec<DiagnosticItem> {
+pub(super) fn collect_syntax_diagnostics(
+    document: &DocumentSnapshot<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<DiagnosticItem>> {
     let root = document.root_node();
     if !root.has_error() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut errors: Vec<(Bytes<usize>, String)> = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
+    let mut pending = vec![(root, "")];
+    while let Some((node, parent_kind)) = pending.pop() {
+        checkpoint(cancelled)?;
         let before = pending.len();
-        pending.extend(
-            node.children(&mut node.walk())
-                .filter(|child| child.has_error()),
-        );
+        for (i, child) in node.children(&mut node.walk()).enumerate() {
+            if i & 1023 == 0 {
+                checkpoint(cancelled)?;
+            }
+            if child.has_error() {
+                pending.push((child, node.kind()));
+            }
+        }
         pending[before..].reverse();
         if before != pending.len() || !(node.is_error() || node.is_missing()) {
             continue;
@@ -40,7 +50,7 @@ pub(super) fn collect_syntax_diagnostics(document: &DocumentSnapshot<'_>) -> Vec
             (
                 node.byte_range(),
                 match node.kind() {
-                    "identifier" if node.parent().is_some_and(|p| p.kind() == "package_clause") => {
+                    "identifier" if parent_kind == "package_clause" => {
                         "Missing package name".into()
                     }
                     "identifier" => "Expected an identifier or expression".into(),
@@ -62,7 +72,7 @@ pub(super) fn collect_syntax_diagnostics(document: &DocumentSnapshot<'_>) -> Vec
             errors.push((bytes, message));
         }
     }
-    errors
+    Ok(errors
         .into_iter()
         .map(|(bytes, message)| {
             DiagnosticItem::new(
@@ -72,7 +82,7 @@ pub(super) fn collect_syntax_diagnostics(document: &DocumentSnapshot<'_>) -> Vec
                 message,
             )
         })
-        .collect()
+        .collect())
 }
 
 fn unexpected(node: tree_sitter::Node<'_>, text: &str) -> (Bytes<usize>, String) {

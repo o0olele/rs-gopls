@@ -17,14 +17,17 @@ def folder(path):
 
 
 @contextmanager
-def capability_session(executable, root, timeout, capabilities, *, folders=None, environment=None):
-    env = {**os.environ, **WORKSPACE_ENVIRONMENT, **(environment or {})}
-    client = LspClient([executable], root, timeout, environment=env)
+def capability_session(executable, root, timeout, capabilities, *, folders=None, environment=None,
+                       initialization_options=None, **env):
+    if environment is None:
+        environment = {**os.environ, **WORKSPACE_ENVIRONMENT}
+    client = LspClient([executable], root, timeout, environment={**environment, **env})
     try:
         if folders is not None:
             client.folders = [folder(path) for path in folders]
+        options = {} if initialization_options is None else {"initializationOptions": initialization_options}
         result = client.request("initialize", rootUri=root.as_uri(), workspaceFolders=client.folders,
-                                capabilities=capabilities)
+                                capabilities=capabilities, **options)
         client.notify("initialized")
         yield client, result["capabilities"]
         client.shutdown()
@@ -79,7 +82,7 @@ def check_push_diagnostics(executable, root, timeout):
     gate = PausedGoList(root / "control", timeout)
     codes = ["import.unused", "var.unused", "name.unresolved"]
     with capability_session(executable, project, timeout, {"textDocument": {"publishDiagnostics": {}}},
-                            environment=gate.environment) as (client, _):
+                            **gate.environment) as (client, _):
         with gate.pause():
             client.open_document(syntax, "package sample\nvar Value = (1 + )\n")
             expect_publications(client, {syntax: (1, ["syntax.error"])})
@@ -151,7 +154,7 @@ def check_pull_diagnostics(executable, root, timeout):
             raise RuntimeError(f"pull client received an unsolicited notification {message!r}")
 
     gate = PausedGoList(root / "control", timeout)
-    with capability_session(executable, project, timeout, PULL, environment=gate.environment) as (client, _):
+    with capability_session(executable, project, timeout, PULL, **gate.environment) as (client, _):
         gate.fail_next()
         client.open_document(path, "package sample\nvar Value = (1 + )\n")
         report = pull(client, path)

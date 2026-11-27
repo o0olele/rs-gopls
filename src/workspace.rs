@@ -1,17 +1,22 @@
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{self, Metadata};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::OnceLock;
 use std::thread;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Deserialize;
 
-use crate::workspace_roots::folder_groups;
+use crate::go_environment::GoEnvironment;
+use crate::workspace_roots::{folder_groups, use_module_auto};
 
 mod inputs;
+mod load_trace;
 use inputs::PackageInputs;
+pub(crate) use load_trace::{CommandTrace, LoadTrace};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceLoad {
@@ -19,7 +24,7 @@ pub struct WorkspaceLoad {
     pub include_tests: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum PackageErrorKind {
     Direct,
     Dependency,
@@ -27,7 +32,7 @@ pub(crate) enum PackageErrorKind {
 }
 
 /// Source positions use Go's one-based lines and byte columns.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct PackageLoadError {
     pub group_id: usize,
     pub import_path: String,
@@ -59,6 +64,7 @@ pub struct Package {
 }
 
 pub struct Workspace {
+    environment: GoEnvironment,
     rename_inputs: Option<Result<PackageInputs, String>>,
     roots: Vec<PathBuf>,
     module_paths: Vec<String>,
@@ -68,9 +74,42 @@ pub struct Workspace {
     packages: BTreeMap<String, Package>,
     file_packages: HashMap<PathBuf, String>,
     importers: HashMap<String, Vec<String>>,
+    diagnostic_file_stamps: HashMap<PathBuf, DiagnosticFileStamp>,
+    diagnostic_observed_at: Instant,
     includes_tests: bool,
-    sdk_root: OnceCell<PathBuf>,
-    builtin_source: OnceCell<Result<PathBuf, String>>,
+    sdk_root: OnceLock<PathBuf>,
+    builtin_source: OnceLock<Result<PathBuf, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DiagnosticFileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+pub(crate) struct DiagnosticFileObservation {
+    pub(crate) epoch: u64,
+    observed_at: Instant,
+    stamp: Option<DiagnosticFileStamp>,
+}
+
+impl DiagnosticFileObservation {
+    pub(crate) fn new(path: &Path, epoch: u64) -> Self {
+        Self {
+            epoch,
+            observed_at: Instant::now(),
+            stamp: fs::metadata(path).ok().map(Into::into),
+        }
+    }
+}
+
+impl From<Metadata> for DiagnosticFileStamp {
+    fn from(metadata: Metadata) -> Self {
+        Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        }
+    }
 }
 
 struct GroupScope {
@@ -79,22 +118,42 @@ struct GroupScope {
 }
 
 impl Workspace {
-    #[cfg_attr(not(test), allow(dead_code, reason = "single-folder loader"))]
+    #[cfg(test)]
     pub fn load(root: &Path, include_tests: bool) -> Result<Self> {
         Self::load_roots(&[root.to_owned()], include_tests)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_roots(folders: &[PathBuf], include_tests: bool) -> Result<Self> {
-        Self::load_graph(folders, include_tests, false)
+        Self::load_roots_in_environment(folders, include_tests, &GoEnvironment::capture())
     }
 
-    pub(crate) fn load_roots_for_rename(folders: &[PathBuf], include_tests: bool) -> Result<Self> {
-        Self::load_graph(folders, include_tests, true)
+    pub(crate) fn load_roots_in_environment(
+        folders: &[PathBuf],
+        include_tests: bool,
+        environment: &GoEnvironment,
+    ) -> Result<Self> {
+        Self::load_graph(folders, include_tests, false, environment)
     }
 
-    fn load_graph(folders: &[PathBuf], include_tests: bool, track_inputs: bool) -> Result<Self> {
-        let configuration = track_inputs.then(|| PackageInputs::configuration(folders));
-        let groups = folder_groups(folders);
+    pub(crate) fn load_roots_for_rename(
+        folders: &[PathBuf],
+        include_tests: bool,
+        environment: &GoEnvironment,
+    ) -> Result<Self> {
+        Self::load_graph(folders, include_tests, true, environment)
+    }
+
+    fn load_graph(
+        folders: &[PathBuf],
+        include_tests: bool,
+        track_inputs: bool,
+        environment: &GoEnvironment,
+    ) -> Result<Self> {
+        let configuration =
+            track_inputs.then(|| PackageInputs::configuration(folders, environment));
+        let groups = folder_groups(folders, environment);
+        load_trace::groups_discovered(groups.len());
         let inputs = configuration.map(|config| {
             let roots: Vec<_> = groups
                 .iter()
@@ -110,6 +169,7 @@ impl Workspace {
         let mut scopes = Vec::with_capacity(groups.len());
         let mut listing = PackageListing::default();
         for group in groups {
+            let _trace = LoadTrace::group(scopes.len());
             let folder = &group.folders[0];
             let mut scope = GroupScope {
                 folders: group.folders.iter().map(|dir| path_key(dir)).collect(),
@@ -125,7 +185,7 @@ impl Workspace {
                     .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone())))
                     .collect();
                 scope.roots.extend(keys.iter().cloned());
-                let packages = list_packages(folder, &directories, include_tests)?;
+                let packages = list_packages(folder, &directories, include_tests, environment)?;
                 roots.extend(keys);
                 Ok(packages)
             });
@@ -137,9 +197,15 @@ impl Workspace {
             scope.roots.dedup();
             scopes.push(scope);
         }
-        let mut workspace =
-            Self::from_listing(roots.into_iter().collect(), scopes, listing, include_tests);
+        let mut workspace = Self::from_listing(
+            roots.into_iter().collect(),
+            scopes,
+            listing,
+            include_tests,
+            environment,
+        );
         workspace.rename_inputs = inputs;
+        load_trace::graph_built(&workspace);
         Ok(workspace)
     }
 
@@ -148,6 +214,7 @@ impl Workspace {
         group_scopes: Vec<GroupScope>,
         listing: PackageListing,
         includes_tests: bool,
+        environment: &GoEnvironment,
     ) -> Self {
         let PackageListing {
             packages,
@@ -194,7 +261,17 @@ impl Workspace {
                 }
             }
         }
+        let diagnostic_observed_at = Instant::now();
+        let diagnostic_file_stamps = file_packages
+            .keys()
+            .filter_map(|path| {
+                fs::metadata(path)
+                    .ok()
+                    .map(|metadata| (path.clone(), metadata.into()))
+            })
+            .collect();
         Self {
+            environment: environment.clone(),
             rename_inputs: None,
             roots,
             module_paths: module_paths.into_iter().collect(),
@@ -204,9 +281,11 @@ impl Workspace {
             packages,
             file_packages,
             importers,
+            diagnostic_file_stamps,
+            diagnostic_observed_at,
             includes_tests,
-            sdk_root: sdk_root.map_or_else(OnceCell::new, OnceCell::from),
-            builtin_source: OnceCell::new(),
+            sdk_root: sdk_root.map_or_else(OnceLock::new, OnceLock::from),
+            builtin_source: OnceLock::new(),
         }
     }
 
@@ -226,16 +305,21 @@ impl Workspace {
             folders: keys.clone(),
             roots: Vec::new(),
         }];
-        let mut workspace = Self::from_listing(keys, scopes, packages, includes_tests);
+        let environment = GoEnvironment::capture();
+        let mut workspace =
+            Self::from_listing(keys, scopes, packages, includes_tests, &environment);
         workspace.rename_inputs = Some(
-            PackageInputs::configuration(roots)
+            PackageInputs::configuration(roots, &environment)
                 .and_then(|inputs| inputs.with_sources(roots))
                 .map_err(|err| err.to_string()),
         );
         workspace
     }
 
-    pub(crate) fn rename_inputs_current(&self) -> Result<bool> {
+    pub(crate) fn rename_inputs_current(&self, environment: &GoEnvironment) -> Result<bool> {
+        if self.environment != *environment {
+            return Ok(false);
+        }
         if let Some(error) = self
             .package_errors
             .iter()
@@ -245,7 +329,7 @@ impl Workspace {
         }
         match &self.rename_inputs {
             None => Ok(false),
-            Some(Ok(inputs)) => inputs.current(&self.roots),
+            Some(Ok(inputs)) => inputs.current(&self.roots, environment),
             Some(Err(reason)) => bail!("cannot verify the package inputs: {reason}"),
         }
     }
@@ -260,6 +344,23 @@ impl Workspace {
 
     pub(crate) fn package_errors(&self) -> &[PackageLoadError] {
         &self.package_errors
+    }
+
+    pub(crate) fn diagnostic_group_inputs(&self, group: usize) -> Option<(&[PathBuf], &[PathBuf])> {
+        let scope = self.group_scopes.get(group)?;
+        Some((&scope.folders, &scope.roots))
+    }
+
+    pub(crate) fn diagnostic_disk_input(
+        &self,
+        key: &Path,
+        change: Option<&DiagnosticFileObservation>,
+    ) -> (Option<DiagnosticFileStamp>, u64) {
+        let stamp = match change {
+            Some(change) if change.observed_at >= self.diagnostic_observed_at => change.stamp,
+            _ => self.diagnostic_file_stamps.get(key).copied(),
+        };
+        (stamp, change.map_or(0, |change| change.epoch))
     }
 
     pub(crate) fn total_load_failure(&self) -> Option<&str> {
@@ -300,7 +401,8 @@ impl Workspace {
                 if let Some(sdk) = self.sdk_root() {
                     Ok(sdk.join("src").join("builtin").join("builtin.go"))
                 } else {
-                    find_builtin_source(root).map_err(|error| format!("{error:#}"))
+                    find_builtin_source(root, &self.environment)
+                        .map_err(|error| format!("{error:#}"))
                 }
             })
             .as_ref()
@@ -318,6 +420,12 @@ impl Workspace {
 
     pub fn includes_tests(&self) -> bool {
         self.includes_tests
+    }
+
+    pub(crate) fn selected_file_stamp(&self, key: &Path) -> Option<Option<DiagnosticFileStamp>> {
+        self.file_packages
+            .contains_key(key)
+            .then(|| self.diagnostic_file_stamps.get(key).copied())
     }
 
     pub fn package_of_file(&self, path: &Path) -> Option<&Package> {
@@ -446,10 +554,20 @@ impl Workspace {
 
     pub(crate) fn affected_packages(&self, path: &Path) -> Option<HashSet<String>> {
         let directory = path_key(path.parent()?);
+        // A known test file can change the in-package or external test
+        // compilation in this directory. The production selection excludes it.
+        let only_tests = path
+            .file_stem()
+            .is_some_and(|name| name.to_string_lossy().ends_with("_test"))
+            && self
+                .package_of_file(path)
+                .is_some_and(|package| !package.is_production());
         let mut queue: Vec<_> = self
             .packages
             .values()
-            .filter(|package| package.directory == directory)
+            .filter(|package| {
+                package.directory == directory && (!only_tests || !package.is_production())
+            })
             .map(|package| package.id.as_str())
             .collect();
         if queue.is_empty() {
@@ -487,6 +605,10 @@ fn scoped_group(scopes: &[GroupScope], key: &Path, groups: Option<&[usize]>) -> 
 }
 
 impl Package {
+    pub(crate) fn diagnostic_import_paths(&self) -> impl Iterator<Item = &str> {
+        self.import_map.keys().map(String::as_str)
+    }
+
     fn remap_imports(&mut self, aliases: &HashMap<String, String>) {
         if let Some(id) = aliases.get(&self.for_test) {
             self.for_test.clone_from(id);
@@ -574,13 +696,15 @@ impl Package {
     }
 }
 
-fn find_builtin_source(root: &Path) -> Result<PathBuf> {
-    let output = Command::new("go")
+fn find_builtin_source(root: &Path, environment: &GoEnvironment) -> Result<PathBuf> {
+    let starting_go = || format!("starting go env GOROOT in {}", root.display());
+    let mut trace = CommandTrace::new("go env", root);
+    let mut command = environment.command("go").with_context(starting_go)?;
+    command
         .args(["env", "GOROOT"])
         .current_dir(root)
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("starting go env GOROOT in {}", root.display()))?;
+        .stdin(Stdio::null());
+    let output = CommandTrace::output(&mut command, trace.as_mut()).with_context(starting_go)?;
     ensure!(
         output.status.success(),
         "go env GOROOT failed in {} ({}): {}",
@@ -594,6 +718,9 @@ fn find_builtin_source(root: &Path) -> Result<PathBuf> {
         goroot.is_absolute(),
         "go env GOROOT did not return an absolute path"
     );
+    if let Some(trace) = &mut trace {
+        trace.parsed(0, 0, 0);
+    }
     Ok(goroot.join("src").join("builtin").join("builtin.go"))
 }
 
@@ -601,6 +728,7 @@ fn list_packages(
     root: &Path,
     directories: &[PathBuf],
     include_tests: bool,
+    environment: &GoEnvironment,
 ) -> Result<Vec<ListedPackage>> {
     let patterns = directories.iter().map(|directory| {
         if directory == root {
@@ -609,7 +737,13 @@ fn list_packages(
             directory.join("...").to_string_lossy().replace('\\', "/")
         }
     });
-    let mut child = Command::new("go")
+    let starting_go = || format!("starting go list in {}", root.display());
+    let mut command = environment.command("go").with_context(starting_go)?;
+    if use_module_auto(root, environment)? {
+        command.env("GO111MODULE", "auto");
+    }
+    let mut trace = CommandTrace::new("go list", root);
+    let mut child = command
         .args([
             "list",
             "-e",
@@ -623,7 +757,10 @@ fn list_packages(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("starting go list in {}", root.display()))?;
+        .with_context(starting_go)?;
+    if let Some(trace) = &mut trace {
+        trace.spawned(child.id());
+    }
     let stdout = child.stdout.take().expect("go list stdout is piped");
     let mut stderr = child.stderr.take().expect("go list stderr is piped");
     let stderr_reader = thread::spawn(move || {
@@ -633,6 +770,12 @@ fn list_packages(
     });
     let packages = read_packages(BufReader::new(stdout));
     let status = child.wait().context("waiting for go list")?;
+    if let Some(trace) = &mut trace {
+        trace.exited(status);
+        if let Ok(packages) = &packages {
+            trace_listed_packages(trace, packages, directories);
+        }
+    }
     let stderr = stderr_reader
         .join()
         .map_err(|_| anyhow!("go list stderr reader panicked"))?
@@ -645,6 +788,29 @@ fn list_packages(
         );
     }
     packages.with_context(|| format!("reading Go packages in {}", root.display()))
+}
+
+fn trace_listed_packages(trace: &mut CommandTrace, packages: &[ListedPackage], roots: &[PathBuf]) {
+    let roots: Vec<_> = roots.iter().map(|root| path_key(root)).collect();
+    let mut project_files = HashSet::new();
+    let mut errors = 0;
+    for package in packages {
+        errors +=
+            usize::from(package.error.is_some()) + package.deps_errors.as_ref().map_or(0, Vec::len);
+        if !package.has_sources() || package.is_external() {
+            continue;
+        }
+        let directory = path_key(&package.dir);
+        if roots.iter().any(|root| directory.starts_with(root)) {
+            for path in package.go_files.iter().chain(&package.cgo_files) {
+                let key = path_key(&directory.join(path));
+                if key.parent() == Some(directory.as_path()) && is_symbol_source(&key) {
+                    project_files.insert(key);
+                }
+            }
+        }
+    }
+    trace.parsed(packages.len(), project_files.len(), errors);
 }
 
 fn read_packages(reader: impl Read) -> Result<Vec<ListedPackage>> {
@@ -677,6 +843,14 @@ impl ListedPackage {
             && !self.import_path.is_empty()
             && !self.name.is_empty()
             && !(self.go_files.is_empty() && self.cgo_files.is_empty())
+    }
+
+    fn is_external(&self) -> bool {
+        self.goroot
+            || self
+                .module
+                .as_ref()
+                .is_some_and(ListedModule::in_module_cache)
     }
 }
 
@@ -870,6 +1044,7 @@ impl PackageListing {
                 continue;
             }
 
+            let external = package.is_external();
             let mut files: Vec<_> = package
                 .go_files
                 .into_iter()
@@ -907,11 +1082,7 @@ impl PackageListing {
                 directory: path_key(&package.dir),
                 import_map,
                 for_test,
-                external: package.goroot
-                    || package
-                        .module
-                        .as_ref()
-                        .is_some_and(ListedModule::in_module_cache),
+                external,
                 groups: vec![group],
                 standard: package.goroot,
                 direct_dependency: package
@@ -1017,14 +1188,90 @@ mod tests {
             );
         }
         let folders = ["left/pkg", "right/pkg"].map(|name| project.root.join(name));
-        let workspace = Workspace::load_roots_for_rename(&folders, false).unwrap();
-        assert!(workspace.rename_inputs_current().unwrap());
+        let environment = GoEnvironment::capture();
+        let workspace = Workspace::load_roots_for_rename(&folders, false, &environment).unwrap();
+        assert!(workspace.rename_inputs_current(&environment).unwrap());
         assert!(workspace.package("example.test/right/pkg").is_some());
         project.write("right/go.mod", "module example.test/renamed\n\ngo 1.22\n");
         assert!(
-            !workspace.rename_inputs_current().unwrap(),
+            !workspace.rename_inputs_current(&environment).unwrap(),
             "the second folder's parent go.mod changed"
         );
+    }
+
+    #[test]
+    fn workspace_rename_tracks_external_work_file_in_the_session_environment() {
+        let project = TestProject::new();
+        let folder = project.root.join("folder");
+        project.write("folder/go.mod", "module example.test/folder\n\ngo 1.22\n");
+        project.write("folder/example.go", "package folder\n");
+        let work = "outside/custom.work";
+        let work_file = project.write(work, "go 1.22\n\nuse ../folder\n");
+        let startup = GoEnvironment::capture();
+        let overrides = BTreeMap::from([
+            ("GO111MODULE".into(), "on".into()),
+            ("GOWORK".into(), work_file.to_str().unwrap().into()),
+        ]);
+        let environment = startup.with_overrides(overrides.clone());
+        let folders = [folder];
+        let workspace = Workspace::load_roots_for_rename(&folders, false, &environment).unwrap();
+        assert!(workspace.package("example.test/folder").is_some());
+        assert!(workspace.rename_inputs_current(&environment).unwrap());
+
+        let mut changed = overrides;
+        changed.insert("GOFLAGS".into(), "-tags=changed".into());
+        let changed = startup.with_overrides(changed);
+        assert!(!workspace.rename_inputs_current(&changed).unwrap());
+
+        project.write(work, "go 1.22\n\nuse ../folder\n\n// changed\n");
+        assert!(!workspace.rename_inputs_current(&environment).unwrap());
+    }
+
+    #[test]
+    fn workspace_loads_canonical_imports_from_two_session_gopath_entries() {
+        let project = TestProject::new();
+        let server = project.root.join("server");
+        let base = project.root.join("serverbase");
+        let caller = project.write(
+            "server/src/example.test/server/caller.go",
+            "package server\nimport \"example.test/serverbase\"\nconst Use = serverbase.Value\n",
+        );
+        project.write(
+            "serverbase/src/example.test/serverbase/base.go",
+            "package serverbase\nconst Value = 1\n",
+        );
+        let environment = GoEnvironment::capture().with_overrides(BTreeMap::from([
+            ("GO111MODULE".into(), String::new()),
+            ("GOENV".into(), "off".into()),
+            ("GOWORK".into(), String::new()),
+            (
+                "GOPATH".into(),
+                std::env::join_paths([&server, &base])
+                    .unwrap()
+                    .into_string()
+                    .unwrap(),
+            ),
+        ]));
+        let single_package = caller.parent().unwrap().to_path_buf();
+        for folders in [
+            vec![single_package],
+            vec![server.clone()],
+            vec![server, base],
+            vec![project.root.clone()],
+        ] {
+            let workspace =
+                Workspace::load_roots_in_environment(&folders, false, &environment).unwrap();
+            assert!(workspace.package_errors().is_empty(), "{folders:?}");
+            let owner = workspace.package_of_file(&caller).unwrap();
+            assert_eq!(owner.id, "example.test/server");
+            assert_eq!(
+                workspace
+                    .resolve_import(owner, "example.test/serverbase")
+                    .unwrap()
+                    .id,
+                "example.test/serverbase"
+            );
+        }
     }
 
     #[test]
@@ -1237,7 +1484,8 @@ mod tests {
             "two/pkg.go",
             "package two\nimport _ \"example.test/two/missing\"\n",
         );
-        let groups = folder_groups(&folders);
+        let environment = GoEnvironment::capture();
+        let groups = folder_groups(&folders, &environment);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].folders, folders);
         let workspace = Workspace::load_roots(&folders, false).unwrap();
@@ -1260,7 +1508,7 @@ mod tests {
         );
 
         let overlapping = [project.root.clone(), folders[0].clone()];
-        let groups = folder_groups(&overlapping);
+        let groups = folder_groups(&overlapping, &environment);
         assert_eq!(groups[0].roots.as_ref().unwrap().len(), 3);
         let workspace = Workspace::load_roots(&overlapping, false).unwrap();
         assert_eq!(workspace.roots().len(), 3);
@@ -1282,7 +1530,8 @@ mod tests {
         );
         let broken = project.write("broken/app.go", "package app\nconst Use = 2\n");
         let folders = ["healthy", "absent", "broken"].map(|folder| project.root.join(folder));
-        let workspace = Workspace::load_roots_for_rename(&folders, true).unwrap();
+        let workspace =
+            Workspace::load_roots_for_rename(&folders, true, &GoEnvironment::capture()).unwrap();
         assert_eq!(workspace.navigation_packages().count(), 2);
         assert_eq!(workspace.package_errors().len(), 2);
         assert!(workspace.package_of_file(&broken).is_none());
@@ -1339,7 +1588,13 @@ mod tests {
                 roots: Vec::new(),
             })
             .collect();
-        let workspace = Workspace::from_listing(roots.clone(), scopes, listing, false);
+        let workspace = Workspace::from_listing(
+            roots.clone(),
+            scopes,
+            listing,
+            false,
+            &GoEnvironment::capture(),
+        );
         assert_eq!(workspace.package_errors().len(), 4);
         for (group, root) in roots.iter().enumerate() {
             let package = workspace.package_of_file(&root.join("app.go")).unwrap();

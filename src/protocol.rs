@@ -6,6 +6,8 @@ use lsp_types::{Location, Range, Uri};
 use serde_json::Value;
 use url::Url;
 
+use crate::rpc_telemetry;
+
 pub(crate) type RequestResult = std::result::Result<Value, (ErrorCode, String)>;
 
 pub(crate) fn file_path(uri: &Uri) -> Result<PathBuf> {
@@ -29,24 +31,31 @@ pub(super) fn invalid_params(error: anyhow::Error) -> (ErrorCode, String) {
 }
 
 pub(super) fn serialize_locations(locations: Vec<(PathBuf, Range)>) -> RequestResult {
-    let locations = locations
-        .into_iter()
-        .map(|(path, range)| Ok(Location::new(path_uri(&path)?, range)))
-        .collect::<Result<Vec<_>>>();
-    serde_json::to_value(locations.map_err(internal_error)?)
-        .map_err(|error| internal_error(error.into()))
+    rpc_telemetry::serialize(|| {
+        let locations = locations
+            .into_iter()
+            .map(|(path, range)| Ok(Location::new(path_uri(&path)?, range)))
+            .collect::<Result<Vec<_>>>();
+        serde_json::to_value(locations.map_err(internal_error)?)
+            .map_err(|error| internal_error(error.into()))
+    })
 }
 
 pub(super) fn serialize_location(location: Option<(PathBuf, Range)>) -> RequestResult {
     let Some((path, range)) = location else {
         return Ok(Value::Null);
     };
-    let uri = path_uri(&path).map_err(internal_error)?;
-    serde_json::to_value(Location::new(uri, range)).map_err(|error| internal_error(error.into()))
+    rpc_telemetry::serialize(|| {
+        let uri = path_uri(&path).map_err(internal_error)?;
+        serde_json::to_value(Location::new(uri, range))
+            .map_err(|error| internal_error(error.into()))
+    })
 }
 
 pub(super) fn serialize_query(result: impl serde::Serialize) -> RequestResult {
-    serde_json::to_value(result).map_err(|error| (ErrorCode::InternalError, error.to_string()))
+    rpc_telemetry::serialize(|| {
+        serde_json::to_value(result).map_err(|error| (ErrorCode::InternalError, error.to_string()))
+    })
 }
 
 pub(super) fn send_response(
@@ -62,6 +71,7 @@ pub(super) fn send_response(
         },
         Err((code, message)) => Response::new_err(id, code as i32, message),
     };
+    rpc_telemetry::responding(&response);
     connection
         .sender
         .send(response.into())

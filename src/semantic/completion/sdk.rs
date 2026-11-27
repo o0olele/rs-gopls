@@ -13,6 +13,7 @@ use anyhow::{Context, Result, ensure};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
+use crate::go_environment::GoEnvironment;
 use crate::semantic::source::is_test_source;
 use crate::workspace::{is_symbol_source, path_key};
 
@@ -87,6 +88,7 @@ struct BuildKey {
     version: (Option<SystemTime>, Vec<u8>),
     context: BuildContext,
     env: BTreeMap<String, String>,
+    environment: Arc<BTreeMap<OsString, OsString>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -100,20 +102,12 @@ struct BuildContext {
 
 #[derive(PartialEq, Eq)]
 struct ProbeInputs {
-    environment: BTreeMap<OsString, OsString>,
+    environment: Arc<BTreeMap<OsString, OsString>>,
     files: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl ProbeInputs {
-    fn capture(project: &Path, root: &Path, key: &BuildKey) -> Self {
-        let environment = std::env::vars_os()
-            .filter(|(name, _)| {
-                let name = name.to_string_lossy().to_ascii_uppercase();
-                name.starts_with("GO")
-                    || name.starts_with("CGO")
-                    || matches!(name.as_str(), "PATH" | "CC" | "CXX")
-            })
-            .collect();
+    fn capture(project: &Path, root: &Path, key: &BuildKey, environment: &GoEnvironment) -> Self {
         let files = std::iter::once(root.join("VERSION"))
             .chain(["GOENV", "GOWORK"].into_iter().filter_map(|name| {
                 let path = Path::new(key.env.get(name)?);
@@ -129,7 +123,10 @@ impl ProbeInputs {
                 (path, bytes)
             })
             .collect();
-        Self { environment, files }
+        Self {
+            environment: Arc::clone(environment.variables()),
+            files,
+        }
     }
 }
 
@@ -141,7 +138,7 @@ impl Inventory {
         }
     }
 
-    pub(super) fn start(&self, project: &Path, refresh: bool) {
+    pub(super) fn start(&self, project: &Path, environment: &GoEnvironment, refresh: bool) {
         let mut state = self.state.lock().unwrap();
         if state.loading {
             state.refresh_requested |= refresh;
@@ -155,7 +152,8 @@ impl Inventory {
                         .as_ref()
                         .zip(ready.key.as_ref())
                         .is_some_and(|(root, key)| {
-                            state.inputs.as_ref() == Some(&ProbeInputs::capture(project, root, key))
+                            state.inputs.as_ref()
+                                == Some(&ProbeInputs::capture(project, root, key, environment))
                         }))
         {
             return;
@@ -164,12 +162,13 @@ impl Inventory {
         drop(state);
 
         let project = project.to_owned();
+        let environment = environment.clone();
         let inventory = self.clone();
         if thread::Builder::new()
             .name("go-completion-sdk".into())
             .spawn(move || {
                 loop {
-                    inventory.load(&project);
+                    inventory.load(&project, &environment);
                     let mut state = inventory.state.lock().unwrap();
                     if !std::mem::take(&mut state.refresh_requested) {
                         state.loading = false;
@@ -197,7 +196,7 @@ impl Inventory {
         (!state.loading).then(|| state.ready.clone()).flatten()
     }
 
-    fn load(&self, project: &Path) {
+    fn load(&self, project: &Path, environment: &GoEnvironment) {
         let started = Instant::now();
         let mut stats = InventoryStats {
             started_unix_ms: unix_ms(),
@@ -209,14 +208,15 @@ impl Inventory {
             fallback: None,
             prewarmed_names: 0,
         };
-        let probed = build_context(project).ok();
+        let probed = build_context(project, environment).ok();
         stats.context_ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.publish(project, probed, stats);
+        self.publish(project, environment, probed, stats);
     }
 
     fn publish(
         &self,
         project: &Path,
+        environment: &GoEnvironment,
         probed: Option<(PathBuf, BuildContext, BTreeMap<String, String>)>,
         mut stats: InventoryStats,
     ) {
@@ -225,8 +225,8 @@ impl Inventory {
         let mut packages = Vec::new();
         let mut names = HashMap::new();
         if let Some((root, context, env)) = probed {
-            key = Some(BuildKey::new(&root, context, env));
-            let inputs = ProbeInputs::capture(project, &root, key.as_ref().unwrap());
+            key = Some(BuildKey::new(&root, context, env, environment));
+            let inputs = ProbeInputs::capture(project, &root, key.as_ref().unwrap(), environment);
             let mut state = self.state.lock().unwrap();
             state.root = Some(root.clone());
             state.inputs = Some(inputs);
@@ -250,7 +250,8 @@ impl Inventory {
                 }
             }
             if stats.method != "native"
-                && let Ok(entries) = command_inventory(project, &root, Some(&build.env))
+                && let Ok(entries) =
+                    command_inventory(project, &root, environment, Some(&build.env))
             {
                 packages = entries;
                 stats.method = "go list std";
@@ -281,7 +282,12 @@ pub(super) fn unix_ms() -> u64 {
 }
 
 impl BuildKey {
-    fn new(root: &Path, context: BuildContext, env: BTreeMap<String, String>) -> Self {
+    fn new(
+        root: &Path,
+        context: BuildContext,
+        env: BTreeMap<String, String>,
+        environment: &GoEnvironment,
+    ) -> Self {
         let version = root.join("VERSION");
         Self {
             root: path_key(&root.canonicalize().unwrap_or_else(|_| root.to_owned())),
@@ -291,6 +297,7 @@ impl BuildKey {
             ),
             context,
             env,
+            environment: Arc::clone(environment.variables()),
         }
     }
 }
@@ -312,30 +319,35 @@ fn go_output(mut go: Command, project: &Path, args: &[&str]) -> Result<Output> {
 fn sdk_go(
     project: &Path,
     root: &Path,
+    environment: &GoEnvironment,
     env: &BTreeMap<String, String>,
     args: &[&str],
 ) -> Result<Output> {
     let installed = root
         .join("bin")
         .join(format!("go{}", std::env::consts::EXE_SUFFIX));
-    let mut go = if installed.is_file() {
-        Command::new(installed)
+    let executable = if installed.is_file() {
+        &installed
     } else {
-        Command::new("go")
+        Path::new("go")
     };
+    let mut go = environment.command(executable)?;
     // Keep cmd/go's effective build settings even when PATH first resolves
     // to a launcher. Graph loads continue to use the configured launcher.
-    go.envs(
-        env.iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "GOVERSION" | "GOTOOLDIR")),
-    )
+    go.envs(env.iter().filter(|(name, _)| {
+        !matches!(name.as_str(), "GOVERSION" | "GOTOOLDIR")
+            && environment.get(name).is_none_or(|value| !value.is_empty())
+    }))
     .env("GOTOOLCHAIN", "local");
     go_output(go, project, args)
 }
 
-fn build_context(project: &Path) -> Result<(PathBuf, BuildContext, BTreeMap<String, String>)> {
+fn build_context(
+    project: &Path,
+    environment: &GoEnvironment,
+) -> Result<(PathBuf, BuildContext, BTreeMap<String, String>)> {
     let env = go_output(
-        Command::new("go"),
+        environment.command("go")?,
         project,
         &[
             "env",
@@ -374,6 +386,7 @@ fn build_context(project: &Path) -> Result<(PathBuf, BuildContext, BTreeMap<Stri
     let output = sdk_go(
         project,
         &root,
+        environment,
         &env,
         &[
             "list",
@@ -438,6 +451,7 @@ struct ListedPackage {
 fn command_inventory(
     project: &Path,
     root: &Path,
+    environment: &GoEnvironment,
     env: Option<&BTreeMap<String, String>>,
 ) -> Result<Vec<Package>> {
     let args = &[
@@ -447,9 +461,9 @@ fn command_inventory(
         "std",
     ];
     let output = if let Some(env) = env {
-        sdk_go(project, root, env, args)?
+        sdk_go(project, root, environment, env, args)?
     } else {
-        go_output(Command::new("go"), project, args)?
+        go_output(environment.command("go")?, project, args)?
     };
     let src = path_key(&root.join("src"));
     let entries = serde_json::Deserializer::from_slice(&output.stdout).into_iter::<ListedPackage>();
@@ -892,12 +906,13 @@ fn directive<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 pub(super) fn compare_current_sdk(project: &Path) -> Result<()> {
-    let (root, context, env) = build_context(project)?;
-    let build = BuildKey::new(&root, context, env);
+    let environment = GoEnvironment::capture();
+    let (root, context, env) = build_context(project, &environment)?;
+    let build = BuildKey::new(&root, context, env, &environment);
     if native_supported(&build) {
         let src = root.join("src");
         let actual = native_inventory(&src, &build.context)?.packages;
-        let mut expected = command_inventory(project, &root, None)?;
+        let mut expected = command_inventory(project, &root, &environment, None)?;
         expected.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         let actual_paths: HashSet<_> = actual.iter().map(|pkg| pkg.path.as_str()).collect();
         let expected_paths: HashSet<_> = expected.iter().map(|pkg| pkg.path.as_str()).collect();
@@ -977,7 +992,7 @@ mod tests {
     use crate::test_support::TestProject;
 
     #[test]
-    fn inventory_reuses_a_matching_build_key_and_replaces_changed_versions_or_tags() {
+    fn inventory_reuses_a_matching_build_key_and_replaces_changed_inputs() {
         let project = TestProject::new();
         let version = project.write("sdk/VERSION", "go1.test");
         let sdk = version.parent().unwrap();
@@ -995,7 +1010,13 @@ mod tests {
         project.write("sdk/src/p/internal/q/visible.go", "package q\n");
         let (wake, _) = crossbeam_channel::bounded(1);
         let inventory = Inventory::new(wake);
-        let set = |tags: &[&str], cgo| {
+        let startup = GoEnvironment::capture();
+        let configured = |value: &str| {
+            startup.with_overrides(BTreeMap::from([("GOFLAGS".to_owned(), value.to_owned())]))
+        };
+        let environment = configured("");
+        let changed = configured("-tags=extra");
+        let set = |environment: &GoEnvironment, tags: &[&str], cgo| {
             let build = BuildContext {
                 os: "windows".into(),
                 arch: "amd64".into(),
@@ -1005,6 +1026,7 @@ mod tests {
             };
             inventory.publish(
                 &project.root,
+                environment,
                 Some((sdk.to_owned(), build, BTreeMap::new())),
                 InventoryStats {
                     started_unix_ms: 0,
@@ -1019,18 +1041,30 @@ mod tests {
             );
             inventory.ready().unwrap()
         };
-        let base = set(&[], false);
+        let base = set(&environment, &[], false);
         assert_eq!(base.packages.len(), 2);
         assert_eq!(base.packages[0].path, "p");
         assert_eq!(
             base.packages[0].files,
             [sdk.join("src/p/a_windows_amd64.go")]
         );
-        assert!(Arc::ptr_eq(&base, &set(&[], false)));
-        let tagged = set(&["amd64.v3", "legacy"], true);
-        assert!(!Arc::ptr_eq(&base, &tagged));
+        let key = base.key.as_ref().unwrap();
+        let inputs = ProbeInputs::capture(&project.root, sdk, key, &environment);
+        assert!(inputs == ProbeInputs::capture(&project.root, sdk, key, &configured("")));
+        assert!(inputs != ProbeInputs::capture(&project.root, sdk, key, &changed));
+        assert!(Arc::ptr_eq(&base, &set(&configured(""), &[], false)));
+
+        let replacement = set(&changed, &[], false);
+        assert!(!Arc::ptr_eq(&base, &replacement));
+        assert!(Arc::ptr_eq(&replacement, &set(&changed, &[], false)));
+
+        let tagged = set(&changed, &["amd64.v3", "legacy"], true);
+        assert!(!Arc::ptr_eq(&replacement, &tagged));
         assert_eq!(tagged.packages[0].files.len(), 4);
         std::fs::write(&version, "go1.next").unwrap();
-        assert!(!Arc::ptr_eq(&tagged, &set(&["amd64.v3", "legacy"], true)));
+        assert!(!Arc::ptr_eq(
+            &tagged,
+            &set(&changed, &["amd64.v3", "legacy"], true)
+        ));
     }
 }

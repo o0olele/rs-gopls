@@ -7,8 +7,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use lsp_types::{CompletionItemKind as Kind, Range};
 
+use crate::go_environment::GoEnvironment;
 use crate::semantic::{
-    index::{CompletionRead, FileIndex, IndexReader},
+    index::{CompletionRead, FileIndex, IndexReader, IndexedSource},
     resolver::{ResolvedSymbol, Resolver, is_exported},
     snapshot::{DocumentSnapshot, EngineSnapshot},
     source::is_test_source,
@@ -25,7 +26,7 @@ use super::ranking::{
     AUTO_IMPORT, Candidate, Insert, Match, SYMBOL, Weight, match_member_hump, match_name,
     match_start, package_priority,
 };
-use super::render::{Description, PendingImport, Target, package_name};
+use super::render::{Description, PendingImport, Target, describe, package_name};
 use super::sdk::{Catalog, Inventory};
 use super::{CompletionClientCapabilities, Trace};
 
@@ -116,8 +117,13 @@ impl Default for ImportCache {
 }
 
 impl ImportCache {
-    pub(in crate::semantic) fn prewarm(&self, root: &Path, refresh: bool) {
-        self.inventory.start(root, refresh);
+    pub(in crate::semantic) fn prewarm(
+        &self,
+        root: &Path,
+        environment: &GoEnvironment,
+        refresh: bool,
+    ) {
+        self.inventory.start(root, environment, refresh);
     }
 
     pub(in crate::semantic) fn sdk_root(&self) -> Option<PathBuf> {
@@ -144,6 +150,7 @@ impl ImportCache {
         &mut self,
         workspace: &Workspace,
         root: &Path,
+        environment: &GoEnvironment,
         trace: Option<&Trace>,
         indexes: &mut IndexReader<'_>,
     ) -> Option<Rc<[Importable]>> {
@@ -151,7 +158,7 @@ impl ImportCache {
         if self.empty_sdk.is_some() && self.empty_sdk == self.generation {
             return Some(Rc::from([]));
         }
-        self.inventory.start(root, false);
+        self.inventory.start(root, environment, false);
         let Some(catalog) = self.inventory.ready() else {
             if self.inventory.is_loading() {
                 if let Some(trace) = trace {
@@ -239,15 +246,15 @@ impl ImportCache {
         entry: &Importable,
     ) -> Rc<[Export]> {
         if let Some(overlay) = indexes.documents.get(key) {
-            return sdk_exports(overlay.declarations(), entry);
+            return sdk_exports(overlay, entry);
         }
         if let Some(exports) = self.sdk_exports.get(key) {
             return Rc::clone(exports);
         }
-        let Ok(index) = indexes.file_index(file) else {
+        let Ok(Some(source)) = indexes.declaration_source(file) else {
             return Rc::from([]);
         };
-        let exports = sdk_exports(index, entry);
+        let exports = sdk_exports(source.as_ref(), entry);
         self.sdk_exports.insert(key.to_owned(), Rc::clone(&exports));
         exports
     }
@@ -562,6 +569,7 @@ impl Search {
             .expect("import search requires an active graph");
         let caller = self.caller.as_deref().and_then(|id| workspace.package(id));
         let root = snapshot.root();
+        let environment = snapshot.environment();
         let mut resolver = snapshot.resolver_with_completion(workspace, Some(request));
         {
             let trace = resolver.indexes.trace().cloned();
@@ -572,7 +580,13 @@ impl Search {
                 self.graph_prepared = true;
             }
             if !self.sdk_prepared
-                && let Some(sdk) = cache.sdk(workspace, root, trace.as_ref(), &mut resolver.indexes)
+                && let Some(sdk) = cache.sdk(
+                    workspace,
+                    root,
+                    environment,
+                    trace.as_ref(),
+                    &mut resolver.indexes,
+                )
             {
                 self.enqueue(&sdk, workspace, caller, document);
                 self.sdk_prepared = true;
@@ -1153,7 +1167,8 @@ impl Export {
     }
 }
 
-fn sdk_exports(index: &FileIndex, entry: &Importable) -> Rc<[Export]> {
+fn sdk_exports(source: &IndexedSource, entry: &Importable) -> Rc<[Export]> {
+    let index = source.declarations();
     if index.package_name.as_deref() != Some(entry.name.as_str()) {
         return Rc::from([]);
     }
@@ -1185,7 +1200,7 @@ fn sdk_exports(index: &FileIndex, entry: &Importable) -> Rc<[Export]> {
             }
             _ => Kind::VARIABLE,
         };
-        let description = index.presentation[&symbol.range].clone().with_kind(kind, true);
+        let description = describe(source, symbol.range, name, kind, true);
         let parameters = matches!(symbol.kind, SymbolKind::Function(_)).then_some(description.has_parameters);
         Export {
             name: name.to_owned(), range: symbol.range, is_type: matches!(symbol.kind, SymbolKind::Type),
