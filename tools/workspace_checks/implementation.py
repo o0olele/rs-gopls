@@ -151,6 +151,55 @@ def check_implementation_candidate_packages(executable_path, root, timeout):
         check_implementations(client, interface, *on_disk)
 
 
+def check_implementation_array_lengths(executable_path, root, timeout):
+    module = "example.test/arraylengths"
+    write(root / "go.mod", f"module {module}\n\ngo 1.22\n")
+    width_text = "package sizes\n\nconst Width = 4\n"
+    width = write(root / "sizes" / "width.go", width_text)
+    contract = write(
+        root / "api" / "frames.go",
+        f'package api\n\nimport frame "{module}/sizes"\n\n'
+        "type Framer interface { SendFrame([frame.Width]byte) }\n",
+    )
+    interface = site(contract, "type [[Framer]] interface")
+    method = site(contract, "{ [[SendFrame]](")
+
+    def sender(package, length):
+        path = write(
+            root / package / "sender.go",
+            f"package {package}\n\ntype Sender struct{{}}\n"
+            f"func (Sender) SendFrame([{length}]byte) {{}}\n",
+        )
+        return site(path, "type [[Sender]] struct"), site(path, "(Sender) [[SendFrame]](")
+
+    literal = sender("literal", "4")
+    named = sender("named", "Width")
+    write(root / "named" / "width.go", "package named\n\nconst Width = 4\n")
+    wide = sender("wide", "5")
+
+    with session(executable_path, root, timeout) as client:
+        client.open_document(contract, interface.text)
+
+        def check_matches(*matching):
+            check_implementations(client, interface, *(typ for typ, _ in matching))
+            check_implementations(client, method, *(decl for _, decl in matching))
+            for candidate in (literal, named, wide):
+                typ, decl = candidate
+                if candidate in matching:
+                    check_implementations(client, typ, interface)
+                    check_implementations(client, decl, method)
+                else:
+                    check_implementations(client, typ)
+                    check_implementations(client, decl)
+
+        check_matches(literal, named)
+        client.open_document(width, width_text)
+        client.change_document(width, 2, width_text.replace("= 4", "= 5"))
+        check_matches(wide)
+        client.close_document(width)
+        check_matches(literal, named)
+
+
 def check_implementation_reverse_candidates(executable_path, root, timeout):
     module = "example.test/reversecandidates"
     write(root / "go.mod", f"module {module}\n\ngo 1.22\n")
@@ -330,4 +379,5 @@ CASES = [
     ("implementation-reverse-watched-sources", check_implementation_reverse_watched_sources, 21),
     ("implementation-cancel", check_implementation_cancel, 22),
     ("implementation-active-cancel", check_active_implementation_cancel, 23),
+    ("implementation-array-lengths", check_implementation_array_lengths),
 ]

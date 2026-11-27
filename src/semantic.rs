@@ -20,6 +20,7 @@ use completion::prefilter::{FileNames, Stamp};
 
 pub(crate) mod actions;
 pub(crate) mod completion;
+mod constants;
 mod definition;
 pub(crate) mod diagnostics;
 mod document_symbols;

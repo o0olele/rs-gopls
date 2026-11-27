@@ -5,6 +5,7 @@ use std::rc::Rc;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, Position, Range};
 use tree_sitter::Node;
 
+use super::super::constants::{ConstDefinition, const_definitions, integer_binary, parse_integer};
 use super::{
     Editor, Parameter, SymbolId, descendants, function_owner, named_children, terminal_type_name,
     unwrap_parens,
@@ -218,18 +219,9 @@ const MAX_EVALUATION_DEPTH: usize = 64;
 const MAX_EVALUATION_NODES: usize = 4096;
 const MAX_CONCATENATED_BYTES: usize = 1 << 20;
 
-#[derive(Clone, Copy)]
-struct Definition<'tree> {
-    name: Node<'tree>,
-    expression: Node<'tree>,
-    explicit_type: Option<Node<'tree>>,
-    explicit_value: bool,
-    iota: usize,
-}
-
 struct Constants<'editor, 'tree> {
     editor: &'editor Editor<'tree>,
-    definitions: HashMap<usize, Definition<'tree>>,
+    definitions: HashMap<usize, ConstDefinition<'tree>>,
     visiting: HashSet<usize>,
     values: HashMap<usize, Constant>,
     remaining: usize,
@@ -247,46 +239,13 @@ impl<'editor, 'tree> Constants<'editor, 'tree> {
     }
 
     fn collect(&mut self, declaration: Node<'tree>) {
-        let mut previous = None;
-        for (iota, spec) in named_children(declaration)
-            .filter(|node| node.kind() == "const_spec")
-            .enumerate()
-        {
-            let explicit = spec.child_by_field_name("value");
-            if let Some(list) = explicit {
-                previous = Some((
-                    named_children(list).collect::<Vec<_>>(),
-                    spec.child_by_field_name("type"),
-                ));
-            } else if spec.has_error() {
-                previous = None;
-            }
-            let Some((expressions, explicit_type)) = &previous else {
-                continue;
-            };
-            let names: Vec<_> = spec
-                .children_by_field_name("name", &mut spec.walk())
-                .filter(|node| node.kind() == "identifier" && !node.is_missing())
-                .collect();
-            if names.len() != expressions.len() {
-                continue;
-            }
-            for (name, &expression) in names.into_iter().zip(expressions) {
-                self.definitions.insert(
-                    name.start_byte(),
-                    Definition {
-                        name,
-                        expression,
-                        explicit_type: *explicit_type,
-                        explicit_value: explicit.is_some(),
-                        iota,
-                    },
-                );
-            }
+        for definition in const_definitions(declaration) {
+            self.definitions
+                .insert(definition.name.start_byte(), definition);
         }
     }
 
-    fn evaluate(&mut self, definition: Definition<'tree>) -> Option<String> {
+    fn evaluate(&mut self, definition: ConstDefinition<'tree>) -> Option<String> {
         self.remaining = MAX_EVALUATION_NODES;
         let value = self.constant(definition.name.start_byte(), 0)?.render()?;
         let expression = self.editor.text(definition.expression);
@@ -327,7 +286,7 @@ impl<'editor, 'tree> Constants<'editor, 'tree> {
         self.remaining = self.remaining.checked_sub(1)?;
         let text = self.editor.text(node);
         let value = match node.kind() {
-            "int_literal" => Value::Int(parse_int(text)?),
+            "int_literal" => Value::Int(parse_integer(text)?),
             "float_literal" => Value::float(parse_float(text)?)?,
             "rune_literal" => Value::Int(i128::from(decode_rune(text)?)),
             "raw_string_literal" | "interpreted_string_literal" => {
@@ -535,7 +494,9 @@ impl Constant {
             None => (self.value, other.value),
         };
         let value = match (left, right) {
-            (Value::Int(left), Value::Int(right)) => integer_binary(operator, left, right),
+            (Value::Int(left), Value::Int(right)) => integer_binary(operator, left, right)
+                .map(Value::Int)
+                .or_else(|| comparison(operator, &left, &right)),
             (Value::Bool(left), Value::Bool(right)) => Some(Value::Bool(match operator {
                 "&&" => left && right,
                 "||" => left || right,
@@ -559,30 +520,7 @@ impl Constant {
     }
 
     fn shift(self, operator: &str, other: Self) -> Option<Self> {
-        let value = self.shift_integer()?;
-        let amount = u128::try_from(other.shift_integer()?).ok()?;
-        let shifted = if amount >= u128::from(i128::BITS) {
-            match operator {
-                ">>" => {
-                    if value < 0 {
-                        -1
-                    } else {
-                        0
-                    }
-                }
-                _ if value == 0 => 0,
-                _ => return None,
-            }
-        } else if operator == ">>" {
-            value >> amount as u32
-        } else {
-            let amount = amount as u32;
-            let shifted = value << amount;
-            if shifted >> amount != value {
-                return None;
-            }
-            shifted
-        };
+        let shifted = integer_binary(operator, self.shift_integer()?, other.shift_integer()?)?;
         Self::result(Value::Int(shifted), self.ty)
     }
 
@@ -651,21 +589,6 @@ impl Value {
     }
 }
 
-fn integer_binary(operator: &str, left: i128, right: i128) -> Option<Value> {
-    Some(Value::Int(match operator {
-        "+" => left.checked_add(right)?,
-        "-" => left.checked_sub(right)?,
-        "*" => left.checked_mul(right)?,
-        "/" => left.checked_div(right)?,
-        "%" => left.checked_rem(right)?,
-        "&" => left & right,
-        "|" => left | right,
-        "^" => left ^ right,
-        "&^" => left & !right,
-        _ => return comparison(operator, &left, &right),
-    }))
-}
-
 fn float_binary(operator: &str, left: f64, right: f64) -> Option<Value> {
     Value::float(match operator {
         "+" => left + right,
@@ -686,18 +609,6 @@ fn comparison<T: PartialOrd>(operator: &str, left: &T, right: &T) -> Option<Valu
         ">=" => left >= right,
         _ => return None,
     }))
-}
-
-fn parse_int(text: &str) -> Option<i128> {
-    let text = text.replace('_', "");
-    let (digits, radix) = match text.as_bytes() {
-        [b'0', b'x' | b'X', ..] => (&text[2..], 16),
-        [b'0', b'b' | b'B', ..] => (&text[2..], 2),
-        [b'0', b'o' | b'O', ..] => (&text[2..], 8),
-        [b'0', _, ..] => (&text[1..], 8),
-        _ => (text.as_str(), 10),
-    };
-    i128::from_str_radix(digits, radix).ok()
 }
 
 fn parse_float(text: &str) -> Option<f64> {

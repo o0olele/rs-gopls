@@ -947,7 +947,7 @@ impl<'w> Resolver<'w, '_> {
                     return Ok(None);
                 }
             }
-            TypeKind::Container(container, _) => match *container {
+            TypeKind::Container(container, origin) => match *container {
                 Container::Slice(element) => {
                     let Some(element) = nested(element)? else {
                         return Ok(None);
@@ -955,8 +955,10 @@ impl<'w> Resolver<'w, '_> {
                     TypeShape::Slice(Box::new(element))
                 }
                 Container::Array { element, length } => {
-                    let (Some(element), Some(length)) =
-                        (nested(element)?, length.as_deref().and_then(array_length))
+                    let Some(element) = nested(element)? else {
+                        return Ok(None);
+                    };
+                    let Some(length) = self.array_length(ty.package, origin, length.as_deref())?
                     else {
                         return Ok(None);
                     };
@@ -1089,18 +1091,6 @@ struct Field {
 struct BoundTerm {
     shape: TypeShape,
     approximate: bool,
-}
-
-fn array_length(text: &str) -> Option<u64> {
-    let literal = text.trim().trim_start_matches('+').replace('_', "");
-    let (radix, digits) = match literal.as_bytes() {
-        [b'0', b'b' | b'B', ..] => (2, &literal[2..]),
-        [b'0', b'o' | b'O', ..] => (8, &literal[2..]),
-        [b'0', b'x' | b'X', ..] => (16, &literal[2..]),
-        [b'0', _, ..] => (8, &literal[1..]),
-        _ => (10, literal.as_str()),
-    };
-    u64::from_str_radix(digits, radix).ok()
 }
 
 #[derive(Default)]

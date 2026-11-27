@@ -5,7 +5,7 @@
 | 状态 | 受阻 |
 | 创建日期 | 2026-11-25 |
 | 用户确认 | 2026-11-25 已确认，开始实施 |
-| 更新日期 | 2026-11-26 |
+| 更新日期 | 2026-11-27 |
 | 完成日期 | 待填写 |
 
 ## 目标与范围
@@ -71,6 +71,18 @@ Rust 方案复用 [`src/main.rs`](../../src/main.rs) 的 LSP 分派和分批取�
 
 - [x] 对照 `SqlStore`、`LocalFileBackend` 和 `Store` 的完整目标，记录换光标、先查另一类型和同光标重复查询的 P50/P95。两种具体类型换光标时的 P50 分别为 0.84 ms 和 0.34 ms，GoLand 分别为 20.12 ms 和 4.43 ms。仅预热 `SqlStore` 后首次查 `LocalFileBackend` 的 P50 仍为 1772.83 ms。[GoLand 复测数据](../goland-implementation-baseline.md#复用具体类型反查的候选范围)
 - [x] 49 项 GoLand 对照及声明跳转、类型定义、引用回归通过。18 项工作区回归验证了接口源码变化、未保存覆盖和关闭恢复的结果。
+
+## 2026-11-27 数组长度常量的签名匹配
+
+用户要求修复并提交完整签名匹配中的漏查。接口方法接收 `[4]byte`，两个包的实现分别使用 `[4]byte` 和 `[Width]byte`，其中 `const Width = 4`。Go 编译器接受两种实现，修复前的发布版只找到前者。将接口本身改为使用导入的长度常量后，新增工作区用例期望两个目标，修复前实际为零。[Go 规范中的类型一致性](https://go.dev/ref/spec#Type_identity)
+
+只读核对 GoLand `GO-263.7307.354` 的 `plugins/go-plugin/lib/modules/intellij.go.impl.jar`。`GoTypeUtil.equalTypes` 比较两侧数组的 `getLength()` 后递归比较元素类型。`GoPsiImplUtil.calcLength` 对显式长度调用 `GoExpression.getValue()`，`GoExpressionEvaluator.evaluateConstDefinition` 从常量声明取初始化表达式及其 `iota` 行号。
+
+Rust 修改沿用现有方法集匹配和工作区索引。在数组类型的声明上下文中解析长度，对已知整数值比较，对无法求值的长度保留未决结果。验收包含正反向类型及方法查询、不同长度排除、类型别名的声明作用域、变更未保存的常量值并关闭文件后的结果恢复。
+
+- [x] VS Code 1.148.0 和官方 Go 扩展 0.58.0 只打开 `api/sink.go`，在 `Sink` 和 `Push` 上查询。旧版两次都只找到字面量实现，修复后的 release 两次都准确返回字面量及具名常量的两个实现，排除了长度为 5 的实现。直接 stdio 回放的文件和 UTF-16 范围一致。
+- [x] 工作区回归核对正反向结果以及未保存编辑 `4 → 5` 和关闭恢复。Rust 用例覆盖别名的声明作用域、分组 `iota`、内建整数类型转换、不同长度及循环或变量，另确认 `[0+10]byte` 只匹配十进制长度 10。
+- [x] 263 项 Rust 测试、7 组实现导航工作区回归、29 组导航夹具与 2 组跨包示例、20 组 LocalChat 既有 GoLand 对照均通过。复验 GoLand 对照使用仓库保存的采集结果。整数计算超出支持的精度，或表达式使用当前不支持的形式时，求值仍可能返回未知。
 
 ## 完成记录
 

@@ -13,6 +13,7 @@ use super::{Engine, Rc, VecDeque};
 use crate::symbols::{self, TypeRef, TypeRefKind};
 use crate::workspace::{Package, path_key};
 
+mod array_length;
 mod candidates;
 mod interface_index;
 mod interface_probe;
@@ -748,6 +749,104 @@ mod tests {
                 Position::new(line, 5 + name.len() as u32),
             ),
         )
+    }
+
+    #[test]
+    fn array_length_uses_the_type_alias_declaration_scope() {
+        let project = TestProject::new();
+        project.write(
+            "formats/block.go",
+            "package formats\nconst (\n _ = 1 << iota\n _\n Width\n)\ntype Block = [Width]byte\n",
+        );
+        let api = project.write(
+            "api/sink.go",
+            "package api\nimport f \"formats\"\nconst Width = 9\ntype Sink interface { Push(f.Block) }\n",
+        );
+        let impls = project.write(
+            "impl/sinks.go",
+            "package impl\ntype Four struct{}\nfunc (Four) Push([2 + 2]byte) {}\ntype Nine struct{}\nfunc (Nine) Push([9]byte) {}\n",
+        );
+        let mut engine = Engine::new(project.root.clone());
+        install_packages(
+            &mut engine,
+            &project.root,
+            &[
+                ("formats", &["block.go"], &[]),
+                ("api", &["sink.go"], &["formats"]),
+                ("impl", &["sinks.go"], &[]),
+            ],
+        );
+        assert_eq!(reverse(&mut engine, &api, 3), [type_at(&impls, 1, "Four")]);
+        assert_eq!(reverse(&mut engine, &impls, 1), [type_at(&api, 3, "Sink")]);
+        assert!(reverse(&mut engine, &impls, 3).is_empty());
+    }
+
+    #[test]
+    fn array_lengths_match_for_typed_and_converted_integer_constants() {
+        let project = TestProject::new();
+        let api = project.write(
+            "api/sink.go",
+            "package api\nconst Width uint8 = 4\ntype Sink interface { Push([Width]byte) }\n",
+        );
+        let impls = project.write(
+            "impl/sinks.go",
+            concat!(
+                "package impl\nconst Width = uint8(uint32(4))\n",
+                "type Four struct{}\nfunc (Four) Push([Width]byte) {}\n",
+                "const OtherWidth = ^Width\ntype Other struct{}\nfunc (Other) Push([OtherWidth]byte) {}\n",
+            ),
+        );
+        let mut engine = Engine::new(project.root.clone());
+        install_packages(
+            &mut engine,
+            &project.root,
+            &[("api", &["sink.go"], &[]), ("impl", &["sinks.go"], &[])],
+        );
+        assert_eq!(reverse(&mut engine, &api, 2), [type_at(&impls, 2, "Four")]);
+    }
+
+    #[test]
+    fn a_leading_zero_in_an_array_length_expression_is_not_an_octal_prefix() {
+        let project = TestProject::new();
+        let api = project.write(
+            "api/sink.go",
+            "package api\ntype Sink interface { Push([0+10]byte) }\n",
+        );
+        let impls = project.write(
+            "impl/sinks.go",
+            "package impl\ntype Eight struct{}\nfunc (Eight) Push([8]byte) {}\ntype Ten struct{}\nfunc (Ten) Push([10]byte) {}\n",
+        );
+        let mut engine = Engine::new(project.root.clone());
+        install_packages(
+            &mut engine,
+            &project.root,
+            &[("api", &["sink.go"], &[]), ("impl", &["sinks.go"], &[])],
+        );
+        assert_eq!(reverse(&mut engine, &api, 1), [type_at(&impls, 3, "Ten")]);
+    }
+
+    #[test]
+    fn unresolved_array_lengths_never_match_a_known_length() {
+        let project = TestProject::new();
+        let api = project.write(
+            "api/sink.go",
+            "package api\ntype Sink interface { Push([0]byte) }\n",
+        );
+        let impls = project.write(
+            "impl/sinks.go",
+            concat!(
+                "package impl\ntype Zero struct{}\nfunc (Zero) Push([0]byte) {}\n",
+                "const Cycle = Cycle\ntype Cyclic struct{}\nfunc (Cyclic) Push([Cycle]byte) {}\n",
+                "var Size = 0\ntype Variable struct{}\nfunc (Variable) Push([Size]byte) {}\n",
+            ),
+        );
+        let mut engine = Engine::new(project.root.clone());
+        install_packages(
+            &mut engine,
+            &project.root,
+            &[("api", &["sink.go"], &[]), ("impl", &["sinks.go"], &[])],
+        );
+        assert_eq!(reverse(&mut engine, &api, 1), [type_at(&impls, 1, "Zero")]);
     }
 
     #[test]
