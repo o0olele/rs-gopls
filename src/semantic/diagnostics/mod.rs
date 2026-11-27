@@ -54,17 +54,28 @@ fn analyze(
 ) -> Result<DiagnosticReport> {
     let mut items = syntax::collect_syntax_diagnostics(document);
     let requires_tests = is_test_source(document.path());
-    let QueryProgress::Ready(graph) = snapshot.active_graph(requires_tests) else {
+    let QueryProgress::Ready(graph) = snapshot.diagnostics_graph(requires_tests) else {
         return Ok(DiagnosticReport::new(key, items, true));
     };
-    let package_errors = package_errors::collect_package_errors(snapshot, document, &items);
+    let package = match snapshot.package_for(document, requires_tests) {
+        QueryProgress::Ready(package) => package,
+        _ => None,
+    };
+    let group_id = graph
+        .group_for_path(document.path())
+        .or_else(|| package.map(Package::group_id));
+    let package_errors =
+        package_errors::collect_package_errors(graph, document, package, group_id, &items);
     if syntax::has_reliable_declarations(document.root_node())
-        && let QueryProgress::Ready(Some(package)) = snapshot.package_for(document, requires_tests)
+        && let Some(package) = package
         && document.outline().package.as_deref() == Some(&package.name)
     {
         let mut analysis = Analysis {
             source: document.indexed(),
             package,
+            group_id: group_id
+                .filter(|group| graph.package_in_group(package, *group))
+                .unwrap_or_else(|| package.group_id()),
             resolver: snapshot.resolver(graph),
             locals: declarations::Locals::default(),
             items,
@@ -89,7 +100,7 @@ pub(crate) fn get_or_compute<'c>(
 ) -> Result<&'c DiagnosticReport> {
     let key = snapshot_key(snapshot, document);
     let partial = !matches!(
-        snapshot.active_graph(is_test_source(document.path())),
+        snapshot.diagnostics_graph(is_test_source(document.path())),
         QueryProgress::Ready(_)
     );
     if !cache
@@ -107,6 +118,7 @@ pub(crate) fn get_or_compute<'c>(
 struct Analysis<'s, 'w, 'i> {
     source: &'s IndexedSource,
     package: &'w Package,
+    group_id: usize,
     resolver: Resolver<'w, 'i>,
     locals: declarations::Locals<'s>,
     items: Vec<DiagnosticItem>,

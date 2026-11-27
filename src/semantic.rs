@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -40,7 +40,7 @@ mod workspace_symbols;
 
 pub(crate) use definition::DefinitionKind;
 pub(crate) use editor::{EditorFoldingOptions, legend as semantic_tokens_legend};
-use index::{DiskIndex, IndexReader, IndexedSource, text_fingerprint};
+use index::{DiskIndex, IndexedSource, NavigationText, text_fingerprint};
 pub(crate) use query::{QueryProgress, SemanticTask};
 pub(crate) use resolver::TypeIdentity;
 // Preserve the shared imports used by the existing presentation and feature submodules.
@@ -118,6 +118,7 @@ struct EngineState {
     documents: HashMap<PathBuf, IndexedSource>,
     new_documents: HashSet<PathBuf>,
     disk_index: HashMap<PathBuf, DiskIndex>,
+    navigation_texts: HashMap<PathBuf, NavigationText>,
     completion_names: HashMap<PathBuf, FileNames>,
     completion_weights: HashMap<completion::InferredMemo, i32>,
 }
@@ -190,6 +191,7 @@ impl Engine {
                 documents: HashMap::new(),
                 new_documents: HashSet::new(),
                 disk_index: HashMap::new(),
+                navigation_texts: HashMap::new(),
                 completion_names: HashMap::new(),
                 completion_weights: HashMap::new(),
             },
@@ -237,6 +239,7 @@ impl Engine {
                 &source.path,
                 new_file,
             );
+            self.implementation_sources.invalidate(&key);
             self.state
                 .documents
                 .insert(key, IndexedSource::new(source, Some(version)));
@@ -265,6 +268,7 @@ impl Engine {
             self.diagnostics_cache.invalidate_document(&key);
             self.state.completion_sources_changed(Some(path));
             self.workspace_symbol_index.document_edited(&key);
+            self.implementation_sources.invalidate(&key);
             edit.apply(&mut self.implementation_cache, &key);
         }
         Ok(())
@@ -284,12 +288,20 @@ impl Engine {
             // watched-file notification. Refresh the build's file selection.
             self.file_changed(path, FileChangeType::CREATED);
         }
-        if self.state.disk_index.contains_key(&key)
+        if self.state.navigation_texts.contains_key(&key)
+            || self.state.disk_index.contains_key(&key)
             || self.state.completion_names.contains_key(&key)
         {
-            let fingerprint = fs::read_to_string(path)
-                .ok()
-                .map(|text| text_fingerprint(&text));
+            let text = fs::read_to_string(path).ok();
+            if self
+                .state
+                .navigation_texts
+                .get(&key)
+                .is_some_and(|cached| !cached.matches(text.as_deref()))
+            {
+                self.state.navigation_texts.remove(&key);
+            }
+            let fingerprint = text.as_deref().map(text_fingerprint);
             if self
                 .state
                 .disk_index
@@ -393,6 +405,20 @@ impl Engine {
                 selected.contains(path) && current
             });
         }
+        if !self.state.navigation_texts.is_empty() {
+            let selected: HashSet<_> = workspace
+                .navigation_packages()
+                .flat_map(|package| package.files.iter().map(|file| path_key(file)))
+                .collect();
+            self.state.navigation_texts.retain(|path, text| {
+                if !selected.contains(path) || !text.is_current(path) {
+                    self.state.disk_index.remove(path);
+                    self.implementation_sources.invalidate(path);
+                    return false;
+                }
+                true
+            });
+        }
         self.implementation_sources.retain_workspace(&workspace);
         self.state.workspace = Some(Rc::new(workspace));
         self.state.completion_graph_generation += 1;
@@ -430,6 +456,7 @@ impl Engine {
         self.state.completion_sources_changed(Some(path));
         let key = path_key(path);
         self.state.completion_names.remove(&key);
+        self.state.navigation_texts.remove(&key);
         self.completion_imports.source_changed(&key);
         self.workspace_symbol_index
             .disk_changed(&key, self.state.documents.contains_key(&key));

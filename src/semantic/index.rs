@@ -6,6 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use lsp_types::{CompletionItemKind, Range, TextDocumentContentChangeEvent};
@@ -169,6 +170,21 @@ pub(super) fn text_fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+pub(super) struct NavigationText {
+    text: String,
+    stamp: Option<Stamp>,
+}
+
+impl NavigationText {
+    pub(super) fn matches(&self, disk_text: Option<&str>) -> bool {
+        Some(self.text.as_str()) == disk_text
+    }
+
+    pub(super) fn is_current(&self, path: &Path) -> bool {
+        fs::metadata(path).is_ok_and(|metadata| self.stamp == Some(metadata.into()))
+    }
+}
+
 pub(super) type DraftFiles<'a> = HashMap<(&'a Path, &'a str), Vec<&'a PathBuf>>;
 
 pub(super) fn active_package<'w>(
@@ -280,6 +296,8 @@ pub(super) struct IndexReader<'a> {
     pub(super) parser: &'a mut Parser,
     pub(super) documents: &'a HashMap<PathBuf, IndexedSource>,
     pub(super) disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
+    pub(super) navigation_texts: &'a mut HashMap<PathBuf, NavigationText>,
+    pub(super) implementation_parse_time: Option<Duration>,
     pub(super) drafts: DraftFiles<'a>,
     pub(super) disk_names: &'a mut HashMap<PathBuf, FileNames>,
     pub(super) completion: Option<&'a mut CompletionRead>,
@@ -397,6 +415,40 @@ impl AsRef<IndexedSource> for ReferenceSource<'_> {
 }
 
 impl<'a> IndexReader<'a> {
+    pub(super) fn navigation_text(&mut self, path: &Path, key: &Path) -> Result<(&str, bool)> {
+        match self.navigation_texts.entry(key.to_owned()) {
+            Entry::Occupied(entry) => Ok((&entry.into_mut().text, false)),
+            Entry::Vacant(entry) => {
+                let mut file = fs::File::open(path)?;
+                let metadata = file.metadata().ok();
+                let length = metadata
+                    .as_ref()
+                    .and_then(|m| usize::try_from(m.len()).ok())
+                    .unwrap_or_default();
+                let mut text = String::with_capacity(length);
+                std::io::Read::read_to_string(&mut file, &mut text)?;
+                let stamp = metadata.map(Stamp::from);
+                Ok((&entry.insert(NavigationText { text, stamp }).text, true))
+            }
+        }
+    }
+
+    fn navigation_source(&mut self, path: &Path, key: &Path) -> Result<Source> {
+        match self.navigation_texts.get(key) {
+            Some(cached) => Source::parse(self.parser, path.to_owned(), cached.text.clone(), None),
+            None => {
+                self.navigation_text(path, key)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Source::parse(
+                    self.parser,
+                    path.to_owned(),
+                    self.navigation_texts[key].text.clone(),
+                    None,
+                )
+            }
+        }
+    }
+
     pub(super) fn reference_source(&mut self, path: &Path) -> Result<Option<ReferenceSource<'a>>> {
         self.get_source(path, false)
     }
@@ -434,7 +486,8 @@ impl<'a> IndexReader<'a> {
                 Err(error) => Err(error),
             };
         }
-        let source = match read_source(self.parser, path) {
+        let started = self.implementation_parse_time.map(|_| Instant::now());
+        let source = match self.navigation_source(path, &key) {
             Ok(source) => Rc::new(IndexedSource::new(source, None)),
             Err(error) if missing_source(&error) => return Ok(None),
             Err(error) => return Err(error),
@@ -450,6 +503,9 @@ impl<'a> IndexReader<'a> {
             Entry::Vacant(entry) => entry.insert(DiskIndex::from_indexed(&source, fingerprint)),
         };
         entry.reference_source = Some(Rc::clone(&source));
+        if let Some(started) = started {
+            *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
+        }
         Ok(Some(ReferenceSource::Disk(source)))
     }
 
@@ -478,14 +534,10 @@ impl<'a> IndexReader<'a> {
             }
             return Ok(&self.disk_index[&key].declarations);
         }
-        let cached = match self.disk_index.entry(key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let source = read_source(self.parser, file)?;
-                entry.insert(DiskIndex::new(&source))
-            }
-        };
-        Ok(&cached.declarations)
+        if !self.disk_index.contains_key(&key) {
+            self.index_navigation_file(file, &key, false)?;
+        }
+        Ok(&self.disk_index[&key].declarations)
     }
 
     pub(super) fn trace(&self) -> Option<&Trace> {
@@ -741,25 +793,49 @@ fn missing_source(error: &anyhow::Error) -> bool {
 }
 
 impl IndexReader<'_> {
+    fn index_navigation_file(&mut self, file: &Path, key: &Path, needs_type: bool) -> Result<()> {
+        let started = self.implementation_parse_time.map(|_| Instant::now());
+        let from_probe = self.navigation_texts.contains_key(key);
+        let source = if needs_type && !from_probe {
+            let text =
+                fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+            if !text.contains("type") {
+                return Ok(());
+            }
+            Source::parse(self.parser, file.to_owned(), text, None)?
+        } else if from_probe {
+            if needs_type && !self.navigation_texts[key].text.contains("type") {
+                return Ok(());
+            }
+            self.navigation_source(file, key)?
+        } else {
+            read_source(self.parser, file)?
+        };
+        let mut index = DiskIndex::new(&source);
+        if from_probe {
+            let indexed = IndexedSource::new(source, None);
+            let _ = indexed.declarations.set(Rc::clone(&index.declarations));
+            index.reference_source = Some(Rc::new(indexed));
+        }
+        self.disk_index.insert(key.to_owned(), index);
+        if let Some(started) = started {
+            *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
+        }
+        Ok(())
+    }
+
     pub(super) fn candidate_index(&mut self, file: &Path) -> Result<Option<&FileIndex>> {
         let key = path_key(file);
         if let Some(source) = self.documents.get(&key) {
             return Ok(Some(source.declarations()));
         }
-        let cached = match self.disk_index.entry(key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let text = fs::read_to_string(file)
-                    .with_context(|| format!("reading {}", file.display()))?;
-                // Candidate declarations require a type spec, including aliases.
-                if !text.contains("type") {
-                    return Ok(None);
-                }
-                let source = Source::parse(self.parser, file.to_owned(), text, None)?;
-                entry.insert(DiskIndex::new(&source))
-            }
-        };
-        Ok(Some(&cached.declarations))
+        if !self.disk_index.contains_key(&key) {
+            self.index_navigation_file(file, &key, true)?;
+        }
+        Ok(self
+            .disk_index
+            .get(&key)
+            .map(|index| index.declarations.as_ref()))
     }
 }
 

@@ -8,30 +8,41 @@ use lsp_types::{Position, Range};
 use super::index::active_package;
 use super::query::{QueryProgress, SemanticTask};
 use super::resolver::{Resolver, TypeIdentity, TypeKind, is_exported};
-use super::source::{ReferenceQuery, Source, TextEditDelta, is_type_declaration, node_text};
+use super::source::{
+    ReferenceQuery, Source, TextEditDelta, is_test_source, is_type_declaration, node_text,
+};
 use super::{Engine, Rc, VecDeque};
 use crate::symbols::{self, TypeRef, TypeRefKind};
 use crate::workspace::{Package, path_key};
 
 mod candidates;
+#[cfg(test)]
+mod forward_tests;
 mod interface_index;
 mod interface_probe;
 mod method_sets;
+pub(super) mod stats;
 
 pub(super) use candidates::InterfaceSources;
-use candidates::{CandidatePackages, PackageProbeKey};
+use candidates::{CandidatePackages, CandidateTypes, PackageProbeKey};
 use interface_index::{IndexedInterface, InterfaceIndex};
 pub(in crate::semantic) use method_sets::RenameMethod;
 use method_sets::{InterfaceMethods, MethodKey, MethodShape};
 
 type Location = (PathBuf, Range);
-type QueryKey = (PathBuf, Position);
+type QueryKey = (PathBuf, Position, Option<TypeHierarchyDirection>);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(in crate::semantic) enum TypeHierarchyDirection {
+    Super,
+    Sub,
+}
 
 #[derive(Default)]
 pub(super) struct ImplementationCache {
     results: HashMap<QueryKey, Vec<Location>>,
-    packages: HashMap<PackageProbeKey, HashSet<String>>,
-    interfaces: HashMap<String, InterfaceIndex>,
+    packages: HashMap<(Vec<usize>, PackageProbeKey), HashSet<String>>,
+    interfaces: HashMap<(String, Option<TypeHierarchyDirection>), InterfaceIndex>,
 }
 
 impl ImplementationCache {
@@ -52,11 +63,12 @@ impl ImplementationCache {
         self.results.insert(key, result);
     }
 
-    fn remember_packages(&mut self, candidates: CandidatePackages) {
+    fn remember_packages(&mut self, groups: Vec<usize>, candidates: CandidatePackages) {
         if self.packages.len() >= 32 {
             self.packages.clear();
         }
-        self.packages.insert(candidates.key, candidates.eligible);
+        self.packages
+            .insert((groups, candidates.key), candidates.eligible);
     }
 
     fn shift(&mut self, path: &Path, shift: LineShift) {
@@ -67,7 +79,7 @@ impl ImplementationCache {
         self.interfaces.clear();
         self.results = std::mem::take(&mut self.results)
             .into_iter()
-            .filter_map(|((query_path, mut position), mut locations)| {
+            .filter_map(|((query_path, mut position, hierarchy), mut locations)| {
                 if query_path == path {
                     position = shift.position(position)?;
                 }
@@ -77,7 +89,7 @@ impl ImplementationCache {
                         range.end = shift.position(range.end)?;
                     }
                 }
-                Some(((query_path, position), locations))
+                Some(((query_path, position, hierarchy), locations))
             })
             .collect();
     }
@@ -190,13 +202,16 @@ fn ordinary_comment(text: &str) -> bool {
 
 pub(crate) struct ImplementationSearch {
     key: QueryKey,
+    groups: Vec<usize>,
     direction: Direction,
     selected: Option<MethodKey>,
     declaration: Location,
     packages: VecDeque<String>,
     package_filter: Option<CandidatePackages>,
+    type_filter: HashMap<String, CandidateTypes>,
     current: Option<PackageSearch>,
     matches: Vec<Location>,
+    stats: Option<stats::QueryStats>,
 }
 
 enum Direction {
@@ -224,6 +239,7 @@ struct PackageSearch {
     id: String,
     files: Vec<PathBuf>,
     direct_owners: HashSet<String>,
+    candidate_names: Option<HashSet<String>>,
     candidates: Vec<Candidate>,
     interface_index: Option<InterfaceIndex>,
     indexed_interfaces: Vec<Rc<IndexedInterface>>,
@@ -257,44 +273,90 @@ struct Subject<'w> {
 }
 
 impl Engine {
+    pub(crate) fn implementation_index_pending(&self) -> bool {
+        self.state
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.total_load_failure().is_none())
+            && matches!(self.state.graph_changes, super::GraphChanges::Clean)
+            && self.implementation_sources.pending()
+    }
+
+    pub(crate) fn advance_implementation_index(&mut self) {
+        let mut snapshot = self.state.snapshot(self.include_tests);
+        if let QueryProgress::Ready(workspace) = snapshot.active_graph(false) {
+            self.implementation_sources
+                .advance(&mut snapshot.resolver(workspace));
+        }
+    }
+
     pub(crate) fn implementations(
         &mut self,
         path: &Path,
         position: Position,
     ) -> Result<QueryProgress<Vec<Location>, ImplementationSearch>> {
+        Ok(self
+            .search_method_relations(path, position, None)?
+            .unwrap_or_else(|| QueryProgress::Ready(Vec::new())))
+    }
+
+    pub(in crate::semantic) fn interface_hierarchy(
+        &mut self,
+        path: &Path,
+        position: Position,
+        direction: TypeHierarchyDirection,
+    ) -> Result<Option<QueryProgress<Vec<Location>, ImplementationSearch>>> {
+        self.search_method_relations(path, position, Some(direction))
+    }
+
+    fn search_method_relations(
+        &mut self,
+        path: &Path,
+        position: Position,
+        hierarchy: Option<TypeHierarchyDirection>,
+    ) -> Result<Option<QueryProgress<Vec<Location>, ImplementationSearch>>> {
         if path.extension().is_none_or(|extension| extension != "go") {
-            return Ok(QueryProgress::Ready(Vec::new()));
+            return Ok(None);
         }
-        self.include_tests = true;
+        let require_tests =
+            hierarchy != Some(TypeHierarchyDirection::Super) || is_test_source(path);
+        self.include_tests |= require_tests;
         let mut snapshot = self.state.snapshot(self.include_tests);
-        let workspace = match snapshot.active_graph(true) {
+        let workspace = match snapshot.active_graph(require_tests) {
             QueryProgress::Ready(workspace) => workspace,
-            QueryProgress::Pending(load) => return Ok(QueryProgress::Pending(load)),
+            QueryProgress::Pending(load) => return Ok(Some(QueryProgress::Pending(load))),
             QueryProgress::Searching(task) => match task {},
         };
-        let key = (path_key(path), position);
+        let key = (path_key(path), position, hierarchy);
         if let Some(cached) = self.implementation_cache.results.get(&key) {
-            return Ok(QueryProgress::Ready(cached.clone()));
+            return Ok(Some(QueryProgress::Ready(cached.clone())));
         }
 
         let root = snapshot.root();
         let new_documents = snapshot.new_documents();
         let mut resolver = snapshot.resolver(workspace);
         let Some(source) = resolver.indexes.reference_source(path)? else {
-            return Ok(QueryProgress::Ready(Vec::new()));
+            return Ok(None);
         };
         let source = source.as_ref();
         let Some(from) = active_package(workspace, source, new_documents) else {
-            return Ok(QueryProgress::Ready(Vec::new()));
+            return Ok(None);
         };
         let Some(subject) = resolver.implementation_subject(from, source, position, root)? else {
-            return Ok(QueryProgress::Ready(Vec::new()));
+            return Ok(None);
         };
         let mut matches = Vec::new();
-        let direction = if let Some(required) = resolver.interface_methods(&subject.owner)? {
+        let required = if hierarchy.is_some() {
+            resolver.hierarchy_interface_methods(&subject.owner)?
+        } else {
+            resolver.interface_methods(&subject.owner)?
+        };
+        let direction = if let Some(required) = required {
             let same_file = path_key(path) == path_key(&subject.declaration.0);
             let range = subject.declaration.1;
-            if !same_file || position < range.start || position >= range.end {
+            if hierarchy.is_none()
+                && (!same_file || position < range.start || position >= range.end)
+            {
                 matches.push(subject.declaration.clone());
             }
             let Some(anchor) = required
@@ -302,10 +364,30 @@ impl Engine {
                 .max_by_key(|name| (name.len(), *name))
                 .map(str::to_owned)
             else {
-                return Ok(QueryProgress::Ready(matches));
+                return Ok((!matches.is_empty()).then_some(QueryProgress::Ready(matches)));
             };
-            Direction::Implementations { required, anchor }
-        } else if let TypeKind::Named { name, .. } = &subject.owner.kind {
+            if hierarchy == Some(TypeHierarchyDirection::Super) {
+                let TypeKind::Named { name, .. } = &subject.owner.kind else {
+                    return Ok(None);
+                };
+                if required.has_predeclared_error_method()
+                    && let Ok(file) = workspace.builtin_source(root)
+                    && let Ok(index) = resolver.indexes.file_index(file)
+                    && let Some(symbol) = index.symbols.declaration("error")
+                {
+                    matches.push((file.to_owned(), symbol.range));
+                }
+                Direction::Interfaces {
+                    package_id: subject.owner.package.id.clone(),
+                    name: name.clone(),
+                    shapes: Some(required.method_shapes().collect()),
+                }
+            } else {
+                Direction::Implementations { required, anchor }
+            }
+        } else if hierarchy.is_none()
+            && let TypeKind::Named { name, .. } = &subject.owner.kind
+        {
             let concrete = TypeIdentity::named(subject.owner.package, name);
             let shapes = if subject.method.is_none() {
                 resolver.concrete_method_shapes(&concrete).unwrap_or(None)
@@ -313,7 +395,7 @@ impl Engine {
                 None
             };
             if shapes.as_ref().is_some_and(|shapes| shapes.is_empty()) {
-                return Ok(QueryProgress::Ready(matches));
+                return Ok(None);
             }
             Direction::Interfaces {
                 package_id: subject.owner.package.id.clone(),
@@ -321,19 +403,34 @@ impl Engine {
                 shapes,
             }
         } else {
-            return Ok(QueryProgress::Ready(matches));
+            return Ok(None);
         };
+        if !workspace.includes_tests() {
+            self.include_tests = true;
+            return Ok(Some(QueryProgress::Pending(self.workspace_load())));
+        }
 
         let package = subject.owner.package;
+        // A declaration in a shared package is visible to every group that
+        // builds it. A reference starts from its own group's import bindings.
+        let groups = if path_key(path) == path_key(&subject.declaration.0) {
+            package.groups().to_vec()
+        } else {
+            vec![
+                workspace
+                    .group_for_path(path)
+                    .unwrap_or_else(|| package.group_id()),
+            ]
+        };
         let package_only = subject
             .method
             .as_ref()
             .is_some_and(|method| !method.is_exported());
-        // The predeclared error interface can supply Error outside the go list graph.
+        let forward = matches!(direction, Direction::Implementations { .. });
         let probe = match &direction {
-            Direction::Implementations { anchor, .. } if !package_only && anchor != "Error" => {
-                Some(PackageProbeKey::Method(anchor.clone()))
-            }
+            Direction::Implementations { required, .. } if !package_only => Some(
+                PackageProbeKey::Implementations(required.method_shapes().collect()),
+            ),
             Direction::Interfaces {
                 shapes: Some(shapes),
                 ..
@@ -350,35 +447,47 @@ impl Engine {
             _ => None,
         };
         let (packages, package_filter) = match probe {
-            Some(key) => match self.implementation_cache.packages.get(&key) {
-                Some(eligible) => (eligible.iter().cloned().collect(), None),
-                None => (
-                    VecDeque::new(),
-                    Some(CandidatePackages::new(key, workspace)),
-                ),
-            },
+            Some(probe) => {
+                if forward {
+                    (VecDeque::new(), Some(CandidatePackages::new(probe)))
+                } else if let Some(eligible) = self
+                    .implementation_cache
+                    .packages
+                    .get(&(groups.clone(), probe.clone()))
+                {
+                    (eligible.iter().cloned().collect(), None)
+                } else {
+                    (VecDeque::new(), Some(CandidatePackages::new(probe)))
+                }
+            }
             None => {
                 let packages = workspace
                     .navigation_packages()
                     .filter(|candidate| {
-                        !package_only
-                            || candidate.directory_and_name() == package.directory_and_name()
+                        groups
+                            .iter()
+                            .any(|group| candidate.groups().contains(group))
+                            && (!package_only
+                                || candidate.directory_and_name() == package.directory_and_name())
                     })
                     .map(|candidate| candidate.id.clone())
                     .collect();
                 (packages, None)
             }
         };
-        Ok(QueryProgress::Searching(ImplementationSearch {
+        Ok(Some(QueryProgress::Searching(ImplementationSearch {
             key,
+            groups,
             direction,
             selected: subject.method,
             declaration: subject.declaration,
             packages,
             package_filter,
+            type_filter: HashMap::new(),
             current: None,
             matches,
-        }))
+            stats: stats::clock().map(|_| stats::QueryStats::default()),
+        })))
     }
 }
 
@@ -394,16 +503,38 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
         );
         let mut resolver = snapshot.resolver(workspace);
         if let Some(filter) = &mut self.package_filter {
-            if filter.advance(&resolver, &mut engine.implementation_sources) {
-                self.packages.extend(filter.eligible.iter().cloned());
-                if let Some(filter) = self.package_filter.take() {
-                    engine.implementation_cache.remember_packages(filter);
+            let sources = &mut engine.implementation_sources;
+            if sources.pending() {
+                let started = self.stats.as_ref().map(|_| Instant::now());
+                let ready = sources.advance(&mut resolver);
+                if let (Some(stats), Some(started)) = (&mut self.stats, started) {
+                    stats.index_wait += started.elapsed();
                 }
+                if !ready {
+                    return Ok(false);
+                }
+            }
+            let started = self.stats.as_ref().map(|_| Instant::now());
+            filter.collect(workspace, sources, &self.groups);
+            self.packages.extend(filter.eligible.iter().cloned());
+            let filter = self.package_filter.take().unwrap();
+            if matches!(self.direction, Direction::Implementations { .. }) {
+                self.type_filter = filter.types;
+            } else {
+                engine
+                    .implementation_cache
+                    .remember_packages(self.groups.clone(), filter);
+            }
+            if let (Some(stats), Some(started)) = (&mut self.stats, started) {
+                stats.probe += started.elapsed();
             }
             return Ok(false);
         }
         let started = Instant::now();
+        resolver.indexes.implementation_parse_time = self.stats.as_ref().map(|_| Duration::ZERO);
+        let mut match_time = Duration::ZERO;
         let index_interfaces = self.indexes_interfaces();
+        let (_, _, hierarchy) = self.key;
         let receiver_shapes = self.direction.receiver_shapes();
         for _ in 0..32 {
             if self.current.is_none() {
@@ -414,16 +545,24 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
                     continue;
                 };
                 let existing = index_interfaces
-                    .then(|| engine.implementation_cache.interfaces.get(&id))
+                    .then(|| {
+                        engine
+                            .implementation_cache
+                            .interfaces
+                            .get(&(id.clone(), hierarchy))
+                    })
                     .flatten();
+                let filtered = self.type_filter.remove(&id);
+                let (files, candidate_names) = match filtered {
+                    Some(types) => (types.files.into_iter().collect(), Some(types.names)),
+                    None if existing.is_some() => (Vec::new(), None),
+                    None => (resolver.indexes.files(package).into_owned(), None),
+                };
                 self.current = Some(PackageSearch {
                     id,
-                    files: if existing.is_some() {
-                        Vec::new()
-                    } else {
-                        resolver.indexes.files(package).into_owned()
-                    },
+                    files,
                     direct_owners: HashSet::new(),
+                    candidate_names,
                     candidates: Vec::new(),
                     interface_index: (index_interfaces && existing.is_none())
                         .then(InterfaceIndex::default),
@@ -432,6 +571,15 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
                 });
             }
             let current = self.current.as_mut().expect("initialized package search");
+            let matching = self
+                .stats
+                .as_ref()
+                .filter(|_| current.files.is_empty())
+                .map(|_| Instant::now());
+            let parse_before = resolver
+                .indexes
+                .implementation_parse_time
+                .unwrap_or_default();
             if let Some(file) = current.files.pop() {
                 resolver.collect_implementation_candidates(
                     current,
@@ -442,14 +590,21 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
             } else if let Some(candidate) = current.candidates.pop() {
                 let eligible = match self.direction {
                     Direction::Implementations { .. } => {
-                        candidate.inherits || current.direct_owners.contains(&candidate.name)
+                        current.candidate_names.is_some()
+                            || candidate.inherits
+                            || current.direct_owners.contains(&candidate.name)
                     }
                     Direction::Interfaces { .. } => candidate.may_be_interface,
                 };
                 if eligible && let Some(package) = workspace.package(&current.id) {
                     if let Some(index) = &mut current.interface_index {
                         let ty = TypeIdentity::named(package, &candidate.name);
-                        if let Some(required) = resolver.interface_methods(&ty)? {
+                        let required = if hierarchy.is_some() {
+                            resolver.hierarchy_interface_methods(&ty)?
+                        } else {
+                            resolver.interface_methods(&ty)?
+                        };
+                        if let Some(required) = required {
                             index.insert(candidate.location, required);
                         }
                     } else if let Some(target) =
@@ -463,7 +618,7 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
                 engine
                     .implementation_cache
                     .interfaces
-                    .insert(current.id.clone(), index);
+                    .insert((current.id.clone(), hierarchy), index);
             } else if let Some(candidate) = current.indexed_interfaces.pop() {
                 if let Some(package) = workspace.package(&current.id)
                     && let Some(target) = resolver.match_interface(
@@ -478,11 +633,30 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
             } else {
                 self.current = None;
             }
+            if let Some(matching) = matching {
+                match_time += matching.elapsed().saturating_sub(
+                    resolver
+                        .indexes
+                        .implementation_parse_time
+                        .unwrap_or_default()
+                        - parse_before,
+                );
+            }
             if started.elapsed() >= Duration::from_millis(2) {
                 break;
             }
         }
         let done = self.current.is_none() && self.packages.is_empty();
+        if let Some(stats) = &mut self.stats {
+            stats.parse += resolver
+                .indexes
+                .implementation_parse_time
+                .unwrap_or_default();
+            stats.matching += match_time;
+            if done {
+                stats.report();
+            }
+        }
         if done {
             self.complete(&mut engine.implementation_cache);
         }
@@ -605,12 +779,21 @@ impl<'w> Resolver<'w, '_> {
             }
             Err(error) => return Err(error),
         };
-        if let Direction::Implementations { anchor, .. } = direction {
+        if package.candidate_names.is_none()
+            && let Direction::Implementations { anchor, .. } = direction
+        {
             package
                 .direct_owners
                 .extend(index.symbols.member_owners(anchor).map(str::to_owned));
         }
         for (name, details) in index.symbols.type_declarations() {
+            if package
+                .candidate_names
+                .as_ref()
+                .is_some_and(|names| !names.contains(name))
+            {
+                continue;
+            }
             if let Some(symbol) = index.symbols.declaration(name) {
                 let named = |reference: &TypeRef| matches!(reference.kind, TypeRefKind::Named(_));
                 let alias_or_base = details.alias.as_ref().is_some_and(|alias| {
@@ -638,7 +821,11 @@ impl<'w> Resolver<'w, '_> {
         }
         let ty = TypeIdentity::named(package, &candidate.name);
         let selected = search.selected.as_ref();
+        let (_, _, hierarchy) = search.key;
         let target = match &search.direction {
+            Direction::Implementations { required, .. } if hierarchy.is_some() => self
+                .satisfies_hierarchy_interface(required, &ty, true)?
+                .then_some(candidate.location),
             Direction::Implementations { required, .. } => {
                 let Some(matched) = self.satisfies_interface(required, &ty, selected, true)? else {
                     return Ok(None);
@@ -675,18 +862,23 @@ impl<'w> Resolver<'w, '_> {
         let Some(owner) = self.workspace.package(package_id) else {
             return Ok(None);
         };
+        let (_, _, hierarchy) = search.key;
         if same_location(location, &search.declaration)
-            || (owner.directory_and_name() != package.directory_and_name()
+            || (hierarchy.is_none()
+                && owner.directory_and_name() != package.directory_and_name()
                 && !required.method_names().any(is_exported))
         {
             return Ok(None);
         }
-        let concrete = TypeIdentity::named(owner, name);
+        let subject = TypeIdentity::named(owner, name);
         let selected = search.selected.as_ref();
-        if self
-            .satisfies_interface(required, &concrete, selected, true)?
-            .is_none()
-        {
+        let satisfied = if hierarchy.is_some() {
+            self.satisfies_hierarchy_interface(required, &subject, false)?
+        } else {
+            self.satisfies_interface(required, &subject, selected, true)?
+                .is_some()
+        };
+        if !satisfied {
             return Ok(None);
         }
         let target = match selected {
@@ -802,7 +994,7 @@ mod tests {
             !engine
                 .implementation_cache
                 .interfaces
-                .contains_key("edited")
+                .contains_key(&("edited".into(), None))
         );
         engine.open(edited.clone(), disk.into(), 1).unwrap();
         engine
@@ -823,7 +1015,7 @@ mod tests {
             !engine
                 .implementation_cache
                 .interfaces
-                .contains_key("edited")
+                .contains_key(&("edited".into(), None))
         );
         assert_eq!(engine.implementation_sources.file_probes, 3);
     }
@@ -846,7 +1038,7 @@ mod tests {
             !engine
                 .implementation_cache
                 .interfaces
-                .contains_key("contracts")
+                .contains_key(&("contracts".into(), None))
         );
         assert_eq!(reverse(&mut engine, &origin, 3), [type_at(&disk, 1, "B")]);
         assert_eq!(engine.implementation_sources.file_probes, 3);
@@ -972,8 +1164,8 @@ mod tests {
         );
         assert!(reverse(&mut engine, &origin, 1).contains(&type_at(&reporter, 1, "Report")));
         let candidates = &engine.implementation_cache.interfaces;
-        assert!(candidates.contains_key("implicit"));
-        assert!(!candidates.contains_key("other"));
+        assert!(candidates.contains_key(&("implicit".into(), None)));
+        assert!(!candidates.contains_key(&("other".into(), None)));
     }
 
     #[test]
@@ -1008,9 +1200,12 @@ mod tests {
             "contracts/i00.go",
             "package contracts\ntype I interface { Read(int) }\n",
         );
-        engine
-            .implementation_sources
-            .invalidate(&path_key(&contract));
+        engine.file_changed(&contract, lsp_types::FileChangeType::CHANGED);
+        install_packages(
+            &mut engine,
+            &project.root,
+            &[("contracts", &files, &[]), ("receivers", &["r.go"], &[])],
+        );
         assert!(reverse(&mut engine, &origin, 1).is_empty());
         assert_eq!(
             reverse(&mut engine, &origin, 3),
@@ -1041,16 +1236,17 @@ mod tests {
     }
 
     fn seed_cache(engine: &mut Engine, path: &Path, line: u32) -> QueryKey {
-        let key = (path_key(path), Position::new(line, 5));
+        let key = (path_key(path), Position::new(line, 5), None);
         let cache = &mut engine.implementation_cache;
         cache.remember(key.clone(), vec![location(path, line)]);
         cache.packages.insert(
-            PackageProbeKey::Method("Run".into()),
+            (vec![0], PackageProbeKey::InterfaceMethod("Run".into())),
             HashSet::from(["example.test/sample".into()]),
         );
-        cache
-            .interfaces
-            .insert("example.test/sample".into(), InterfaceIndex::default());
+        cache.interfaces.insert(
+            ("example.test/sample".into(), None),
+            InterfaceIndex::default(),
+        );
         key
     }
 
@@ -1063,15 +1259,15 @@ mod tests {
         let old_key = seed_cache(&mut engine, &path, 3);
         let cache = &mut engine.implementation_cache;
         cache.remember(
-            (path_key(&other), Position::new(5, 0)),
+            (path_key(&other), Position::new(5, 0), None),
             vec![location(&other, 5), location(&path, 3)],
         );
         cache.remember(
-            (path_key(&path), Position::new(2, 0)),
+            (path_key(&path), Position::new(2, 0), None),
             vec![location(&other, 5)],
         );
         cache.remember(
-            (path_key(&other), Position::new(6, 0)),
+            (path_key(&other), Position::new(6, 0), None),
             vec![(
                 path.clone(),
                 Range::new(Position::new(1, 0), Position::new(2, 0)),
@@ -1089,13 +1285,15 @@ mod tests {
             )
             .unwrap();
         let cache = &engine.implementation_cache;
-        let shifted_key = (path_key(&path), Position::new(4, 5));
+        let shifted_key = (path_key(&path), Position::new(4, 5), None);
         assert_eq!(
             cache.results.get(&shifted_key),
             Some(&vec![location(&path, 4)])
         );
         assert_eq!(
-            cache.results.get(&(path_key(&other), Position::new(5, 0))),
+            cache
+                .results
+                .get(&(path_key(&other), Position::new(5, 0), None)),
             Some(&vec![location(&other, 5), location(&path, 4)])
         );
         assert_eq!(cache.results.len(), 2);

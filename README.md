@@ -24,7 +24,7 @@ Launch the resulting executable as a stdio language server with a Go module, a g
 
 ## Navigation performance
 
-Use actual GoLand navigation queries as the performance reference. Fix the project revision, Go SDK, search scope, and query positions. Compare complete matching result sets and report startup, new queries on ready indexes, repeated queries, and edits as separate workloads. [Measurement protocol](docs/PLANS.md#导航性能对照) · [GoLand implementation timings](docs/goland-implementation-baseline.md#与-goland-直接对照)
+Use actual GoLand navigation queries as the performance reference. Fix the project revision, Go SDK, search scope, and query positions. Compare complete matching result sets and report startup, new queries on ready indexes, repeated queries, and edits as separate workloads. [Measurement protocol](docs/PLANS.md#导航性能对照) · [GoLand implementation timings](docs/goland-implementation-baseline.md#与-goland-直接对照) · [GoLand hierarchy timings](docs/goland-hierarchy-baseline.md)
 
 ## Definition coverage
 
@@ -77,13 +77,24 @@ Clients can pull diagnostics or receive published reports for open Go files. Rep
 
 ## Call and type hierarchy across workspace folders
 
-Call hierarchy groups incoming and outgoing calls by declaration. Type hierarchy follows interface and struct embedding. Adding or removing a workspace folder refreshes the active package graph. [GoLand hierarchy and multi-folder baseline](docs/goland-hierarchy-baseline.md)
+Call hierarchy groups incoming and outgoing calls by declaration. Type hierarchy follows interface satisfaction and struct embedding. Adding or removing a workspace folder refreshes the active package graph. [GoLand hierarchy and multi-folder baseline](docs/goland-hierarchy-baseline.md)
+
+Cold lookups from a concrete type to matching interfaces reuse an index of interface method names across queries. Interface subtype searches use method names, parameter and result counts, variadic shape, and reverse embedding links to narrow the candidate set before verifying full method sets. [Track F performance plan](docs/plans/2026-11-27-go-hierarchy-foundation-hardening.md)
+
+From the repository root, use the release executable `$server` to check exact hierarchy results and replay the archived GoLand timings. For paired timings, use the same Go SDK as the capture and confirm that `go version` reports `go1.27.4 windows/amd64`. [Build and verify](#build-and-verify)
+
+```powershell
+python -B .\tools\check_goland_hierarchy.py $server --workspace .\tools\fixtures\hierarchy --fixture .\tools\fixtures\hierarchy\goland-hierarchy.json
+python -B .\tools\compare_hierarchy.py $server --workspace .\tools\fixtures\hierarchy --fixture .\tools\fixtures\hierarchy\goland-hierarchy.json
+```
 
 ## Formatting and code actions
 
 Document formatting runs the Go SDK's `gofmt` on the unsaved buffer and preserves its line endings. Organize Imports groups standard, third-party, and local imports while preserving comments and cgo preambles. Quick fixes can add missing imports, remove unused imports, and repair unused variables or short declarations. [GoLand formatting and code actions baseline](docs/goland-actions-baseline.md)
 
 ## Try safe rename in VS Code on Windows
+
+Clients that support versioned workspace edits can use `textDocument/rename` and, when supported, `textDocument/prepareRename`. The server checks that the edits preserve reference bindings and interface contracts, including across packages, test files, and unsaved buffers. Replay the acceptance fixture with `python -B .\tools\fixtures\rename\replay.py lsp $server`. [Build and verify](#build-and-verify) · [GoLand and rs-gopls rename results](docs/goland-rename-baseline.md)
 
 After building the release executable, run these commands from the repository root. They create a fresh copy of the two-package Go example and open it in a dedicated VS Code profile. The Generic LSP Client starts this repository's release binary over stdio.
 
@@ -103,7 +114,7 @@ code --profile 'rs-gopls Demo' --new-window $workspace --goto "${demo}/client/cl
 code --profile 'rs-gopls Demo' --install-extension zsol.vscode-glspc
 ```
 
-Trust the example workspace when prompted. In `client/client.go`, press **F12** on `Bonus` to jump to its declaration, or press **F2** and rename it to `Award` to update three files. To try a rejected rename, open `Capture` in `api/api.go` and rename `result` to `total`. The server reports the reference whose binding would change. Run `go test ./...` in the example's terminal to check your edits. [GoLand and rs-gopls rename results](docs/goland-rename-baseline.md)
+Trust the example workspace when prompted. In `client/client.go`, press **F12** on `Bonus` to jump to its declaration, or press **F2** and rename it to `Award` to update three files. To try a rejected rename, open `Capture` in `api/api.go` and rename `result` to `total`. The server reports the reference whose binding would change. Run `go test ./...` in the example's terminal to check your edits.
 
 ## Test in Zed on Windows
 

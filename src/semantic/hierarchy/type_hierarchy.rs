@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use lsp_types::{Position, SymbolKind, TypeHierarchyItem, Uri};
@@ -10,7 +10,9 @@ use super::{
     BATCH_TIME, Hierarchy, Location, SearchResults, declaration_at, document, in_package, walk,
 };
 use crate::protocol::path_uri;
-use crate::semantic::implementation::ImplementationSearch;
+use crate::semantic::implementation::{
+    ImplementationSearch, InterfaceSources, TypeHierarchyDirection, stats,
+};
 use crate::semantic::index::active_package;
 use crate::semantic::resolver::{MAX_TYPE_DEPTH, Resolver, TypeKind};
 use crate::semantic::snapshot::EngineSnapshot;
@@ -177,41 +179,41 @@ fn type_name(mut ty: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn embedded_names(ty: Node<'_>) -> Vec<Node<'_>> {
-    let list = match ty.kind() {
-        "interface_type" => ty,
-        "struct_type" => {
-            let Some(fields) = ty
-                .named_children(&mut ty.walk())
-                .find(|node| node.kind() == "field_declaration_list")
-            else {
-                return Vec::new();
-            };
-            fields
-        }
-        _ => return Vec::new(),
+    if ty.kind() == "interface_type" {
+        return ty
+            .named_children(&mut ty.walk())
+            .filter(|element| element.kind() == "type_elem")
+            .filter_map(|element| {
+                let mut cursor = element.walk();
+                let mut terms = element
+                    .named_children(&mut cursor)
+                    .filter(|term| !term.is_extra());
+                let term = terms.next()?;
+                if terms.next().is_some() {
+                    return None;
+                }
+                type_name(term)
+            })
+            .collect();
+    }
+    let Some(fields) = ty
+        .named_children(&mut ty.walk())
+        .find(|node| node.kind() == "field_declaration_list")
+    else {
+        return Vec::new();
     };
-    list.named_children(&mut list.walk())
-        .filter_map(|element| {
-            let ty = match element.kind() {
-                "field_declaration" if element.child_by_field_name("name").is_none() => {
-                    element.child_by_field_name("type")?
-                }
-                "type_elem" => {
-                    let mut cursor = element.walk();
-                    let mut terms = element
-                        .named_children(&mut cursor)
-                        .filter(|term| !term.is_extra());
-                    let term = terms.next()?;
-                    if terms.next().is_some() {
-                        return None;
-                    }
-                    term
-                }
-                _ => return None,
-            };
-            type_name(ty)
+    fields
+        .named_children(&mut fields.walk())
+        .filter(|field| {
+            field.kind() == "field_declaration" && field.child_by_field_name("name").is_none()
         })
+        .filter_map(|field| type_name(field.child_by_field_name("type")?))
         .collect()
+}
+
+fn is_local_type(spec: Node<'_>) -> bool {
+    std::iter::successors(spec.parent(), Node::parent)
+        .any(|ancestor| ancestor.kind() == "statement_list")
 }
 
 struct TypeShape {
@@ -219,6 +221,7 @@ struct TypeShape {
     identity: Location,
     body: Location,
     kind: SymbolKind,
+    empty_interface_body: bool,
 }
 
 struct TypeRelations<'w, 'idx> {
@@ -278,6 +281,10 @@ impl<'w, 'idx> TypeRelations<'w, 'idx> {
                 identity: identity.unwrap_or_else(|| body.clone()),
                 body,
                 kind: type_kind(ty),
+                empty_interface_body: ty.kind() == "interface_type"
+                    && ty
+                        .named_children(&mut ty.walk())
+                        .all(|node| node.is_extra()),
             }));
         }
         Ok(None)
@@ -311,20 +318,28 @@ fn insert_item(items: &mut Items, item: TypeHierarchyItem) {
     items.insert((item.uri.clone(), item.selection_range.start), item);
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Direction {
-    Super,
-    Sub,
-}
-
 struct EmbeddingSearch {
     target: TypeShape,
-    files: Vec<PathBuf>,
+    files: Option<Vec<PathBuf>>,
     candidates: Vec<Location>,
+    elapsed: Option<Duration>,
 }
 
 impl EmbeddingSearch {
-    fn new(target: TypeShape, relations: &TypeRelations<'_, '_>) -> Self {
+    fn new(target: TypeShape) -> Self {
+        Self {
+            target,
+            files: None,
+            candidates: Vec::new(),
+            elapsed: stats::clock().map(|_| Duration::ZERO),
+        }
+    }
+
+    fn files(
+        &self,
+        relations: &mut TypeRelations<'_, '_>,
+        sources: &InterfaceSources,
+    ) -> Result<Vec<PathBuf>> {
         let workspace = relations.resolver.workspace;
         let mut files = workspace.project_symbol_files();
         for ((directory, _), paths) in &relations.resolver.indexes.drafts {
@@ -334,18 +349,33 @@ impl EmbeddingSearch {
                 }
             }
         }
-        Self {
-            target,
-            files: files.into_values().collect(),
-            candidates: Vec::new(),
+        let (path, range) = &self.target.identity;
+        if let Some(origin) = relations.resolver.indexes.reference_source(path)?
+            && let Some(spec) = declaration_at(origin.as_ref(), range.start)
+            && let Some(name) = spec.child_by_field_name("name")
+            && let Some(indexed) = sources.embedding_files(
+                workspace,
+                path,
+                node_text(name, &origin.as_ref().text),
+                self.target.kind == SymbolKind::INTERFACE,
+            )
+        {
+            files.retain(|key, _| indexed.contains(key));
         }
+        Ok(files.into_values().collect())
     }
 
     fn advance(
         &mut self,
         relations: &mut TypeRelations<'_, '_>,
+        sources: &InterfaceSources,
         items: &mut Items,
     ) -> Result<bool> {
+        let started = self.elapsed.map(|_| Instant::now());
+        if self.files.is_none() {
+            self.files = Some(self.files(relations, sources)?);
+        }
+        let files = self.files.as_mut().unwrap();
         if let Some(candidate) = self.candidates.pop() {
             for parent in relations.parents(&candidate)? {
                 if same_type(&parent, &self.target.identity)
@@ -361,19 +391,21 @@ impl EmbeddingSearch {
                     break;
                 }
             }
-        } else if let Some(file) = self.files.pop()
+        } else if let Some(file) = files.pop()
             && let Some(origin) = relations.resolver.indexes.reference_source(&file)?
         {
             let source = origin.as_ref();
-            let kind = if self.target.kind == SymbolKind::INTERFACE {
-                SymbolKind::INTERFACE
+            let interface = self.target.kind == SymbolKind::INTERFACE;
+            let syntax = if interface {
+                "interface_type"
             } else {
-                SymbolKind::STRUCT
+                "struct_type"
             };
             walk(source.tree.root_node(), |node| {
                 if is_type_declaration(node)
+                    && (!interface || is_local_type(node))
                     && type_syntax(node)
-                        .is_some_and(|ty| type_kind(ty) == kind && !embedded_names(ty).is_empty())
+                        .is_some_and(|ty| ty.kind() == syntax && !embedded_names(ty).is_empty())
                     && let Some(name) = node.child_by_field_name("name")
                 {
                     self.candidates.push((file.clone(), source.range(name)));
@@ -381,13 +413,22 @@ impl EmbeddingSearch {
                 Ok(())
             })?;
         }
-        Ok(self.candidates.is_empty() && self.files.is_empty())
+        let done = self.candidates.is_empty() && files.is_empty();
+        if let (Some(elapsed), Some(started)) = (&mut self.elapsed, started) {
+            *elapsed += started.elapsed();
+            if done {
+                eprintln!(
+                    "rs-gopls-wp2 {{\"kind\":\"embeddings\",\"scan_us\":{}}}",
+                    elapsed.as_micros()
+                );
+            }
+        }
+        Ok(done)
     }
 }
 
 pub(crate) struct TypeHierarchyTask {
     generation: u64,
-    direction: Direction,
     implementations: SearchResults<ImplementationSearch>,
     embeddings: Option<EmbeddingSearch>,
     items: Items,
@@ -397,27 +438,27 @@ pub(crate) fn supertypes(
     engine: &mut Engine,
     item: &TypeHierarchyItem,
 ) -> Result<QueryProgress<Option<Vec<TypeHierarchyItem>>, TypeHierarchyTask>> {
-    related_types(engine, item, Direction::Super)
+    related_types(engine, item, TypeHierarchyDirection::Super)
 }
 
 pub(crate) fn subtypes(
     engine: &mut Engine,
     item: &TypeHierarchyItem,
 ) -> Result<QueryProgress<Option<Vec<TypeHierarchyItem>>, TypeHierarchyTask>> {
-    related_types(engine, item, Direction::Sub)
+    related_types(engine, item, TypeHierarchyDirection::Sub)
 }
 
 fn related_types(
     engine: &mut Engine,
     item: &TypeHierarchyItem,
-    direction: Direction,
+    direction: TypeHierarchyDirection,
 ) -> Result<QueryProgress<Option<Vec<TypeHierarchyItem>>, TypeHierarchyTask>> {
     let Some((path, start)) =
         Hierarchy::Type.anchor(&item.uri, item.selection_range, item.data.as_ref())?
     else {
         return Ok(QueryProgress::Ready(None));
     };
-    let require_tests = direction == Direction::Sub || is_test_source(&path);
+    let require_tests = direction == TypeHierarchyDirection::Sub || is_test_source(&path);
     engine.include_tests |= require_tests;
     let mut snapshot = engine.snapshot();
     let workspace = match snapshot.active_graph(require_tests) {
@@ -430,10 +471,10 @@ fn related_types(
         return Ok(QueryProgress::Ready(None));
     };
     let source = origin.as_ref();
-    let Some(name) = declaration_at(source, start)
-        .filter(|node| is_type_declaration(*node))
-        .and_then(|spec| spec.child_by_field_name("name"))
-    else {
+    let Some(spec) = declaration_at(source, start).filter(|node| is_type_declaration(*node)) else {
+        return Ok(QueryProgress::Ready(None));
+    };
+    let Some(name) = spec.child_by_field_name("name") else {
         return Ok(QueryProgress::Ready(None));
     };
     let selection = source.range(name);
@@ -444,11 +485,23 @@ fn related_types(
         return Ok(QueryProgress::Ready(None));
     };
     let interface = shape.kind == SymbolKind::INTERFACE;
+    let local_interface = interface && is_local_type(spec);
     let mut items = Items::new();
-    let (embeddings, search_implementations) = match direction {
-        Direction::Super => {
+    let (embeddings, progress) = match direction {
+        _ if shape.empty_interface_body => return Ok(QueryProgress::Ready(Some(Vec::new()))),
+        _ if interface && !local_interface => {
+            let Some(progress) = engine.interface_hierarchy(&path, start, direction)? else {
+                return Ok(QueryProgress::Ready(Some(Vec::new())));
+            };
+            // The package index covers structural candidates. Function-local
+            // declarations retain their direct embedding edges.
+            let embeddings =
+                (direction == TypeHierarchyDirection::Sub).then(|| EmbeddingSearch::new(shape));
+            (embeddings, progress)
+        }
+        TypeHierarchyDirection::Super => {
             for parent in relations.parents(&shape.body)? {
-                if (!interface
+                if (!local_interface
                     || relations
                         .shape(&parent)?
                         .is_some_and(|parent| parent.kind == SymbolKind::INTERFACE))
@@ -458,14 +511,17 @@ fn related_types(
                     insert_item(&mut items, item);
                 }
             }
-            (None, !interface)
+            let progress = if local_interface {
+                QueryProgress::Ready(Vec::new())
+            } else {
+                engine.implementations(&path, start)?
+            };
+            (None, progress)
         }
-        Direction::Sub => (Some(EmbeddingSearch::new(shape, &relations)), interface),
-    };
-    let progress = if search_implementations {
-        engine.implementations(&path, start)?
-    } else {
-        QueryProgress::Ready(Vec::new())
+        TypeHierarchyDirection::Sub => (
+            Some(EmbeddingSearch::new(shape)),
+            QueryProgress::Ready(Vec::new()),
+        ),
     };
     let implementations = match SearchResults::new(progress) {
         Ok(results) => results,
@@ -476,7 +532,6 @@ fn related_types(
     } else {
         QueryProgress::Searching(TypeHierarchyTask {
             generation: engine.workspace_load().generation,
-            direction,
             implementations,
             embeddings,
             items,
@@ -494,7 +549,7 @@ impl SemanticTask<Option<Vec<TypeHierarchyItem>>> for TypeHierarchyTask {
             self.implementations.advance(engine)?;
             return Ok(self.implementations.is_empty() && self.embeddings.is_none());
         }
-        let mut snapshot = engine.snapshot();
+        let mut snapshot = engine.state.snapshot(engine.include_tests);
         let workspace = snapshot
             .workspace()
             .context("type hierarchy needs a workspace")?;
@@ -502,18 +557,15 @@ impl SemanticTask<Option<Vec<TypeHierarchyItem>>> for TypeHierarchyTask {
         let started = Instant::now();
         for _ in 0..32 {
             if let Some(location) = self.implementations.locations.pop() {
-                // Implementation search also returns structurally compatible interfaces.
-                // Only explicit embedding makes one interface a child of another.
-                if (self.direction == Direction::Super
-                    || relations
-                        .shape(&location)?
-                        .is_some_and(|shape| shape.kind != SymbolKind::INTERFACE))
-                    && let Some(item) = item_at(&mut relations.resolver, &location)?
-                {
+                if let Some(item) = item_at(&mut relations.resolver, &location)? {
                     insert_item(&mut self.items, item);
                 }
             } else if let Some(search) = &mut self.embeddings {
-                if search.advance(&mut relations, &mut self.items)? {
+                if search.advance(
+                    &mut relations,
+                    &engine.implementation_sources,
+                    &mut self.items,
+                )? {
                     self.embeddings = None;
                 }
             } else {

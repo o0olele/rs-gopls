@@ -167,7 +167,9 @@ fn serve(connection: &Connection) -> Result<()> {
     loop {
         let (search_receiver, completion_wake) = match &state {
             State::Running(running) => (
-                if running.scheduler.ready_search(&running.engine).is_some() {
+                if running.scheduler.ready_search(&running.engine).is_some()
+                    || running.engine.implementation_index_pending()
+                {
                     &search_ready
                 } else {
                     &search_idle
@@ -218,7 +220,11 @@ fn serve(connection: &Connection) -> Result<()> {
             recv(search_receiver) -> ready => {
                 ready.context("receiving navigation search work")?;
                 if let State::Running(running) = &mut state {
-                    running.advance_search(connection)?;
+                    if running.scheduler.ready_search(&running.engine).is_some() {
+                        running.advance_search(connection)?;
+                    } else {
+                        running.engine.advance_implementation_index();
+                    }
                 }
                 search_token.send(()).context("scheduling further navigation searches")?;
             }

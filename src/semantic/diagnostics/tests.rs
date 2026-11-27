@@ -733,6 +733,194 @@ fn repaired_go_list_parse_error_disappears_before_the_file_is_saved() {
 }
 
 #[test]
+fn positionless_import_cycle_belongs_to_its_canonical_package() {
+    let project = TestProject::new();
+    let module = "module example.test/same\n\ngo 1.24\n";
+    project.write("a-healthy/go.mod", module);
+    project.write("b-broken/go.mod", module);
+    let healthy = project.write("a-healthy/sample.go", "package sample\n");
+    let text = "package sample\nimport _ \"example.test/same/child\"\n";
+    let broken = project.write("b-broken/sample.go", text);
+    project.write(
+        "b-broken/child/child.go",
+        "package child\nimport _ \"example.test/same\"\n",
+    );
+    let roots = ["a-healthy", "b-broken"].map(|dir| project.root.join(dir));
+    let graph = Workspace::load_roots(&roots, false).unwrap();
+    let broken_id = &graph.package_of_file(&broken).unwrap().id;
+    assert_ne!(broken_id, &graph.package_of_file(&healthy).unwrap().id);
+    assert_ne!(broken_id, "example.test/same");
+    assert!(graph.package_errors().iter().any(|error| {
+        error.package_id.as_ref() == Some(broken_id)
+            && error.path.is_none()
+            && error.message.contains("import cycle")
+    }));
+    let mut engine = Engine::with_roots(roots.to_vec());
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    let healthy = analyze_file(&mut engine, &healthy);
+    assert!(healthy.items.is_empty(), "{:#?}", healthy.items);
+    let broken = analyze_file(&mut engine, &broken);
+    let cycle = item_at(
+        &broken,
+        text,
+        PackageLoad,
+        "package sample",
+        "package sample",
+    );
+    assert!(cycle.message.contains("import cycle"), "{cycle:?}");
+}
+
+#[test]
+fn unsaved_imports_use_error_evidence_from_the_owners_build_group() {
+    let project = TestProject::new();
+    project.write(
+        "healthy/go.mod",
+        "module example.test/same\n\ngo 1.24\n\nrequire example.test/local v0.0.0\nreplace example.test/local => ../local\n",
+    );
+    project.write("broken/go.mod", "module example.test/same\n\ngo 1.24\n");
+    project.write("local/go.mod", "module example.test/local\n\ngo 1.24\n");
+    let local = project.write("local/known/known.go", "package known\nconst Value = 1\n");
+    project.write("local/unsaved/unsaved.go", "package unsaved\n");
+    project.write(
+        "healthy/anchor/anchor.go",
+        "package anchor\nimport _ \"example.test/local/known\"\n",
+    );
+    let healthy = project.write("healthy/sample.go", "package sample\n");
+    let broken_text = "package sample\nimport _ \"example.test/local/unsaved\"\n";
+    let broken = project.write("broken/sample.go", broken_text);
+    let roots = ["healthy", "broken"].map(|dir| project.root.join(dir));
+    let graph = Workspace::load_roots(&roots, false).unwrap();
+    let owner = graph.package_of_file(&healthy).unwrap();
+    let known = graph
+        .resolve_import(owner, "example.test/local/known")
+        .unwrap();
+    assert_eq!(known.files.len(), 1);
+    assert_eq!(path_key(&known.files[0]), path_key(&local));
+    assert!(
+        graph
+            .resolve_import(owner, "example.test/local/unsaved")
+            .is_none()
+    );
+    let mut engine = Engine::with_roots(roots.to_vec());
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    engine
+        .open(
+            healthy.clone(),
+            "package sample\nimport \"example.test/local/known\"\nimport _ \"example.test/local/unsaved\"\nvar _ = known.Value\n".into(),
+            1,
+        )
+        .unwrap();
+    engine.open(broken.clone(), broken_text.into(), 1).unwrap();
+    let healthy = analyze_file(&mut engine, &healthy);
+    assert!(healthy.items.is_empty(), "{:#?}", healthy.items);
+    let broken = analyze_file(&mut engine, &broken);
+    item_at(
+        &broken,
+        broken_text,
+        ImportInvalid,
+        "\"example.test/local/unsaved\"",
+        "\"example.test/local/unsaved\"",
+    );
+}
+
+#[test]
+fn test_variant_cycle_stays_off_shared_ordinary_and_external_test_files() {
+    let project = TestProject::new();
+    project.write("go.mod", "module example.test/sample\n\ngo 1.24\n");
+    let ordinary = project.write("sample.go", "package sample\n");
+    let test_text = "package sample\nimport _ \"example.test/sample/child\"\n";
+    let test = project.write("sample_test.go", test_text);
+    let external = project.write("external_test.go", "package sample_test\n");
+    let child = project.write(
+        "child/child.go",
+        "package child\nimport _ \"example.test/sample\"\n",
+    );
+    let graph = Workspace::load(&project.root, true).unwrap();
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    for good in [ordinary, external, child] {
+        let report = analyze_file(&mut engine, &good);
+        assert!(
+            report.items.iter().all(|item| item.code != PackageLoad),
+            "{good:?}: {:#?}",
+            report.items
+        );
+    }
+    let report = analyze_file(&mut engine, &test);
+    let cycle = item_at(
+        &report,
+        test_text,
+        PackageLoad,
+        "package sample",
+        "package sample",
+    );
+    assert!(cycle.message.contains("import cycle"), "{cycle:?}");
+}
+
+#[test]
+fn group_load_failure_is_visible_in_its_source_documents() {
+    let project = TestProject::new();
+    project.write(
+        "healthy/go.mod",
+        "module example.test/healthy\n\ngo 1.24\n\nrequire example.test/broken v0.0.0\nreplace example.test/broken => ../broken\n",
+    );
+    let healthy = project.write(
+        "healthy/sample.go",
+        "package sample\nimport _ \"example.test/broken\"\n",
+    );
+    project.write("broken/go.mod", "module example.test/broken\n\ngo 1.24\n");
+    project.write("broken/go.work", "go 1.24\ninvalid_group_setting 1\n");
+    let broken = project.write("broken/sample.go", "package sample\n");
+    let roots = ["healthy", "broken"].map(|dir| project.root.join(dir));
+    let graph = Workspace::load_roots(&roots, false).unwrap();
+    // The unhealthy root is still a usable replacement in the healthy build.
+    assert!(graph.package_of_file(&broken).is_some());
+    let mut engine = Engine::with_roots(roots.to_vec());
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    let healthy = analyze_file(&mut engine, &healthy);
+    assert!(healthy.items.is_empty(), "{:#?}", healthy.items);
+    let broken = analyze_file(&mut engine, &broken);
+    let item = item_at(
+        &broken,
+        "package sample\n",
+        PackageLoad,
+        "package sample",
+        "package sample",
+    );
+    assert!(item.message.contains("invalid_group_setting"), "{item:?}");
+}
+
+#[test]
+fn positioned_package_errors_can_reach_unindexed_local_dependencies() {
+    let project = TestProject::new();
+    project.write(
+        "app/go.mod",
+        "module example.test/app\n\ngo 1.22\n\nrequire example.test/local v0.0.0\nreplace example.test/local => ../local\n",
+    );
+    project.write(
+        "app/app.go",
+        "package app\nimport _ \"example.test/local\"\n",
+    );
+    project.write("local/go.mod", "module example.test/local\n\ngo 1.22\n");
+    let broken = project.write("local/local.go", "package 123\n");
+    let root = project.root.join("app");
+    let graph = Workspace::load(&root, false).unwrap();
+    assert!(graph.package_of_file(&broken).is_none());
+    assert!(graph.group_for_path(&broken).is_none());
+    let mut engine = Engine::new(root);
+    assert!(engine.install_workspace(engine.workspace_load(), graph));
+    let report = analyze_file(&mut engine, &broken);
+    assert!(
+        report
+            .items
+            .iter()
+            .any(|item| { item.code == PackageLoad && item.range.start == Position::new(0, 8) }),
+        "{:#?}",
+        report.items
+    );
+}
+
+#[test]
 fn escaped_imports_do_not_suggest_importing_an_existing_qualifier() {
     let text = r#"package sample
 import "ma\x74h"

@@ -266,7 +266,10 @@ fn fixture_types_combine_implementations_with_direct_embedding() {
     );
     assert_eq!(parents(&mut engine, &reader), Vec::<String>::new());
     assert_eq!(parents(&mut engine, &read_closer), ["Reader"]);
-    assert_eq!(parents(&mut engine, &service), ["ReadCloser"]);
+    assert_eq!(
+        parents(&mut engine, &service),
+        ["Reader", "ReadCloser", "Resetter"]
+    );
     assert_eq!(
         parents(&mut engine, &derived),
         ["Reader", "ReadCloser", "Service", "Resetter", "Base"]
@@ -274,7 +277,7 @@ fn fixture_types_combine_implementations_with_direct_embedding() {
     assert_eq!(parents(&mut engine, &alias), parents(&mut engine, &derived));
     assert_eq!(
         children(&mut engine, &reader),
-        ["ReadCloser", "Base", "Derived", "Alias"]
+        ["ReadCloser", "Service", "Base", "Derived", "Alias"]
     );
     assert_eq!(
         children(&mut engine, &read_closer),
@@ -289,6 +292,320 @@ fn at(text: &str, marker: &str) -> Position {
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
     let column = prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32;
     Position::new(line, column)
+}
+
+#[test]
+fn interface_hierarchy_matches_structural_method_sets_in_both_directions() {
+    let project = TestProject::new();
+    let text = r#"package sample
+type (
+	Small interface { Read() int }
+	Middle interface { Small; Close() }
+	Full interface { Middle; Reset() }
+	Independent interface { Reset() }
+	/* 🙂 */ 接口别名 = Small
+	/* 🙂 */ 定义接口 Small
+	/* 🙂 */ 具体别名 = Concrete
+	Wrong interface { Read() string }
+	Concrete struct{}
+	DefinedConcrete Concrete
+	Embedded struct { Concrete }
+	DefinedEmbedded Embedded
+)
+func (Concrete) Read() int { return 0 }
+"#;
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], true)
+    ));
+    let mut prepare =
+        |marker| single(prepare_type_hierarchy(&mut engine, &path, at(text, marker)).unwrap());
+    let small = prepare("Small interface");
+    let middle = prepare("Middle interface");
+    let full = prepare("Full interface");
+    let independent = prepare("Independent interface");
+    let alias = prepare("接口别名");
+    let defined = prepare("定义接口");
+    let concrete_alias = prepare("具体别名");
+    let concrete = prepare("Concrete struct");
+    let embedded = prepare("Embedded struct");
+    let defined_embedded = prepare("DefinedEmbedded Embedded");
+    assert_eq!(alias.selection_range, span(6, 10, 14));
+    assert_eq!(defined.selection_range, span(7, 10, 14));
+    assert_eq!(concrete_alias.selection_range, span(8, 10, 14));
+
+    let progress = supertypes(&mut engine, &full).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [
+            small.clone(),
+            middle.clone(),
+            independent,
+            alias.clone(),
+            defined.clone()
+        ]
+    );
+    let progress = subtypes(&mut engine, &small).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [
+            middle,
+            full,
+            alias.clone(),
+            defined.clone(),
+            concrete_alias,
+            concrete,
+            embedded,
+            defined_embedded
+        ]
+    );
+    let progress = supertypes(&mut engine, &alias).unwrap();
+    assert_eq!(complete(&mut engine, progress).unwrap(), [small, defined]);
+}
+
+#[test]
+fn interface_hierarchy_keeps_the_declaring_package_of_private_methods() {
+    let project = TestProject::new();
+    let contract_text = "package contract\ntype Sealed interface { seal() }\n";
+    let contract = project.write("contract/contract.go", contract_text);
+    let adapter_text = concat!(
+        "package adapter\nimport \"contract\"\n",
+        "type Relay interface { contract.Sealed }\n",
+        "type Extension interface { Relay; Public() }\n",
+        "type Lookalike interface { seal() }\n",
+        "type Wrapper struct { contract.Sealed }\n",
+    );
+    let adapter = project.write("adapter/adapter.go", adapter_text);
+    let listing = [
+        json!({"Dir": contract.parent(), "ImportPath": "contract", "Name": "contract", "GoFiles": ["contract.go"]}),
+        json!({"Dir": adapter.parent(), "ImportPath": "adapter", "Name": "adapter", "GoFiles": ["adapter.go"], "Imports": ["contract"]}),
+    ]
+    .map(|package| package.to_string())
+    .join("\n");
+    let mut engine = Engine::new(project.root.clone());
+    let workspace =
+        Workspace::from_test_listing(std::slice::from_ref(&project.root), &listing, true);
+    assert!(engine.install_workspace(engine.workspace_load(), workspace));
+    let sealed = single(
+        prepare_type_hierarchy(&mut engine, &contract, at(contract_text, "Sealed")).unwrap(),
+    );
+    let mut prepare = |name| {
+        single(prepare_type_hierarchy(&mut engine, &adapter, at(adapter_text, name)).unwrap())
+    };
+    let relay = prepare("Relay");
+    let extension = prepare("Extension");
+    let wrapper = prepare("Wrapper");
+
+    let progress = supertypes(&mut engine, &extension).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [relay.clone(), sealed.clone()]
+    );
+    let progress = subtypes(&mut engine, &sealed).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [relay, extension, wrapper]
+    );
+}
+
+#[test]
+fn local_interface_embedding_resolves_the_nearest_type_declaration() {
+    let project = TestProject::new();
+    let text = r#"package sample
+type Parent interface{ Global() }
+func local() {
+	type Parent interface{ Local() }
+	type Child interface{ Parent }
+}
+func another() {
+	type GlobalChild interface{ Parent }
+}
+"#;
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], true)
+    ));
+    let mut prepare =
+        |marker| single(prepare_type_hierarchy(&mut engine, &path, at(text, marker)).unwrap());
+    let global_parent = prepare("Parent interface{ Global");
+    let local_parent = prepare("Parent interface{ Local");
+    let local_child = prepare("Child interface");
+    let global_child = prepare("GlobalChild interface");
+
+    let progress = supertypes(&mut engine, &local_child).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [local_parent.clone()]
+    );
+    let progress = subtypes(&mut engine, &local_parent).unwrap();
+    assert_eq!(complete(&mut engine, progress).unwrap(), [local_child]);
+    let progress = subtypes(&mut engine, &global_parent).unwrap();
+    assert_eq!(complete(&mut engine, progress).unwrap(), [global_child]);
+}
+
+#[test]
+fn interface_hierarchy_matches_the_builtin_error_method_set() {
+    let project = TestProject::new();
+    let text = r#"package sample
+type Sequence interface{ error; Reset() }
+type Alias = error
+type Defined error
+type Independent interface{ Error() string }
+type Direct struct{}
+func (Direct) Error() string { return "" }
+func (Direct) Reset() {}
+type Promoted struct{ error }
+func (Promoted) Reset() {}
+type ResetOnly struct{}
+func (ResetOnly) Reset() {}
+type Wrong struct{}
+func (Wrong) Error() int { return 0 }
+func (Wrong) Reset() {}
+"#;
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], true)
+    ));
+    let mut prepare =
+        |marker| single(prepare_type_hierarchy(&mut engine, &path, at(text, marker)).unwrap());
+    let sequence = prepare("Sequence");
+    let alias = prepare("Alias");
+    let defined = prepare("Defined");
+    let independent = prepare("Independent");
+    let direct = prepare("Direct");
+    let promoted = prepare("Promoted");
+
+    let progress = supertypes(&mut engine, &sequence).unwrap();
+    let user_types = complete(&mut engine, progress)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.uri == sequence.uri)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_types,
+        [alias.clone(), defined.clone(), independent.clone()]
+    );
+
+    let progress = subtypes(&mut engine, &sequence).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [direct.clone(), promoted.clone()]
+    );
+    let progress = subtypes(&mut engine, &independent).unwrap();
+    assert_eq!(
+        complete(&mut engine, progress).unwrap(),
+        [sequence, alias, defined, direct, promoted]
+    );
+}
+
+#[test]
+fn empty_interface_hierarchy_returns_without_starting_a_search() {
+    let project = TestProject::new();
+    let text = concat!(
+        "package sample\n",
+        "type Empty interface{}\n",
+        "type Embedded interface{ Empty }\n",
+        "type AnyAlias = any\n",
+        "type AnyDefined any\n",
+        "type Concrete struct{}\n",
+    );
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], true)
+    ));
+    for marker in [
+        "Empty interface",
+        "Embedded interface",
+        "AnyAlias",
+        "AnyDefined",
+    ] {
+        let item = single(prepare_type_hierarchy(&mut engine, &path, at(text, marker)).unwrap());
+        assert!(
+            matches!(
+                supertypes(&mut engine, &item).unwrap(),
+                QueryProgress::Ready(Some(items)) if items.is_empty()
+            ),
+            "unexpected supertypes for {marker}"
+        );
+        assert!(
+            matches!(
+                subtypes(&mut engine, &item).unwrap(),
+                QueryProgress::Ready(Some(items)) if items.is_empty()
+            ),
+            "unexpected subtypes for {marker}"
+        );
+    }
+}
+
+#[test]
+fn nested_function_literals_belong_to_the_outer_named_function_or_method() {
+    let project = TestProject::new();
+    let text = r#"package sample
+func Leaf() {}
+type Worker struct{}
+func Outer() {
+	closure := func() { _ = "🙂"; Leaf() }
+	closure()
+}
+func (Worker) Work() {
+	func() { _ = "🙂"; Leaf(); func() { Leaf() }() }()
+}
+var global = func() { Leaf() }
+"#;
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], true)
+    ));
+    let mut prepare =
+        |name| single(prepare_call_hierarchy(&mut engine, &path, at(text, name)).unwrap());
+    let leaf = prepare("Leaf");
+    let outer = prepare("Outer");
+    let work = prepare("Work()");
+    assert_eq!(outer.kind, SymbolKind::FUNCTION);
+    assert_eq!(
+        (work.name.as_str(), work.kind),
+        ("(Worker).Work", SymbolKind::METHOD)
+    );
+
+    let outer_ranges = vec![span(4, 31, 35)];
+    let work_ranges = vec![span(8, 20, 24), span(8, 37, 41)];
+    assert_eq!(
+        callers(&mut engine, &leaf),
+        [
+            CallHierarchyIncomingCall {
+                from: outer.clone(),
+                from_ranges: outer_ranges.clone()
+            },
+            CallHierarchyIncomingCall {
+                from: work.clone(),
+                from_ranges: work_ranges.clone()
+            },
+        ]
+    );
+    assert_eq!(
+        callees(&mut engine, &outer),
+        [CallHierarchyOutgoingCall {
+            to: leaf.clone(),
+            from_ranges: outer_ranges
+        }]
+    );
+    assert_eq!(
+        callees(&mut engine, &work),
+        [CallHierarchyOutgoingCall {
+            to: leaf,
+            from_ranges: work_ranges
+        }]
+    );
 }
 
 #[test]
@@ -431,14 +748,17 @@ fn external_test_package_resolves_generic_calls_pointer_methods_and_embedded_ali
     assert_eq!(test_only.range.start, test_only.selection_range.start);
     assert!(parents(&mut engine, &test_only).contains(&"LocalBase".to_owned()));
     let child = single(prepare_type_hierarchy(&mut engine, &path, at(&text, "TestChild")).unwrap());
-    assert_eq!(parents(&mut engine, &child), ["LocalReader"]);
-    let names = children(&mut engine, &reader);
-    assert!(names.iter().any(|name| name == "TestChild"));
-    assert!(
-        !names
-            .iter()
-            .any(|name| matches!(name.as_str(), "Indirect" | "Twin" | "LocalReader"))
+    assert_eq!(
+        parents(&mut engine, &child),
+        ["LocalReader", "Indirect", "Twin", "Reader"]
     );
+    let names = children(&mut engine, &reader);
+    for expected in ["LocalReader", "TestChild", "Indirect", "Twin"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "missing {expected}"
+        );
+    }
     let constraint =
         single(prepare_type_hierarchy(&mut engine, &path, at(&text, "Constraint")).unwrap());
     assert!(parents(&mut engine, &constraint).is_empty());

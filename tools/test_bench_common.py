@@ -5,12 +5,13 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from bench_common import (
-    apply_text_edits, describe_binary, normalize_capture, normalize_path, percentile,
-    relative_uri, resolve_goland_exe, summarize,
+    EDIT_PREFIX, Fixture, apply_text_edits, describe_binary, goland_timings, normalize_capture,
+    normalize_path, percentile, relative_uri, resolve_goland_exe, summarize, write_json,
 )
 
 
@@ -80,6 +81,33 @@ class BenchCommonTests(unittest.TestCase):
         with patch.dict(os.environ, {"GOLAND_EXE": ""}):
             with self.assertRaisesRegex(ValueError, "--goland or GOLAND_EXE"):
                 resolve_goland_exe(None)
+
+    def test_live_capture_uses_requested_iteration_count(self):
+        class SampleFixture(Fixture):
+            track = "sample"
+            default_method = "sample/request"
+            capture_fields = ()
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            (workspace / "sample.go").write_text("package sample\n", encoding="utf-8")
+            row = {"id": "sample", "path": "sample.go"}
+            spec = {"build": "sample-build", "cases": [row]}
+            write_json(workspace / "sample-queries.json", spec)
+            args = SimpleNamespace(workspace=workspace, fixture=None, timeout=60, capture_goland=True,
+                                   goland=sys.executable, goland_bench=None, iterations=3)
+            capture = {"build": spec["build"], "cases": [row]}
+            with patch("bench_common.capture_goland", return_value=capture) as run_capture:
+                fixture = SampleFixture(args)
+            run_capture.assert_called_once_with(Path(sys.executable).resolve(), "sample", workspace,
+                                               {**spec, "iterations": 3}, 60)
+            self.assertEqual(fixture.spec, spec)
+
+    def test_goland_timings_replay_all_verified_edit_samples(self):
+        row = {"id": "sample", "firstMs": 3, "timingsMs": [1, 2], "afterEditTimingsMs": [4, 5]}
+        self.assertEqual(goland_timings({"editPrefix": EDIT_PREFIX}, row),
+                         {"first": [3], "warm": [1, 2], "after_edit": [4, 5]})
+        self.assertEqual(goland_timings({}, row)["after_edit"], [])
 
 
 if __name__ == "__main__":
