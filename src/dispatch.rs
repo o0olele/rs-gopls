@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -32,13 +32,13 @@ use crate::protocol::{
     serialize_locations, serialize_query,
 };
 use crate::scheduler::{DeferredQuery, DiagnosticConsumer, RequestProgress, Scheduler, SearchTask};
-use crate::semantic::actions::needs_diagnostics;
+use crate::semantic::actions::supports_code_actions;
 use crate::semantic::completion::{
-    CompletionClientCapabilities, ResolveCompletionResult, StaleCompletion, Trace,
+    CompletionClientCapabilities, CompletionResolve, ResolveCompletionResult, StaleCompletion,
 };
 use crate::semantic::rename::{RenameError, RenameResult};
 use crate::semantic::{
-    DefinitionKind, EditorFoldingOptions, Engine, QueryProgress, SemanticTask,
+    DefinitionKind, EditorFoldingOptions, Engine, QueryProgress, QueryReadMemo, SemanticTask,
     semantic_tokens_legend,
 };
 use crate::{rpc_telemetry, telemetry};
@@ -274,7 +274,8 @@ pub(super) fn handle(
     client: ClientFeatures,
     request: Request,
 ) -> Result<()> {
-    if (scheduler.watching_files() || engine.has_pending_open_parses())
+    if request.method != Completion::METHOD
+        && (scheduler.watching_files() || engine.has_pending_open_parses())
         && client.supports(&request.method)
         && telemetry_method(&request.method).is_some()
         && let Some(scope) = OpenRequestScope::for_request(&request)
@@ -354,6 +355,7 @@ impl OpenRequestScope {
             | InlayHintRequest::METHOD
             | FoldingRangeRequest::METHOD
             | DocumentDiagnosticRequest::METHOD
+            | CodeActionRequest::METHOD
             | Formatting::METHOD => Self::Document(path?),
             References::METHOD => Self::References(path?),
             _ => Self::Dependencies(path?),
@@ -630,17 +632,84 @@ fn request_definition(
     params: Value,
     kind: DefinitionKind,
 ) -> Result<()> {
-    context.document_query(
-        id,
-        document_position(params).map(|(path, position)| (path, (position, kind))),
-        |engine, path, &(position, kind)| {
-            Ok(adapt(
-                engine.definition(path, position, kind)?,
+    navigation_query(context, id, params, NavigationOperation::Definition(kind))
+}
+
+enum NavigationOperation {
+    Definition(DefinitionKind),
+    Hover,
+}
+
+struct NavigationQuery {
+    path: PathBuf,
+    position: Position,
+    operation: NavigationOperation,
+    hover_fallback: Cell<bool>,
+    memo: QueryReadMemo,
+}
+
+impl DeferredQuery for NavigationQuery {
+    fn run(&self, engine: &mut Engine) -> Result<RequestProgress> {
+        Ok(match self.operation {
+            NavigationOperation::Definition(kind) => adapt(
+                engine.definition_foreground(&self.path, self.position, kind, &self.memo)?,
                 serialize_location,
-            ))
-        },
-        None,
-    )
+            ),
+            NavigationOperation::Hover => adapt(
+                engine.hover_foreground(
+                    &self.path,
+                    self.position,
+                    !self.hover_fallback.get(),
+                    &self.memo,
+                )?,
+                serialize_query,
+            ),
+        })
+    }
+
+    fn document_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
+
+    fn read_memo(&self) -> Option<&QueryReadMemo> {
+        Some(&self.memo)
+    }
+
+    fn load_failed_progress(&self, engine: &mut Engine, message: &str) -> Result<RequestProgress> {
+        match self.operation {
+            NavigationOperation::Hover => {
+                self.hover_fallback.set(true);
+                self.run(engine)
+            }
+            NavigationOperation::Definition(_) => Ok(QueryProgress::Ready(Err((
+                ErrorCode::RequestFailed,
+                message.into(),
+            )))),
+        }
+    }
+}
+
+fn navigation_query(
+    context: &mut RequestContext<'_>,
+    id: RequestId,
+    params: Value,
+    operation: NavigationOperation,
+) -> Result<()> {
+    match document_position(params) {
+        Ok((path, position)) => context.scheduler.submit(
+            context.engine,
+            context.connection,
+            id,
+            NavigationQuery {
+                path,
+                position,
+                operation,
+                hover_fallback: Cell::new(false),
+                memo: QueryReadMemo::default(),
+            },
+        ),
+        Err(error) => context.respond(id, Err(invalid_params(error))),
+    }
 }
 
 fn implementation(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
@@ -680,17 +749,7 @@ fn references(context: &mut RequestContext<'_>, id: RequestId, params: Value) ->
 }
 
 fn hover(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
-    context.document_query(
-        id,
-        document_position(params),
-        |engine, path, &position| Ok(adapt(engine.hover(path, position)?, serialize_query)),
-        Some(|engine, path, &position| {
-            engine
-                .hover_after_load_failure(path, position)
-                .map_err(internal_error)
-                .and_then(serialize_query)
-        }),
-    )
+    navigation_query(context, id, params, NavigationOperation::Hover)
 }
 
 fn signature_help(context: &mut RequestContext<'_>, id: RequestId, params: Value) -> Result<()> {
@@ -838,20 +897,28 @@ fn code_actions(context: &mut RequestContext<'_>, id: RequestId, params: Value) 
     match document_params(params, |p: &CodeActionParams| &p.text_document.uri) {
         Ok((path, params))
             if path.extension().is_some_and(|ext| ext == "go")
-                && needs_diagnostics(params.context.only.as_deref()) =>
+                && supports_code_actions(params.context.only.as_deref()) =>
         {
-            context.scheduler.submit_diagnostics(
-                context.engine,
-                context.connection,
-                path,
-                DiagnosticConsumer::Actions {
-                    id,
-                    uri: params.text_document.uri,
-                    range: params.range,
-                    only: params.context.only,
-                },
-                "textDocument/codeAction",
-            )
+            let uri = params.text_document.uri;
+            match context
+                .engine
+                .local_code_actions(&path, &uri, params.range, &params.context)
+            {
+                Ok(Some(actions)) => context.respond(id, serialize_query(actions)),
+                Ok(None) => context.scheduler.submit_diagnostics(
+                    context.engine,
+                    context.connection,
+                    path,
+                    DiagnosticConsumer::Actions {
+                        id,
+                        uri,
+                        range: params.range,
+                        only: params.context.only,
+                    },
+                    "textDocument/codeAction",
+                ),
+                Err(error) => context.respond(id, Err(internal_error(error))),
+            }
         }
         Ok(_) => context.respond(id, Ok(Value::Array(Vec::new()))),
         Err(error) => context.respond(id, Err(invalid_params(error))),
@@ -935,69 +1002,19 @@ fn completion(context: &mut RequestContext<'_>, id: RequestId, params: Value) ->
         let params: CompletionParams = serde_json::from_value(params)?;
         let document = params.text_document_position;
         let path = file_path(&document.text_document.uri)?;
-        Ok(CompletionQuery {
-            trace: Trace::start(&path, document.position),
+        Ok(crate::scheduler::CompletionRequest {
             path,
             position: document.position,
             caps: context.completion_capabilities,
         })
     })();
     match query {
-        Ok(query) => context
-            .scheduler
-            .submit(context.engine, context.connection, id, query),
+        Ok(query) => {
+            context
+                .scheduler
+                .submit_completion(context.engine, context.connection, id, query)
+        }
         Err(error) => context.respond(id, Err(invalid_params(error))),
-    }
-}
-
-struct CompletionQuery {
-    path: PathBuf,
-    position: Position,
-    caps: CompletionClientCapabilities,
-    trace: Option<Trace>,
-}
-
-impl DeferredQuery for CompletionQuery {
-    fn document_path(&self) -> Option<&Path> {
-        Some(&self.path)
-    }
-
-    fn is_completion(&self) -> bool {
-        true
-    }
-
-    fn run(&self, engine: &mut Engine) -> Result<RequestProgress> {
-        let result =
-            engine.complete_traced(&self.path, self.position, &self.caps, self.trace.as_ref());
-        if result.is_err()
-            && let Some(trace) = &self.trace
-        {
-            trace.outcome("failed");
-        }
-        Ok(adapt(result?, serialize_query))
-    }
-
-    fn load_failed(&self, engine: &mut Engine, _message: &str) -> RequestResult {
-        let result = engine.complete_after_load_failure(
-            &self.path,
-            self.position,
-            &self.caps,
-            self.trace.as_ref(),
-        );
-        if let Some(trace) = &self.trace {
-            trace.outcome(if result.is_ok() {
-                "completed with local syntax"
-            } else {
-                "failed"
-            });
-        }
-        result.map_err(internal_error).and_then(serialize_query)
-    }
-
-    fn discard(&mut self, code: ErrorCode) {
-        if let Some(trace) = &self.trace {
-            trace.error(code);
-        }
     }
 }
 
@@ -1006,23 +1023,60 @@ fn resolve_completion(
     id: RequestId,
     params: Value,
 ) -> Result<()> {
-    let item = serde_json::from_value::<CompletionItem>(params)
-        .map_err(|error| invalid_params(error.into()));
-    let result = item.and_then(|item| {
-        match context
-            .engine
-            .resolve_completion_item(item, &context.completion_capabilities)
-            .map_err(internal_error)?
-        {
-            ResolveCompletionResult::Item(item) => serialize_query(item),
-            ResolveCompletionResult::ContentModified => {
+    let item = match serde_json::from_value::<CompletionItem>(params) {
+        Ok(item) => item,
+        Err(error) => return context.respond(id, Err(invalid_params(error.into()))),
+    };
+    let Some(request) = CompletionResolve::new(item) else {
+        return context.respond(id, Err(invalid_completion_data()));
+    };
+    context.scheduler.submit(
+        context.engine,
+        context.connection,
+        id,
+        ResolveCompletionQuery {
+            request,
+            caps: context.completion_capabilities,
+            memo: QueryReadMemo::default(),
+        },
+    )
+}
+
+struct ResolveCompletionQuery {
+    request: CompletionResolve,
+    caps: CompletionClientCapabilities,
+    memo: QueryReadMemo,
+}
+
+impl DeferredQuery for ResolveCompletionQuery {
+    fn document_path(&self) -> Option<&Path> {
+        Some(self.request.path())
+    }
+
+    fn read_memo(&self) -> Option<&QueryReadMemo> {
+        Some(&self.memo)
+    }
+
+    fn run(&self, engine: &mut Engine) -> Result<RequestProgress> {
+        let result = engine.resolve_completion_item(&self.request, &self.caps, &self.memo);
+        let response = match result {
+            Ok(ResolveCompletionResult::Item(item)) => serialize_query(item),
+            Ok(ResolveCompletionResult::InvalidData) => Err(invalid_completion_data()),
+            Ok(ResolveCompletionResult::ContentModified) => {
                 Err((ErrorCode::ContentModified, StaleCompletion.to_string()))
             }
-            ResolveCompletionResult::InvalidData => Err((
-                ErrorCode::InvalidParams,
-                "invalid completion item data".into(),
-            )),
-        }
-    });
-    context.respond(id, result)
+            Err(error) if error.is::<StaleCompletion>() => {
+                Err((ErrorCode::ContentModified, StaleCompletion.to_string()))
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(QueryProgress::Ready(response))
+    }
+}
+
+fn invalid_completion_data() -> (ErrorCode, String) {
+    (
+        ErrorCode::InvalidParams,
+        "invalid completion item data".into(),
+    )
 }

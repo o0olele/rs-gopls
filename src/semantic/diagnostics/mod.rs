@@ -2,6 +2,7 @@ mod cache;
 mod declarations;
 mod imports;
 mod inputs;
+mod local_fixes;
 mod model;
 mod package_errors;
 mod retention;
@@ -29,11 +30,14 @@ use crate::workspace::{Package, Workspace};
 
 pub(crate) use worker::{DiagnosticInput, DiagnosticsPreparation};
 
-pub(super) use syntax::has_reliable_package_scope;
+pub(super) use declarations::DiagnosticPackageNames;
+pub(super) use syntax::{has_reliable_declarations, has_reliable_package_scope};
 
 pub(crate) use cache::{DiagnosticKeys, DiagnosticsCache};
+pub(super) use imports::local_imports;
 use inputs::diagnostics_view;
 pub(crate) use inputs::snapshot_key_for_path;
+pub(super) use local_fixes::local_variable_fixes;
 pub(crate) use model::{
     ContextCompleteness, DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticProvenance,
     DiagnosticReport, DiagnosticSeverity, DiagnosticSnapshotKey, DiagnosticStage, DiagnosticTag,
@@ -106,6 +110,7 @@ pub(super) fn analyze(
         inspect(&mut analysis, stages)?;
         if document.root_node().has_error() && !analysis.locals.incomplete_package {
             let globals = std::mem::take(&mut analysis.locals.globals);
+            analysis.resolver.inference_memo.clear();
             analysis.locals = declarations::Locals::default();
             let filter = WalkMode::Recover {
                 dirty: None,
@@ -361,7 +366,7 @@ fn inspect_with<const RECORD: bool>(
                 stages.inspected_nodes += 1;
             }
             let value_name = declarations::identifier_kind(kind)
-                && unused::value_name(analysis, node, kind, parents);
+                && unused::value_name(&analysis.locals, node, kind, parents);
             let local = value_name
                 .then(|| analysis.locals.lookup(node, analysis.text(node)))
                 .flatten();

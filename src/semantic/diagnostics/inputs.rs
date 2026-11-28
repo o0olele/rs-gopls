@@ -38,7 +38,7 @@ impl<'w> DiagnosticView<'w> {
         })
     }
 
-    fn package_group(&self, package: &Package) -> usize {
+    pub(super) fn package_group(&self, package: &Package) -> usize {
         self.group_id
             .filter(|group| self.graph.package_in_group(package, *group))
             .unwrap_or_else(|| package.group_id())

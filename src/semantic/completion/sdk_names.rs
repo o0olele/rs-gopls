@@ -1,7 +1,11 @@
 use std::iter::Peekable;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::Result;
 
 use crate::semantic::resolver::is_exported;
+use crate::semantic::source::check_optional_cancelled;
 
 use super::cursor::is_keyword;
 
@@ -16,15 +20,81 @@ pub(in crate::semantic) struct Names {
 /// A negative result is safe only if the lexer could follow the declarations.
 /// The recovering parser handles damaged headers, groups, and literals.
 pub(in crate::semantic) fn scan_names(text: &str) -> Option<Names> {
-    scan_declarations(text, true)
+    scan_declarations(text, true, None)
+}
+
+pub(super) fn scan_names_cancellable(
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<Names>> {
+    let names = scan_declarations(text, true, cancelled);
+    check_optional_cancelled(cancelled)?;
+    Ok(names)
 }
 
 pub(in crate::semantic) fn scan_function_bodies(text: &str) -> Option<Vec<Range<usize>>> {
-    Some(scan_declarations(text, false)?.bodies)
+    Some(scan_declarations(text, false, None)?.bodies)
 }
 
-fn scan_declarations(text: &str, elide_initializers: bool) -> Option<Names> {
-    let mut tokens = Tokens::new(text).peekable();
+pub(in crate::semantic) fn scan_function_bodies_cancellable(
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<Vec<Range<usize>>>> {
+    let names = scan_declarations(text, false, cancelled);
+    check_optional_cancelled(cancelled)?;
+    Ok(names.map(|names| names.bodies))
+}
+
+pub(in crate::semantic) fn package_header_end(text: &str) -> Option<usize> {
+    let mut tokens = Tokens::new(text);
+    let mut grouped = false;
+    while let Some(token) = tokens.next() {
+        match token {
+            Token::Word(word @ ("const" | "func" | "type" | "var")) if !grouped => {
+                return Some(tokens.offset - word.len());
+            }
+            Token::Punct(b'(', _) if !grouped => grouped = true,
+            Token::Punct(b')', _) if grouped => grouped = false,
+            Token::Punct(b'(' | b')', _) | Token::Invalid => return None,
+            _ => {}
+        }
+    }
+    Some(text.len())
+}
+
+pub(in crate::semantic) fn embed_directives(text: &str, start: usize) -> Option<Vec<Box<str>>> {
+    let mut directives = Vec::new();
+    let mut tokens = Tokens {
+        text,
+        offset: start,
+        cancelled: None,
+    };
+    while let Some(token) = tokens.next_observing_comments(|offset, comment| {
+        if let Some(arguments) = comment.strip_prefix("//go:embed")
+            && arguments.starts_with([' ', '\t'])
+            && text[..offset]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|prefix| prefix.trim_matches([' ', '\t']).is_empty())
+        {
+            directives.push(arguments.trim().into());
+        }
+    }) {
+        if matches!(token, Token::Invalid) {
+            return None;
+        }
+    }
+    Some(directives)
+}
+
+fn scan_declarations(
+    text: &str,
+    elide_initializers: bool,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Names> {
+    let mut lexer = Tokens::new(text);
+    lexer.cancelled = cancelled;
+    let mut tokens = lexer.peekable();
     let mut exported = Vec::new();
     let mut private = Vec::new();
     let mut types = Vec::new();
@@ -163,10 +233,13 @@ fn scan_declarations(text: &str, elide_initializers: bool) -> Option<Names> {
     if !delimiters.is_empty() {
         return None;
     }
+    check_optional_cancelled(cancelled).ok()?;
     exported.sort_unstable();
     exported.dedup();
+    check_optional_cancelled(cancelled).ok()?;
     private.sort_unstable();
     private.dedup();
+    check_optional_cancelled(cancelled).ok()?;
     types.sort_unstable();
     types.dedup();
     Some(Names {
@@ -266,6 +339,7 @@ pub(super) enum Token<'a> {
 pub(super) struct Tokens<'a> {
     text: &'a str,
     offset: usize,
+    cancelled: Option<&'a AtomicBool>,
 }
 
 impl<'a> Tokens<'a> {
@@ -273,23 +347,47 @@ impl<'a> Tokens<'a> {
         Self {
             text,
             offset: usize::from(text.starts_with('\u{feff}')) * 3,
+            cancelled: None,
         }
     }
-}
 
-impl<'a> Iterator for Tokens<'a> {
-    type Item = Token<'a>;
+    fn cancelled(&self) -> bool {
+        self.cancelled
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn prefix_bytes(&self, text: &str, accepts: impl Fn(u8) -> bool) -> Option<usize> {
+        if self.cancelled.is_none() {
+            return Some(text.bytes().take_while(|byte| accepts(*byte)).count());
+        }
+        let mut length = 0;
+        for chunk in text.as_bytes().chunks(4096) {
+            if self.cancelled() {
+                return None;
+            }
+            let matched = chunk.iter().take_while(|byte| accepts(**byte)).count();
+            length += matched;
+            if matched < chunk.len() {
+                break;
+            }
+        }
+        Some(length)
+    }
+
+    fn next_observing_comments(
+        &mut self,
+        mut observe: impl FnMut(usize, &'a str),
+    ) -> Option<Token<'a>> {
         loop {
+            if self.cancelled() {
+                return None;
+            }
             let rest = self.text.get(self.offset..)?;
             let byte = *rest.as_bytes().first()?;
             let token = match byte {
                 b' ' | b'\r' | b'\t' => {
-                    self.offset += rest
-                        .bytes()
-                        .take_while(|byte| matches!(byte, b' ' | b'\r' | b'\t'))
-                        .count();
+                    self.offset +=
+                        self.prefix_bytes(rest, |byte| matches!(byte, b' ' | b'\r' | b'\t'))?;
                     continue;
                 }
                 b'\n' => {
@@ -297,7 +395,9 @@ impl<'a> Iterator for Tokens<'a> {
                     Token::Newline
                 }
                 b'/' if rest.starts_with("//") => {
-                    self.offset += rest.find('\n').unwrap_or(rest.len());
+                    let end = rest.find('\n').unwrap_or(rest.len());
+                    observe(self.offset, &rest[..end]);
+                    self.offset += end;
                     continue;
                 }
                 b'/' if rest.starts_with("/*") => {
@@ -323,7 +423,14 @@ impl<'a> Iterator for Tokens<'a> {
                     let bytes = rest.as_bytes();
                     let mut end = 1;
                     let mut closed = false;
+                    let mut checkpoint = 4096;
                     while let Some(byte) = bytes.get(end).copied() {
+                        if end >= checkpoint {
+                            if self.cancelled() {
+                                return None;
+                            }
+                            checkpoint += 4096;
+                        }
                         end += 1;
                         if byte == quote {
                             closed = true;
@@ -344,7 +451,7 @@ impl<'a> Iterator for Tokens<'a> {
                     }
                 }
                 byte if word(byte) => {
-                    let end = rest.bytes().take_while(|byte| word(*byte)).count();
+                    let end = self.prefix_bytes(rest, word)?;
                     self.offset += end;
                     Token::Word(&rest[..end])
                 }
@@ -359,6 +466,14 @@ impl<'a> Iterator for Tokens<'a> {
             };
             return Some(token);
         }
+    }
+}
+
+impl<'a> Iterator for Tokens<'a> {
+    type Item = Token<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_observing_comments(|_, _| {})
     }
 }
 

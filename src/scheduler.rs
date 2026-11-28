@@ -1,29 +1,25 @@
+mod completion;
 mod diagnostics;
 mod highlights;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use lsp_server::{Connection, ErrorCode, Request, RequestId};
-use lsp_types::{
-    FileChangeType, Position,
-    request::{Completion, Request as _},
-};
+use lsp_types::{FileChangeType, Position};
 
 use crate::dispatch::OpenRequestScope;
 use crate::protocol::{RequestResult, internal_error, send_response};
-use crate::semantic::{Engine, LoadedWorkspace, QueryProgress, SharedLoadPending};
-use crate::workspace::{LoadTrace, Workspace, WorkspaceLoad, path_key};
+use crate::semantic::{Engine, LoadedWorkspace, QueryProgress, QueryReadMemo, SharedLoadPending};
+use crate::workspace::{CancelToken, LoadTrace, Workspace, WorkspaceLoad, path_key};
 use crate::{rpc_telemetry, telemetry};
 
+use self::completion::Completions;
+pub(super) use self::completion::{Completed as CompletionResult, Request as CompletionRequest};
 use self::diagnostics::Diagnostics;
 pub(super) use self::diagnostics::{
     Completed as DiagnosticCompletion, Consumer as DiagnosticConsumer, Mode as DiagnosticMode,
@@ -62,12 +58,16 @@ pub(super) trait DeferredQuery {
         false
     }
 
-    fn is_completion(&self) -> bool {
-        false
-    }
-
     fn load_failed(&self, _engine: &mut Engine, message: &str) -> RequestResult {
         Err((ErrorCode::RequestFailed, message.to_owned()))
+    }
+
+    fn load_failed_progress(&self, engine: &mut Engine, message: &str) -> Result<RequestProgress> {
+        Ok(QueryProgress::Ready(self.load_failed(engine, message)))
+    }
+
+    fn read_memo(&self) -> Option<&QueryReadMemo> {
+        None
     }
 
     fn discard(&mut self, _code: ErrorCode) {}
@@ -82,6 +82,7 @@ pub(super) struct Pending {
 pub(super) struct Searching {
     request: Pending,
     generation: u64,
+    source_generations: Option<(u64, u64)>,
     task: SearchWork,
 }
 
@@ -100,6 +101,18 @@ impl SearchWork {
 }
 
 impl Searching {
+    fn current(&self, engine: &Engine) -> bool {
+        self.generation == engine.workspace_load().generation
+            && self
+                .source_generations
+                .is_none_or(|generations| generations == engine.query_generations())
+            && self
+                .request
+                .query
+                .read_memo()
+                .is_none_or(|memo| engine.query_overlays_current(memo))
+    }
+
     fn discard(&mut self, code: ErrorCode) {
         match &mut self.task {
             SearchWork::Semantic(task) => task.discard(code),
@@ -119,15 +132,21 @@ struct WatchedFiles {
     changes: BTreeMap<PathBuf, (PathBuf, FileChangeType)>,
 }
 
-struct PrewarmingTests {
-    cancelled: Arc<AtomicBool>,
-    promoted: bool,
+struct WorkspaceJob {
+    cancel: CancelToken,
+    test_prewarm: Option<TestPrewarm>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TestPrewarm {
+    Background,
+    Promoted,
 }
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        if let Some(warmup) = &self.prewarming_tests {
-            warmup.cancelled.store(true, Ordering::Relaxed);
+        if let Some(job) = &self.workspace_job {
+            job.cancel.cancel();
         }
     }
 }
@@ -156,10 +175,11 @@ pub(super) struct Scheduler {
     requested_from: &'static str,
     load_trace: Option<(Instant, &'static str)>,
     prewarm: Option<(WorkspaceLoad, Instant)>,
-    prewarming_tests: Option<PrewarmingTests>,
+    workspace_job: Option<WorkspaceJob>,
     deferred_test_view: Option<WorkspaceResult>,
     workspace_file_event: bool,
     watched_files: WatchedFiles,
+    completion: Completions,
     diagnostics: Diagnostics,
     highlights: Highlights,
     open_requests: Vec<(Request, OpenRequestScope)>,
@@ -198,22 +218,48 @@ impl Scheduler {
         })
     }
 
-    pub(super) fn watch_file(&mut self, path: PathBuf, change: FileChangeType, now: Instant) {
-        self.record_workspace_file_event();
+    pub(super) fn watch_file(
+        &mut self,
+        engine: &mut Engine,
+        path: PathBuf,
+        change: FileChangeType,
+        now: Instant,
+    ) {
+        self.record_watched_file_event(engine, &path, change);
         self.watched_files
             .deadline
             .get_or_insert(now + WATCH_WINDOW);
-        self.watched_files
+        let pending = self
+            .watched_files
             .changes
-            .insert(path_key(&path), (path, change));
+            .entry(path_key(&path))
+            .or_insert_with(|| (path.clone(), change));
+        pending.0 = path;
+        if change != FileChangeType::CHANGED {
+            pending.1 = change;
+        }
     }
 
-    pub(super) fn watch_save(&mut self, path: PathBuf) {
-        self.record_workspace_file_event();
+    pub(super) fn watch_save(&mut self, engine: &mut Engine, path: PathBuf) {
+        self.record_watched_file_event(engine, &path, FileChangeType::CHANGED);
         self.watched_files
             .changes
             .entry(path_key(&path))
             .or_insert((path, FileChangeType::CHANGED));
+    }
+
+    fn record_watched_file_event(
+        &mut self,
+        engine: &mut Engine,
+        path: &Path,
+        change: FileChangeType,
+    ) {
+        if self.loading.is_some()
+            && !self.workspace_file_event
+            && !engine.watched_package_selection_is_unchanged(path, change)
+        {
+            self.record_workspace_file_event();
+        }
     }
 
     pub(super) fn record_workspace_file_event(&mut self) {
@@ -221,8 +267,10 @@ impl Scheduler {
         // an intermediate state even if the last event leaves the graph clean.
         if self.loading.is_some() {
             self.workspace_file_event = true;
-            if let Some(warmup) = &self.prewarming_tests {
-                warmup.cancelled.store(true, Ordering::Relaxed);
+            if let Some(job) = &self.workspace_job
+                && job.test_prewarm.is_some()
+            {
+                job.cancel.cancel();
             }
         }
     }
@@ -285,10 +333,10 @@ impl Scheduler {
     pub(super) fn request_workspace_from(&mut self, load: WorkspaceLoad, trigger: &'static str) {
         if let Some(loading) = self.loading {
             if !self.workspace_file_event && loading.covers(load) {
-                if let Some(warmup) = &mut self.prewarming_tests
-                    && !warmup.promoted
+                if let Some(job) = &mut self.workspace_job
+                    && job.test_prewarm == Some(TestPrewarm::Background)
                 {
-                    warmup.promoted = true;
+                    job.test_prewarm = Some(TestPrewarm::Promoted);
                     telemetry::event!("workspace_load_promoted", {
                         "trigger": trigger,
                         "target_generation": load.generation,
@@ -297,8 +345,10 @@ impl Scheduler {
                 }
                 return;
             }
-            if let Some(warmup) = &self.prewarming_tests {
-                warmup.cancelled.store(true, Ordering::Relaxed);
+            if let Some(job) = &self.workspace_job
+                && (loading.generation != load.generation || job.test_prewarm.is_some())
+            {
+                job.cancel.cancel();
             }
         }
         self.prewarm = None;
@@ -319,11 +369,14 @@ impl Scheduler {
     ) -> Result<()> {
         let current = engine.workspace_load();
         if let Some(loading) = self.loading {
-            if loading.generation != current.generation
-                && let Some(warmup) = &self.prewarming_tests
-            {
-                warmup.cancelled.store(true, Ordering::Relaxed);
-                if self.requested.is_none() {
+            if loading.generation != current.generation {
+                if let Some(job) = &self.workspace_job {
+                    job.cancel.cancel();
+                }
+                if self
+                    .requested
+                    .is_none_or(|load| load.generation != current.generation)
+                {
                     self.request_workspace_from(current, "workspace_changed");
                 }
             }
@@ -341,10 +394,10 @@ impl Scheduler {
         let roots = engine.roots().to_vec();
         let environment = engine.environment().clone();
         let track_rename_inputs = engine.track_rename_inputs;
-        let cache_snapshot = engine.begin_workspace_cache_validation(load);
+        let mut cache_snapshot = engine.begin_workspace_cache_validation(load);
         let results = results.clone();
-        let cancelled = (trigger == TEST_VIEW_PREWARM).then(|| Arc::new(AtomicBool::new(false)));
-        let worker_cancelled = cancelled.clone();
+        let cancel = CancelToken::default();
+        let worker_cancel = cancel.clone();
         let in_flight_generation = Some(load.generation);
         self.load_trace = telemetry::now().map(|start| {
             telemetry::emit(
@@ -362,23 +415,26 @@ impl Scheduler {
             .name("go-package-loader".into())
             .spawn(move || {
                 let _trace = LoadTrace::enter(trigger, load, in_flight_generation);
-                let result = if let Some(cancelled) = &worker_cancelled {
-                    Workspace::prewarm_tests(&roots, &environment, track_rename_inputs, cancelled)
-                } else if track_rename_inputs {
-                    Workspace::load_roots_for_rename(&roots, load.include_tests, &environment)
-                } else {
-                    Workspace::load_roots_in_environment(&roots, load.include_tests, &environment)
-                };
-                let result = result.map(|workspace| cache_snapshot.validate(workspace));
+                let result = (|| {
+                    cache_snapshot.observe_package_selections(&worker_cancel)?;
+                    let workspace = Workspace::load_cancellable(
+                        &roots,
+                        load.include_tests,
+                        track_rename_inputs,
+                        &environment,
+                        &worker_cancel,
+                    )?;
+                    cache_snapshot.validate_cancellable(workspace, &worker_cancel)
+                })();
                 let _ = results.send(WorkspaceResult { load, result });
             });
         if let Err(error) = worker {
             engine.discard_workspace_cache_validation(load);
             return Err(error).context("starting Go package loader");
         }
-        self.prewarming_tests = cancelled.map(|cancelled| PrewarmingTests {
-            cancelled,
-            promoted: false,
+        self.workspace_job = Some(WorkspaceJob {
+            cancel,
+            test_prewarm: (trigger == TEST_VIEW_PREWARM).then_some(TestPrewarm::Background),
         });
         self.loading = Some(load);
         Ok(())
@@ -406,18 +462,10 @@ impl Scheduler {
         self.loading == Some(load)
             && engine.workspace_load().generation == load.generation
             && !self.workspace_file_event
-            && self
-                .prewarming_tests
-                .as_ref()
-                .is_some_and(|job| !job.promoted && !job.cancelled.load(Ordering::Relaxed))
-            && (self
-                .searches
-                .iter()
-                .any(|search| search.request.query.is_completion())
-                || self
-                    .open_requests
-                    .iter()
-                    .any(|(request, _)| request.method == Completion::METHOD))
+            && self.workspace_job.as_ref().is_some_and(|job| {
+                job.test_prewarm == Some(TestPrewarm::Background) && !job.cancel.is_cancelled()
+            })
+            && self.completion.blocks_test_prewarm()
     }
 
     pub(super) fn take_deferred_test_view(&mut self, engine: &Engine) -> Option<WorkspaceResult> {
@@ -439,12 +487,20 @@ impl Scheduler {
         }
         let loading = self.loading == Some(update.load);
         let file_event = self.workspace_file_event;
+        let current = engine.workspace_load();
+        let superseded = current.generation != update.load.generation;
+        let cancelled = loading
+            && self
+                .workspace_job
+                .as_ref()
+                .is_some_and(|job| job.cancel.is_cancelled());
         if loading && let Some((start, trigger)) = self.load_trace.take() {
-            let current = engine.workspace_load();
-            let failure = match &update.result {
-                Ok(loaded) => loaded.workspace.total_load_failure().is_some(),
-                Err(_) => true,
-            };
+            let failure = !cancelled
+                && !superseded
+                && match &update.result {
+                    Ok(loaded) => loaded.workspace.total_load_failure().is_some(),
+                    Err(_) => true,
+                };
             telemetry::emit(
                 "workspace_load_done",
                 serde_json::json!({
@@ -454,8 +510,9 @@ impl Scheduler {
                     "include_tests": update.load.include_tests,
                     "load_ms": telemetry::elapsed(start),
                     "failed": failure,
-                    "cancelled": self.prewarming_tests.as_ref().is_some_and(|job| job.cancelled.load(Ordering::Relaxed)),
-                    "stale": file_event || current.generation != update.load.generation || failure && current != update.load,
+                    "cancelled": cancelled,
+                    "superseded": superseded,
+                    "stale": cancelled || file_event || superseded || failure && current != update.load,
                 }),
             );
         }
@@ -464,13 +521,25 @@ impl Scheduler {
             return Ok(false);
         }
         self.workspace_file_event = false;
-        let warmup = if loading {
+        let job = if loading {
             self.loading = None;
-            self.prewarming_tests.take()
+            self.workspace_job.take()
         } else {
             None
         };
-        let background_only = warmup.as_ref().is_some_and(|job| !job.promoted);
+        let background_only =
+            job.is_some_and(|job| job.test_prewarm == Some(TestPrewarm::Background));
+        if superseded {
+            engine.discard_workspace_cache_validation(update.load);
+            if loading
+                && self
+                    .requested
+                    .is_none_or(|load| load.generation != current.generation)
+            {
+                self.request_workspace_from(current, "workspace_changed");
+            }
+            return Ok(false);
+        }
         if file_event {
             engine.discard_workspace_cache_validation(update.load);
             if self.requested.is_none() {
@@ -482,7 +551,7 @@ impl Scheduler {
             }
             return Ok(false);
         }
-        if warmup.is_some_and(|job| job.cancelled.load(Ordering::Relaxed)) {
+        if cancelled {
             engine.discard_workspace_cache_validation(update.load);
             return Ok(false);
         }
@@ -490,13 +559,28 @@ impl Scheduler {
         match update.result {
             Ok(loaded) => {
                 let failure = loaded.workspace.total_load_failure().map(str::to_owned);
-                if (failure.is_none() || !background_only && update.load == engine.workspace_load())
+                let can_install = (failure.is_none()
+                    || !background_only && update.load == engine.workspace_load())
                     && (!background_only
-                        || engine.can_install_background_test_view(&loaded.workspace))
-                    && engine.install_loaded_workspace(update.load, loaded)
-                {
+                        || engine.can_install_background_test_view(&loaded.workspace));
+                if can_install {
+                    self.completion.revalidate(engine, connection)?;
+                    self.completion.interrupt();
+                }
+                if can_install && engine.install_loaded_workspace(update.load, loaded) {
                     installed = true;
-                    self.revalidate_diagnostics(engine, connection)?;
+                    self.completion.workspace_installed(
+                        engine,
+                        connection,
+                        update.load,
+                        failure.is_some(),
+                    )?;
+                    if let Some(load) = self
+                        .diagnostics
+                        .revalidate_before_replay(engine, connection)?
+                    {
+                        self.request_workspace_from(load, "publish_diagnostics");
+                    }
                     if let Some(message) = failure {
                         // Diagnostics can use the installed failures. Graph
                         // queries retain their load error and can retry later.
@@ -536,10 +620,12 @@ impl Scheduler {
                         }
                     }
                 }
+                self.completion.revalidate(engine, connection)?;
                 engine.discard_workspace_cache_validation(update.load);
             }
             Err(error) if !background_only && update.load == engine.workspace_load() => {
                 engine.discard_workspace_cache_validation(update.load);
+                self.completion.workspace_failed(update.load);
                 self.fail_pending_load(engine, connection, &format!("{error:#}"))?;
             }
             Err(_) => engine.discard_workspace_cache_validation(update.load),
@@ -568,8 +654,19 @@ impl Scheduler {
         for pending in std::mem::take(&mut self.pending) {
             let _trace = rpc_telemetry::step(&pending.id, false);
             rpc_telemetry::wait(|| "graph_load_failed");
-            let result = pending.query.load_failed(engine, message);
-            send_response(connection, pending.id, result)?;
+            let Pending {
+                id,
+                document_key,
+                query,
+            } = pending;
+            let progress = run_query_step(query.as_ref(), engine, |query, engine| {
+                query.load_failed_progress(engine, message)
+            });
+            self.resolve(engine, connection, id, progress, |id| Pending {
+                id,
+                document_key,
+                query,
+            })?;
         }
         Ok(())
     }
@@ -589,6 +686,70 @@ impl Scheduler {
             self.request_workspace_from(load, trigger);
         }
         Ok(())
+    }
+
+    pub(super) fn submit_completion(
+        &mut self,
+        engine: &Engine,
+        connection: &Connection,
+        id: RequestId,
+        request: CompletionRequest,
+    ) -> Result<()> {
+        let paused = self.watching_files();
+        self.completion
+            .submit(engine, connection, id, request, paused)
+    }
+
+    pub(super) fn completion_results(&self) -> Option<&Receiver<CompletionResult>> {
+        self.completion.receiver()
+    }
+
+    pub(super) fn completion_worker_stopped(&mut self, connection: &Connection) -> Result<()> {
+        self.completion.worker_stopped(connection)
+    }
+
+    pub(super) fn complete_completion(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        completed: CompletionResult,
+    ) -> Result<()> {
+        if let Some((load, trigger)) = self.completion.complete(engine, connection, completed)? {
+            engine.note_completion_load(load);
+            self.request_workspace_from(load, trigger);
+        }
+        Ok(())
+    }
+
+    pub(super) fn interrupt_completion(&mut self) {
+        self.completion.interrupt();
+    }
+
+    pub(super) fn revalidate_completion(
+        &mut self,
+        engine: &Engine,
+        connection: &Connection,
+    ) -> Result<()> {
+        self.completion.revalidate(engine, connection)
+    }
+
+    pub(super) fn advance_completion(
+        &mut self,
+        engine: &Engine,
+        connection: &Connection,
+    ) -> Result<()> {
+        let paused = self.watching_files();
+        self.completion.advance(engine, connection, paused)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_completion(&self) -> bool {
+        self.completion.active()
+    }
+
+    #[cfg(test)]
+    pub(super) fn completion_waiting_for_workspace(&self) -> bool {
+        self.completion.waiting_for_workspace()
     }
 
     pub(super) fn diagnostic_completions(&self) -> Option<&Receiver<DiagnosticCompletion>> {
@@ -668,7 +829,7 @@ impl Scheduler {
     ) -> Result<()> {
         let result = match progress {
             Ok(QueryProgress::Pending(load)) => {
-                let trigger = rpc_telemetry::wait(|| engine.workspace_wait_reason(load));
+                let trigger = rpc_telemetry::wait_workspace(|| engine.workspace_wait_reason(load));
                 self.pending.push(defer(id));
                 self.request_workspace_from(load, trigger);
                 return Ok(());
@@ -677,6 +838,7 @@ impl Scheduler {
                 self.searches.push_back(Searching {
                     request: defer(id),
                     generation: engine.workspace_load().generation,
+                    source_generations: None,
                     task: SearchWork::Semantic(task),
                 });
                 return Ok(());
@@ -684,8 +846,14 @@ impl Scheduler {
             Ok(QueryProgress::Ready(result)) => result,
             Err(error) => match error.downcast::<SharedLoadPending>() {
                 Ok(pending) => {
+                    rpc_telemetry::wait_shared_source();
+                    let request = defer(id);
                     self.searches.push_back(Searching {
-                        request: defer(id),
+                        source_generations: request
+                            .query
+                            .read_memo()
+                            .map(|_| engine.query_generations()),
+                        request,
                         generation: engine.workspace_load().generation,
                         task: SearchWork::SharedSource(pending),
                     });
@@ -707,7 +875,7 @@ impl Scheduler {
         };
         let mut search = self.searches.remove(next).unwrap();
         let _trace = rpc_telemetry::step(&search.request.id, false);
-        let result = if engine.workspace_load().generation != search.generation {
+        let result = if !search.current(engine) {
             search.discard(ErrorCode::ContentModified);
             Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
         } else {
@@ -746,6 +914,7 @@ impl Scheduler {
                             Ok(true) => task.finish(),
                             Err(error) => match error.downcast::<SharedLoadPending>() {
                                 Ok(pending) => {
+                                    rpc_telemetry::wait_shared_source();
                                     search.task = SearchWork::SharedSource(pending);
                                     self.searches.push_back(search);
                                     return Ok(());
@@ -764,21 +933,20 @@ impl Scheduler {
     }
 
     pub(super) fn ready_search(&self, engine: &Engine) -> Option<usize> {
-        let generation = engine.workspace_load().generation;
         self.searches
             .iter()
-            .position(|search| search.generation != generation || search.task.ready(engine))
+            .position(|search| !search.current(engine) || search.task.ready(engine))
     }
 
     fn cancel_searches(
         &mut self,
         connection: &Connection,
-        mut matches: impl FnMut(&RequestId) -> bool,
+        mut matches: impl FnMut(&Pending) -> bool,
         code: ErrorCode,
         message: &str,
     ) -> Result<()> {
         for mut search in std::mem::take(&mut self.searches) {
-            if matches(&search.request.id) {
+            if matches(&search.request) {
                 search.discard(code);
                 drop(search.task);
                 send_response(
@@ -810,6 +978,12 @@ impl Scheduler {
 
     pub(super) fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<()> {
         rpc_telemetry::cancelled(id);
+        self.completion.cancel(
+            connection,
+            |active| active == id,
+            ErrorCode::RequestCanceled,
+            "the client cancelled the request",
+        )?;
         self.cancel_open_requests(
             connection,
             |request, _| &request.id == id,
@@ -826,7 +1000,7 @@ impl Scheduler {
         )?;
         self.cancel_searches(
             connection,
-            |active| active == id,
+            |active| &active.id == id,
             ErrorCode::RequestCanceled,
             "the client cancelled the search",
         )
@@ -852,8 +1026,8 @@ impl Scheduler {
         path: &Path,
     ) -> Result<()> {
         self.highlights.document_modified(connection, path)?;
+        let key = path_key(path);
         if !self.pending.is_empty() {
-            let key = path_key(path);
             self.cancel_pending(
                 connection,
                 |request| {
@@ -866,7 +1040,11 @@ impl Scheduler {
         }
         self.cancel_searches(
             connection,
-            |_| true,
+            |request| {
+                request.query.read_memo().is_none_or(|memo| {
+                    request.document_key.as_ref() == Some(&key) || memo.touched_overlay(&key)
+                })
+            },
             ErrorCode::ContentModified,
             "the document changed during search",
         )
@@ -883,6 +1061,8 @@ impl Scheduler {
         load: WorkspaceLoad,
         trigger: &'static str,
     ) -> Result<()> {
+        self.completion
+            .workspace_invalidated(connection, WORKSPACE_CHANGED)?;
         self.cancel_pending(
             connection,
             |request| request.query.requires_stable_workspace(),
@@ -905,8 +1085,8 @@ impl Scheduler {
         self.prewarm = None;
         self.deferred_test_view = None;
         self.workspace_file_event = false;
-        if let Some(warmup) = self.prewarming_tests.take() {
-            warmup.cancelled.store(true, Ordering::Relaxed);
+        if let Some(job) = self.workspace_job.take() {
+            job.cancel.cancel();
         }
         self.loading = None;
         self.load_trace = None;
@@ -929,6 +1109,8 @@ impl Scheduler {
         code: ErrorCode,
         message: &str,
     ) -> Result<()> {
+        self.completion
+            .cancel(connection, |_| true, code, message)?;
         self.cancel_open_requests(connection, |_, _| true, code, message)?;
         self.cancel_pending(connection, |_| true, code, message)?;
         self.cancel_searches(connection, |_| true, code, message)?;
@@ -954,18 +1136,60 @@ impl Scheduler {
 }
 
 fn run_query(query: &dyn DeferredQuery, engine: &mut Engine) -> Result<RequestProgress> {
-    if let Some(pending) = query
-        .document_path()
-        .and_then(|path| engine.pending_open_dependency(path))
-    {
-        return Err(pending.into());
+    run_query_step(query, engine, |query, engine| {
+        if let Some(pending) = query
+            .document_path()
+            .and_then(|path| engine.pending_open_dependency(path))
+        {
+            return Err(pending.into());
+        }
+        query.run(engine)
+    })
+}
+
+fn run_query_step(
+    query: &dyn DeferredQuery,
+    engine: &mut Engine,
+    run: impl FnOnce(&dyn DeferredQuery, &mut Engine) -> Result<RequestProgress>,
+) -> Result<RequestProgress> {
+    let Some(memo) = query.read_memo() else {
+        return run(query, engine);
+    };
+    if let Some(path) = query.document_path() {
+        engine.track_query_overlay(memo, path);
     }
-    query.run(engine)
+    let generations = engine.query_generations();
+    let modified =
+        || QueryProgress::Ready(Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.into())));
+    if !engine.query_overlays_current(memo) {
+        return Ok(modified());
+    }
+    let result = run(query, engine);
+    if generations != engine.query_generations() || !engine.query_overlays_current(memo) {
+        return Ok(modified());
+    }
+    match result {
+        Err(error) if error.is::<SharedLoadPending>() => Err(error),
+        Err(error) => {
+            let code = if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+            {
+                ErrorCode::ContentModified
+            } else {
+                ErrorCode::RequestFailed
+            };
+            Ok(QueryProgress::Ready(Err((code, format!("{error:#}")))))
+        }
+        result => result,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    mod completion_worker;
     mod diagnostic_protocol;
+    mod foreground_navigation;
     mod workspace_reload;
 
     use std::cell::Cell;
@@ -983,7 +1207,7 @@ mod tests {
             Initialized, Notification as _,
         },
         request::{
-            CodeActionRequest, DocumentDiagnosticRequest, DocumentHighlightRequest,
+            CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
             FoldingRangeRequest, GotoDefinition, GotoImplementation, HoverRequest, Initialize,
             InlayHintRequest, References, Request as _, SemanticTokensFullRequest, Shutdown,
             SignatureHelpRequest, WorkspaceSymbolRequest,
@@ -1145,6 +1369,26 @@ mod tests {
             running.advance_search(&self.server).unwrap();
         }
 
+        fn step_completion(&mut self) {
+            let State::Running(running) = &mut self.state else {
+                panic!("expected a running session");
+            };
+            running
+                .scheduler
+                .advance_completion(&running.engine, &self.server)
+                .unwrap();
+            let completed = running
+                .scheduler
+                .completion_results()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            running
+                .scheduler
+                .complete_completion(&mut running.engine, &self.server, completed)
+                .unwrap();
+        }
+
         fn finish_diagnostic_job(&mut self) {
             let completed = self.take_diagnostic_completion();
             self.complete_diagnostic(completed);
@@ -1188,7 +1432,6 @@ mod tests {
                 }
                 crossbeam_channel::select! {
                     recv(running.engine.reference_wake()) -> signal => signal.unwrap(),
-                    recv(running.engine.completion_wake()) -> signal => signal.unwrap(),
                     recv(running.engine.shared_disk_wake()) -> signal => signal.unwrap(),
                     default(Duration::from_secs(10)) => panic!("search worker did not wake"),
                 }
@@ -1287,6 +1530,7 @@ mod tests {
         let cold = project.write("cold.go", "package sample\nvar Cold int\n");
         let other = project.write("other.go", "package sample\nvar Other int\n");
         let mut session = Session::start(&project);
+        session.open(&other, "package sample\nvar Other int\n");
         let engine = &mut session.running().engine;
         let key = engine.diagnostic_key(&cold).unwrap();
         let input = engine.capture_diagnostics(&cold, key);
@@ -1380,6 +1624,7 @@ mod tests {
         session.scheduler().searches.push_back(Searching {
             request: task_request(2),
             generation: old.generation,
+            source_generations: None,
             task: SearchWork::Semantic(Box::new(CountingSearch(Rc::clone(&discarded)))),
         });
 
@@ -2242,6 +2487,7 @@ mod tests {
             position(&path, 1, 19),
         );
         session.request(2, WorkspaceSymbolRequest::METHOD, json!({ "query": "f" }));
+        session.finish_searches();
         assert_eq!(session.scheduler().pending.len(), 3);
         let load = session.begin_load();
         session.deliver(load, Err(anyhow!("Go package loading failed")));
@@ -2314,6 +2560,7 @@ mod tests {
             running.scheduler.searches.push_back(Searching {
                 request: task_request(id),
                 generation: running.engine.workspace_load().generation,
+                source_generations: None,
                 task: SearchWork::Semantic(Box::new(InvalidatingTask {
                     calls: Rc::clone(&calls),
                     manifest: manifest.clone(),

@@ -20,7 +20,14 @@ fn configured_sessions_emit_private_jsonl() {
     let project = TestProject::new();
     project.write("go.mod", "module example.test/telemetry\n\ngo 1.22\n");
     project.write("caller.go", SOURCE);
-    project.write("dep/target.go", "package dep\nfunc Target() {}\n");
+    project.write(
+        "dep/target.go",
+        "package dep\nfunc Target() { println(1) }\n",
+    );
+    project.write(
+        "diagnostic/diagnostic-target.go",
+        "package diagnostic\nfunc Used() int { return 7 }\n",
+    );
     for (mode, source) in [
         ("disabled", None),
         ("process", Some("process_env")),
@@ -36,7 +43,8 @@ fn configured_sessions_emit_private_jsonl() {
             .env("GOWORK", "off")
             .env("GOENV", "off")
             .env_remove(FILE_ENV)
-            .env_remove(REDACT_ENV);
+            .env_remove(REDACT_ENV)
+            .env_remove(COMPLETION_PROFILE_ENV);
         if mode == "process" {
             command.env(FILE_ENV, &log);
         }
@@ -97,12 +105,46 @@ fn configured_sessions_emit_private_jsonl() {
         assert_eq!(document.len(), 18);
         assert!(!raw.contains("caller.go"));
         assert!(!raw.contains("target.go"));
+        assert!(!raw.contains("diagnostic-target.go"));
         assert!(!raw.contains("go.mod"));
         let diagnostic = |id| {
             rows.iter()
                 .find(|row| row["event"] == "rpc_done" && row["req_id"] == id)
                 .unwrap()
         };
+        let hover = diagnostic(12);
+        for phase in ["anchor", "symbol", "markup"] {
+            assert!(hover["phases_ms"][phase].is_number(), "missing {phase}");
+        }
+        assert!(hover["shared_source_wait_ms"].as_f64().unwrap() > 0.0);
+        assert!(hover["shared_source_replay_count"].as_u64().unwrap() > 0);
+        let completed = |id| {
+            rows.iter()
+                .position(|row| row["event"] == "rpc_done" && row["req_id"] == id)
+                .unwrap()
+        };
+        let body_saves = &rows[completed(4)..completed(7)];
+        assert_eq!(
+            body_saves
+                .iter()
+                .filter(
+                    |row| row["event"] == "notification" && row["method"] == "textDocument/didSave"
+                )
+                .count(),
+            2
+        );
+        assert!(
+            !body_saves
+                .iter()
+                .any(|row| row["event"] == "workspace_dirty")
+        );
+        assert!(
+            !body_saves
+                .iter()
+                .any(|row| row["event"] == "workspace_load_cmd"
+                    && row["phase"] == "cmd_start"
+                    && row["command"] == "go list")
+        );
         let full = diagnostic(10);
         let unchanged = diagnostic(11);
         assert_eq!(full["doc_version"], 2);
@@ -124,6 +166,51 @@ fn configured_sessions_emit_private_jsonl() {
                     && row["job"] == full["job"]
                     && row["doc_version"] == full["doc_version"])
         );
+        assert!(
+            rows.iter()
+                .any(|row| row["event"] == "diagnostic_worker_result"
+                    && row["job"] == full["job"]
+                    && row["result_queue_ms"].as_f64().is_some_and(|ms| ms >= 0.0))
+        );
+        for relevant in [
+            |row: &Value| row["req_id"] == 12,
+            |row: &Value| row["job"].is_number() && row["stage"] == "stage2",
+        ] {
+            let producer = rows
+                .iter()
+                .find(|row| {
+                    row["event"] == "shared_disk_lookup"
+                        && row["outcome"] == "producer_requested"
+                        && row["artifact"] == "declarations"
+                        && relevant(row)
+                })
+                .unwrap_or_else(|| panic!("missing correlated declaration producer in {mode}"));
+            let flight = &producer["flight_id"];
+            assert!(!flight.is_null());
+            let parsed = rows
+                .iter()
+                .find(|row| {
+                    row["event"] == "shared_disk_flight"
+                        && row["flight_id"] == *flight
+                        && row["phase"] == "parse"
+                        && relevant(row)
+                })
+                .unwrap();
+            assert_eq!(parsed["artifact"], "declarations");
+            assert_eq!(parsed["parse_mode"], "body_elided");
+            if producer["job"].is_number() {
+                for key in ["job", "run", "stage", "lane"] {
+                    assert!(!producer[key].is_null());
+                    assert_eq!(producer[key], parsed[key]);
+                }
+                assert!(rows.iter().any(|row| {
+                    row["event"] == "diagnostic_worker_done"
+                        && ["job", "run", "stage", "lane"]
+                            .iter()
+                            .all(|key| row[*key] == producer[*key])
+                }));
+            }
+        }
     }
 }
 
@@ -162,6 +249,8 @@ fn session_worker() {
         "position": {"line": 2, "character": column},
         "context": {"includeDeclaration": true},
     });
+    let hover = request(&client, 12, "textDocument/hover", params.clone());
+    assert!(hover.is_object(), "{hover}");
     let definition = request(&client, 2, "textDocument/definition", params.clone());
     assert!(
         definition["uri"]
@@ -173,6 +262,27 @@ fn session_worker() {
         let references = request(&client, id, "textDocument/references", params.clone());
         assert_eq!(references.as_array().unwrap().len(), 2);
     }
+    for (value, id) in [(1, 8), (12, 9)] {
+        fs::write(
+            root.join("caller.go"),
+            SOURCE.replace("dep.Target()", &format!("dep.Target(); _ = {value}")),
+        )
+        .unwrap();
+        notify(
+            &client,
+            "textDocument/didSave",
+            json!({"textDocument": {"uri": uri}}),
+        );
+        let references = request(&client, id, "textDocument/references", params.clone());
+        assert_eq!(references.as_array().unwrap().len(), 2);
+    }
+    notify(
+        &client,
+        "workspace/didChangeWatchedFiles",
+        json!({"changes": [{"uri": uri, "type": 2}]}),
+    );
+    let references = request(&client, 7, "textDocument/references", params.clone());
+    assert_eq!(references.as_array().unwrap().len(), 2);
     let manifest_uri = path_uri(&root.join("go.mod")).unwrap();
     notify(
         &client,
@@ -184,7 +294,7 @@ fn session_worker() {
         &client,
         "textDocument/didChange",
         json!({"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{
-            "text": format!("package sample\nfunc use() {{ {SOURCE_CANARY}() }}\n")
+            "text": format!("package sample\nimport \"example.test/telemetry/diagnostic\"\nfunc use() {{ _ = diagnostic.Used(); {SOURCE_CANARY}() }}\n")
         }]}),
     );
     let full = request(

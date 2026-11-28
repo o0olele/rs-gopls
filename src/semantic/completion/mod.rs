@@ -1,5 +1,6 @@
 mod candidates;
 mod cursor;
+pub(in crate::semantic) mod disk_observation;
 mod expected;
 mod imports;
 pub(super) mod prefilter;
@@ -10,30 +11,41 @@ mod sdk;
 pub(super) mod sdk_names;
 #[cfg(test)]
 mod tests;
+mod worker;
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use lsp_types::{CompletionItem, CompletionResponse, InitializeParams, MarkupKind, Position};
+use lsp_types::{
+    CompletionItem, CompletionResponse, Documentation, InitializeParams, MarkupKind, Position,
+};
 
 use crate::protocol::file_path;
+use crate::rpc_telemetry;
 use crate::workspace::{Package, Workspace, path_key};
 
+#[cfg(test)]
+use super::SemanticTask;
 use super::{
-    Engine, QueryProgress, SemanticTask,
-    index::{CompletionRead, text_fingerprint},
+    Engine, QueryProgress, QueryReadMemo,
+    index::CompletionRead,
+    shared_disk::NeedsFullDeclarations,
     snapshot::{DocumentSnapshot, EngineSnapshot},
-    source::is_test_source,
+    source::{check_optional_cancelled, is_test_source},
 };
 use cursor::{Edit, Probe, Site};
 pub(super) use expected::InferredMemo;
 pub(super) use imports::ImportCache;
 use imports::{Search, SearchKind};
-use prefilter::Stamp;
+#[cfg(test)]
+pub(crate) use profile::CompletionHook;
 pub(crate) use profile::Trace;
 use render::{
-    ItemData, build_import_edits, markup, nonoverlapping, package_name, response, target_markup,
+    ItemData, SourceRev, Target, build_import_edits, declaration_markup, markup, nonoverlapping,
+    package_name, response,
 };
+pub(crate) use worker::{CompletionInput, CompletionOutcome, CompletionStamp, CompletionWorker};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CompletionClientCapabilities {
@@ -89,12 +101,30 @@ pub(crate) enum ResolveCompletionResult {
     InvalidData,
 }
 
+pub(crate) struct CompletionResolve {
+    item: CompletionItem,
+    data: ItemData,
+    path: PathBuf,
+}
+
+impl CompletionResolve {
+    pub(crate) fn new(item: CompletionItem) -> Option<Self> {
+        let data: ItemData = serde_json::from_value(item.data.as_ref()?.clone()).ok()?;
+        let path = file_path(&data.uri).ok()?;
+        Some(Self { item, data, path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StaleCompletion;
 
 impl std::fmt::Display for StaleCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the completion document or package graph changed")
+        f.write_str("the completion document, target, or package graph changed")
     }
 }
 
@@ -109,78 +139,55 @@ impl Engine {
         _context: Option<lsp_types::CompletionContext>,
         caps: &CompletionClientCapabilities,
     ) -> Result<QueryProgress<CompletionResponse, CompletionTask>> {
-        self.complete_traced(path, position, caps, None)
-    }
-
-    pub(crate) fn complete_traced(
-        &mut self,
-        path: &Path,
-        position: Position,
-        caps: &CompletionClientCapabilities,
-        trace: Option<&Trace>,
-    ) -> Result<QueryProgress<CompletionResponse, CompletionTask>> {
         let generation = self.state.completion_graph_generation;
-        let progress = self
-            .snapshot()
-            .complete(path, position, caps, Some(generation), trace)?;
+        let mut snapshot = self.snapshot();
+        let Some(document) = completion_document(&mut snapshot, path, None)? else {
+            return Ok(empty());
+        };
+        let progress =
+            snapshot.complete_document(document, position, caps, Some(generation), None)?;
         if let QueryProgress::Pending(load) = &progress {
             self.include_tests |= load.include_tests;
-        }
-        if matches!(progress, QueryProgress::Ready(_))
-            && let Some(trace) = trace
-        {
-            trace.outcome("completed");
         }
         Ok(progress)
     }
 
-    pub(crate) fn complete_after_load_failure(
-        &mut self,
-        path: &Path,
-        position: Position,
-        caps: &CompletionClientCapabilities,
-        trace: Option<&Trace>,
-    ) -> Result<CompletionResponse> {
-        match self
-            .snapshot()
-            .complete(path, position, caps, None, trace)?
-        {
-            QueryProgress::Ready(response) => Ok(response),
-            _ => unreachable!("completion fallback uses local syntax"),
-        }
-    }
-
     pub(crate) fn resolve_completion_item(
         &mut self,
-        item: CompletionItem,
+        request: &CompletionResolve,
         caps: &CompletionClientCapabilities,
+        memo: &QueryReadMemo,
     ) -> Result<ResolveCompletionResult> {
+        let rev_check = rpc_telemetry::phase("rev_check");
         let generation = self.state.completion_graph_generation;
+        let target_opening = request.data.target.as_ref().is_some_and(|target| {
+            self.track_query_overlay(memo, &target.file);
+            self.document_parse_pending(&target.file)
+        });
+        drop(rev_check);
         self.snapshot()
-            .resolve_completion_item(item, caps, generation)
+            .resolve_completion_item(request, caps, generation, memo, target_opening)
     }
 }
 
 impl EngineSnapshot<'_> {
-    fn complete(
+    fn complete_document(
         &mut self,
-        path: &Path,
+        document: DocumentSnapshot<'_>,
         position: Position,
         caps: &CompletionClientCapabilities,
         generation: Option<u64>,
         trace: Option<&Trace>,
     ) -> Result<QueryProgress<CompletionResponse, CompletionTask>> {
         let mut request = CompletionRead::new(trace.cloned());
+        let cancelled = self.completion_cancelled();
         let phase = trace.map(|trace| trace.phase("cursor"));
-        let Some(document) = completion_document(self, path, trace)? else {
-            return Ok(empty());
-        };
-        let Some(probe) = Probe::new(&document, self.parser(), position, trace)? else {
+        let Some(probe) = Probe::new(&document, self.parser(), position, trace, cancelled)? else {
             return Ok(empty());
         };
         let source = probe.source(&document);
         let anchor = probe.anchor(source);
-        let site = probe.site(source, document.text());
+        let site = probe.site(source, document.text(), cancelled)?;
         let edit = &probe.edit;
         drop(phase);
         if let Some(candidates) = candidates::syntax_candidates(
@@ -189,7 +196,9 @@ impl EngineSnapshot<'_> {
             anchor,
             edit.prefix(document.text()),
             self.docs(),
-        ) {
+            self.shared_disk(),
+            cancelled,
+        )? {
             return Ok(QueryProgress::Ready(response(
                 self,
                 &document,
@@ -202,8 +211,12 @@ impl EngineSnapshot<'_> {
         }
 
         let Some(generation) = generation else {
-            let candidates =
-                candidates::collect(&document, source, anchor, site, edit, None, caps)?.candidates;
+            let local_candidates = trace.map(|trace| trace.phase("local_candidates"));
+            let candidates = candidates::collect(
+                &document, source, anchor, site, &probe, None, caps, cancelled,
+            )?
+            .candidates;
+            drop(local_candidates);
             return Ok(QueryProgress::Ready(response(
                 self,
                 &document,
@@ -214,7 +227,7 @@ impl EngineSnapshot<'_> {
                 &mut request,
             )?));
         };
-        let test = is_test_source(path);
+        let test = is_test_source(document.path());
         let workspace = match self.active_graph(test) {
             QueryProgress::Ready(workspace) => workspace,
             QueryProgress::Pending(load) => return Ok(QueryProgress::Pending(load)),
@@ -230,29 +243,33 @@ impl EngineSnapshot<'_> {
             (Vec::new(), Some(SearchKind::Path { close }))
         } else {
             let _phase = trace.map(|trace| trace.phase("local_candidates"));
+            #[cfg(test)]
+            if let Some(trace) = trace {
+                trace.checkpoint("local_candidates", cancelled);
+            }
+            check_optional_cancelled(cancelled)?;
             let mut resolver = self.resolver_with_completion(workspace, Some(&mut request));
             let graph = package.map(|package| (&mut resolver, package));
-            let collection =
-                candidates::collect(&document, source, anchor, site, edit, graph, caps)?;
+            let collection = candidates::collect(
+                &document, source, anchor, site, &probe, graph, caps, cancelled,
+            )?;
             (
                 collection.candidates,
                 collection.search.map(SearchKind::Symbols),
             )
         };
         if let Some(search) = search {
-            let version = document.version();
+            let path = document.path().to_owned();
             let prefix = edit.prefix(document.text()).to_owned();
             let edit = edit.clone();
-            if let Some(source) = document.into_disk()
-                && let Ok(metadata) = std::fs::metadata(path)
-            {
-                request.pin_document(source, metadata.into());
+            if let Some((source, ticket)) = document.into_disk() {
+                request.pin_document(source, ticket);
             }
             return Ok(QueryProgress::Searching(CompletionTask {
-                path: path.to_owned(),
+                path,
                 generation,
+                #[cfg(test)]
                 source_generation: self.completion_source_generation(),
-                version,
                 prefix,
                 edit,
                 caps: *caps,
@@ -275,51 +292,55 @@ impl EngineSnapshot<'_> {
 
     fn resolve_completion_item(
         &mut self,
-        mut item: CompletionItem,
+        request: &CompletionResolve,
         caps: &CompletionClientCapabilities,
         generation: u64,
+        memo: &QueryReadMemo,
+        target_opening: bool,
     ) -> Result<ResolveCompletionResult> {
-        let Some(data) = item
-            .data
-            .as_ref()
-            .and_then(|data| serde_json::from_value::<ItemData>(data.clone()).ok())
-        else {
-            return Ok(ResolveCompletionResult::InvalidData);
-        };
-        let Ok(path) = file_path(&data.uri) else {
-            return Ok(ResolveCompletionResult::InvalidData);
-        };
-        let Some(source) = self.docs().get(&path_key(&path)) else {
+        let rev_check = rpc_telemetry::phase("rev_check");
+        let CompletionResolve { item, data, path } = request;
+        let Some(source) = self.docs().get(&path_key(path)) else {
             return Ok(ResolveCompletionResult::ContentModified);
         };
-        let document = DocumentSnapshot::borrowed(&path, source);
+        let document = DocumentSnapshot::borrowed(path, source);
         if data.document_version.is_none()
             || document.version() != data.document_version
-            || format!("{:016x}", text_fingerprint(document.text())) != data.document_fingerprint
+            || format!("{:016x}", source.fingerprint()) != data.document_fingerprint
+            || data
+                .document_revision
+                .as_ref()
+                .is_some_and(|revision| SourceRev::overlay(source).as_ref() != Some(revision))
             || data
                 .graph_generation
                 .is_some_and(|graph| graph != generation)
         {
             return Ok(ResolveCompletionResult::ContentModified);
         }
-        if item.detail.is_none() {
-            item.detail = data.detail;
-        }
-        if item.documentation.is_none()
-            && let Some(target) = data.target
-        {
-            if path_key(&target.file) == path_key(&path) {
-                item.documentation = markup(source, target.range, caps);
-            } else if let Some(workspace) = self.workspace() {
-                let mut request = CompletionRead::new(None);
-                let mut resolver = self.resolver_with_completion(workspace, Some(&mut request));
-                item.documentation = target_markup(&mut resolver.indexes, &target, caps);
-            }
-        }
+        drop(rev_check);
+        let docs = if let Some(target) = &data.target {
+            self.resolve_target(
+                target,
+                item.documentation.is_none(),
+                target_opening,
+                caps,
+                memo,
+            )?
+        } else {
+            None
+        };
+        let mut item = {
+            let _detail_doc = rpc_telemetry::phase("detail_doc");
+            let mut item = item.clone();
+            item.detail = item.detail.or_else(|| data.detail.clone());
+            item.documentation = item.documentation.or(docs);
+            item
+        };
         if caps.resolve_additional_text_edits
-            && let Some(import) = data.pending_import
+            && let Some(import) = &data.pending_import
         {
-            let Some(edits) = build_import_edits(&document, &import) else {
+            let _import_edit = rpc_telemetry::phase("import_edit");
+            let Some(edits) = build_import_edits(&document, import) else {
                 return Ok(ResolveCompletionResult::ContentModified);
             };
             if item
@@ -334,6 +355,70 @@ impl EngineSnapshot<'_> {
             }
         }
         Ok(ResolveCompletionResult::Item(item))
+    }
+
+    fn resolve_target(
+        &self,
+        target: &Target,
+        want_docs: bool,
+        opening: bool,
+        caps: &CompletionClientCapabilities,
+        memo: &QueryReadMemo,
+    ) -> Result<Option<Documentation>> {
+        let rev_check = rpc_telemetry::phase("rev_check");
+        let Some(expected) = &target.revision else {
+            return Ok(None);
+        };
+        let source = self.docs().get(&path_key(&target.file));
+        if let Some(source) = source {
+            if SourceRev::overlay(source).as_ref() != Some(expected) {
+                return Err(StaleCompletion.into());
+            }
+            drop(rev_check);
+            let _detail_doc = rpc_telemetry::phase("detail_doc");
+            return Ok(want_docs
+                .then(|| markup(source, target.range, caps))
+                .flatten());
+        }
+        let SourceRev::Disk(expected) = expected else {
+            return Err(StaleCompletion.into());
+        };
+        if opening {
+            return Err(StaleCompletion.into());
+        }
+        let disk = self.shared_disk();
+        let Some(text) = optional_target(disk.read_foreground_verified(&target.file, memo, None))?
+        else {
+            return Ok(None);
+        };
+        if text
+            .read_ticket
+            .as_ref()
+            .is_none_or(|ticket| ticket.source_revision() != *expected)
+        {
+            return Err(StaleCompletion.into());
+        }
+        drop(rev_check);
+        if !want_docs {
+            return Ok(None);
+        }
+        let _detail_doc = rpc_telemetry::phase("detail_doc");
+        let source = optional_target(disk.load_documentation_foreground(&target.file, memo, None))?;
+        Ok(source.and_then(|source| declaration_markup(&source.declarations, target.range, caps)))
+    }
+}
+
+fn optional_target<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.is::<NeedsFullDeclarations>() => Ok(None),
+        Err(error) => match error.downcast_ref::<io::Error>().map(io::Error::kind) {
+            Some(io::ErrorKind::NotFound | io::ErrorKind::Interrupted) => {
+                Err(StaleCompletion.into())
+            }
+            Some(_) => Ok(None),
+            None => Err(error),
+        },
     }
 }
 
@@ -400,8 +485,8 @@ fn empty() -> QueryProgress<CompletionResponse, CompletionTask> {
 pub(crate) struct CompletionTask {
     path: PathBuf,
     generation: u64,
+    #[cfg(test)]
     source_generation: u64,
-    version: Option<i32>,
     prefix: String,
     edit: Edit,
     caps: CompletionClientCapabilities,
@@ -411,6 +496,7 @@ pub(crate) struct CompletionTask {
     result: Option<CompletionResponse>,
 }
 
+#[cfg(test)]
 impl SemanticTask<CompletionResponse> for CompletionTask {
     fn ready(&self, engine: &Engine) -> bool {
         engine.state.completion_graph_generation != self.generation
@@ -432,27 +518,42 @@ impl SemanticTask<CompletionResponse> for CompletionTask {
         }
         if engine.state.completion_graph_generation != self.generation
             || engine.state.completion_source_generation != self.source_generation
+            || self
+                .request
+                .document
+                .as_ref()
+                .is_some_and(|(_, ticket)| !ticket.matches_disk(&self.path))
         {
             self.discard(lsp_server::ErrorCode::ContentModified);
             return Err(StaleCompletion.into());
         }
         let mut snapshot = engine.state.snapshot(engine.include_tests);
+        self.advance_snapshot(&mut snapshot, &mut engine.completion_imports)
+    }
+
+    fn finish(self) -> CompletionResponse {
+        self.into_response()
+    }
+}
+
+impl CompletionTask {
+    fn advance_snapshot(
+        &mut self,
+        snapshot: &mut EngineSnapshot<'_>,
+        imports: &mut ImportCache,
+    ) -> Result<bool> {
+        check_optional_cancelled(snapshot.completion_cancelled())?;
         let retained;
-        let document = if let Some((source, stamp)) = &self.request.document {
-            if !std::fs::metadata(&self.path).is_ok_and(|metadata| Stamp::from(metadata) == *stamp)
-            {
-                return Err(StaleCompletion.into());
-            }
+        let document = if let Some((source, ticket)) = &self.request.document {
             retained = std::rc::Rc::clone(source);
-            DocumentSnapshot::borrowed(&self.path, &retained)
+            DocumentSnapshot::pinned_disk(&self.path, &retained, ticket.clone())
         } else {
-            completion_document(&mut snapshot, &self.path, self.request.trace.as_ref())?
-                .filter(|document| document.version() == self.version)
+            completion_document(snapshot, &self.path, self.request.trace.as_ref())?
                 .ok_or(StaleCompletion)?
         };
         if !self.search.advance(
-            &mut engine.completion_imports,
-            &mut snapshot,
+            imports,
+            snapshot,
             &document,
             self.generation,
             &self.prefix,
@@ -463,7 +564,7 @@ impl SemanticTask<CompletionResponse> for CompletionTask {
             return Ok(false);
         }
         self.result = Some(response(
-            &mut snapshot,
+            snapshot,
             &document,
             &self.edit,
             std::mem::take(&mut self.candidates),
@@ -471,13 +572,13 @@ impl SemanticTask<CompletionResponse> for CompletionTask {
             Some(self.generation),
             &mut self.request,
         )?);
+        if !self.request.completion_sdk_is_current() {
+            return Err(StaleCompletion.into());
+        }
         Ok(true)
     }
 
-    fn finish(self) -> CompletionResponse {
-        if let Some(trace) = &self.request.trace {
-            trace.outcome("completed");
-        }
+    fn into_response(self) -> CompletionResponse {
         self.result
             .expect("completion task must finish its last batch")
     }

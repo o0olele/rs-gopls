@@ -22,7 +22,7 @@ fn test_graph(project: &TestProject) -> Workspace {
     )
 }
 
-fn start_prewarm(session: &mut Session, project: &TestProject) -> (WorkspaceLoad, Arc<AtomicBool>) {
+fn start_prewarm(session: &mut Session, project: &TestProject) -> (WorkspaceLoad, CancelToken) {
     let production = session.running().engine.workspace_load();
     session.deliver(production, Ok(project.workspace(&["api.go"], false)));
     let running = session.running();
@@ -44,13 +44,13 @@ fn start_prewarm(session: &mut Session, project: &TestProject) -> (WorkspaceLoad
         running.scheduler.take_workspace_load(&running.engine, at),
         Some((load, TEST_VIEW_PREWARM)),
     );
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel = CancelToken::default();
     running.scheduler.loading = Some(load);
-    running.scheduler.prewarming_tests = Some(PrewarmingTests {
-        cancelled: cancelled.clone(),
-        promoted: false,
+    running.scheduler.workspace_job = Some(WorkspaceJob {
+        cancel: cancel.clone(),
+        test_prewarm: Some(TestPrewarm::Background),
     });
-    (load, cancelled)
+    (load, cancel)
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn workspace_references_join_one_test_view_prewarm_or_use_its_installed_view() {
     let test = project.write("api_test.go", "package sample\nfunc test() { Find() }\n");
     for in_flight in [true, false] {
         let mut session = Session::start(&project);
-        let (load, cancelled) = start_prewarm(&mut session, &project);
+        let (load, cancel) = start_prewarm(&mut session, &project);
         if !in_flight {
             session.deliver(load, Ok(test_graph(&project)));
         }
@@ -70,8 +70,11 @@ fn workspace_references_join_one_test_view_prewarm_or_use_its_installed_view() {
         if in_flight {
             let scheduler = session.scheduler();
             assert_eq!(scheduler.loading, Some(load));
-            assert!(scheduler.prewarming_tests.as_ref().unwrap().promoted);
-            assert!(!cancelled.load(Ordering::Relaxed));
+            assert!(
+                scheduler.workspace_job.as_ref().unwrap().test_prewarm
+                    == Some(TestPrewarm::Promoted)
+            );
+            assert!(!cancel.is_cancelled());
             session.deliver(load, Ok(test_graph(&project)));
         }
         session.finish_searches();
@@ -98,12 +101,12 @@ fn workspace_configuration_change_cancels_the_old_test_view_prewarm() {
     let project = TestProject::new();
     project.write("api.go", "package sample\n");
     let mut session = Session::start(&project);
-    let (old, cancelled) = start_prewarm(&mut session, &project);
+    let (old, cancel) = start_prewarm(&mut session, &project);
     session.notify(
         DidChangeConfiguration::METHOD,
         json!({ "settings": { "env": { "GOFLAGS": "-tags=new" } } }),
     );
-    assert!(cancelled.load(Ordering::Relaxed));
+    assert!(cancel.is_cancelled());
     let current = session.running().engine.workspace_load();
     assert_ne!(old.generation, current.generation);
     assert!(!current.include_tests);
@@ -117,6 +120,126 @@ fn workspace_configuration_change_cancels_the_old_test_view_prewarm() {
         session.scheduler().prewarm.unwrap().0.generation,
         current.generation
     );
+}
+
+#[test]
+fn workspace_new_generation_cancels_a_running_foreground_go_list() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let project = TestProject::new();
+    project.write(
+        "go.mod",
+        "module example.test/sample\n\ngo 1.22\n\nrequire example.test/slow v0.1.0\n",
+    );
+    let api = project.write("api.go", "package old\nimport _ \"example.test/slow\"\n");
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let mut env = json!({
+        "GO111MODULE": "on",
+        "GOENV": "off",
+        "GOFLAGS": "-mod=mod",
+        "GOPROXY": format!("http://{}", proxy.local_addr().unwrap()),
+        "GONOPROXY": "none",
+        "GOMODCACHE": project.root.join("modules"),
+        "GOSUMDB": "off",
+        "GOTOOLCHAIN": "local",
+        "GOWORK": "off",
+    });
+    let mut session = Session::initialize(&project, json!({}), json!({ "env": env }));
+    let old = session.running().engine.workspace_load();
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    {
+        let running = session.running();
+        running.scheduler.request_workspace_from(old, "test");
+        running
+            .scheduler
+            .start_workspace_load(&mut running.engine, &sender)
+            .unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream = loop {
+        match proxy.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    receiver.is_empty(),
+                    "go list exited before reaching the proxy"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "go list did not contact the proxy"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("accepting the Go module proxy request: {error}"),
+        }
+    };
+    let cancel = session
+        .scheduler()
+        .workspace_job
+        .as_ref()
+        .unwrap()
+        .cancel
+        .clone();
+    assert!(!cancel.is_cancelled());
+    project.write("api.go", "package sample\n");
+    env["GOPROXY"] = json!("off");
+    session.notify(
+        DidChangeConfiguration::METHOD,
+        json!({ "settings": { "env": env } }),
+    );
+    let current = session.running().engine.workspace_load();
+    assert_ne!(old.generation, current.generation);
+    assert!(cancel.is_cancelled());
+    let cancelled = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(cancelled.load, old);
+    assert!(
+        matches!(&cancelled.result, Err(error) if format!("{error:#}").contains("cancelled Go workspace load"))
+    );
+    // The request was left unanswered, so EOF or a reset verifies that the
+    // obsolete Go process closed the connection and released the loader.
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let disconnect = stream.read_to_end(&mut Vec::new());
+    assert!(
+        disconnect.is_ok()
+            || matches!(&disconnect, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "obsolete go list still has an open connection: {disconnect:?}"
+    );
+
+    let State::Running(running) = &mut session.state else {
+        unreachable!()
+    };
+    assert!(
+        !running
+            .scheduler
+            .workspace_loaded(&mut running.engine, &session.server, cancelled)
+            .unwrap()
+    );
+    assert!(matches!(
+        running.engine.snapshot().active_graph(false),
+        QueryProgress::Pending(_)
+    ));
+    running
+        .scheduler
+        .start_workspace_load(&mut running.engine, &sender)
+        .unwrap();
+    let update = receiver.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert_eq!(update.load, current);
+    assert!(
+        running
+            .scheduler
+            .workspace_loaded(&mut running.engine, &session.server, update)
+            .unwrap()
+    );
+    let QueryProgress::Ready(graph) = running.engine.snapshot().active_graph(false) else {
+        panic!("the superseding graph should be installed");
+    };
+    assert_eq!(graph.package_of_file(&api).unwrap().name, "sample");
 }
 
 #[test]
@@ -144,10 +267,15 @@ fn workspace_watches_fold_fifteen_bursts_with_edits_and_queue_one_load_each() {
         let now = Instant::now();
         for delta in [0, 20, 45, 60] {
             let at = now + Duration::from_millis(delta);
-            session
-                .scheduler()
-                .watch_file(extra.clone(), FileChangeType::CHANGED, at);
-            session.scheduler().watch_file(
+            let running = session.running();
+            running.scheduler.watch_file(
+                &mut running.engine,
+                extra.clone(),
+                FileChangeType::CHANGED,
+                at,
+            );
+            running.scheduler.watch_file(
+                &mut running.engine,
                 extra.clone(),
                 if present {
                     FileChangeType::CREATED
@@ -223,15 +351,21 @@ fn workspace_load_reading_an_intermediate_watcher_state_is_retried() {
 
     let now = Instant::now();
     project.write("api.go", "//go:build never_selected\n\npackage sample\n");
-    session
-        .scheduler()
-        .watch_file(api.clone(), FileChangeType::CHANGED, now);
+    let running = session.running();
+    running.scheduler.watch_file(
+        &mut running.engine,
+        api.clone(),
+        FileChangeType::CHANGED,
+        now,
+    );
     let intermediate = WorkspaceResult {
         load: current,
         result: Ok(validation.validate(project.workspace(&["stable.go"], false))),
     };
     project.write("api.go", original);
-    session.scheduler().watch_file(
+    let running = session.running();
+    running.scheduler.watch_file(
+        &mut running.engine,
         api.clone(),
         FileChangeType::CHANGED,
         now + Duration::from_millis(50),
@@ -256,13 +390,52 @@ fn workspace_load_reading_an_intermediate_watcher_state_is_retried() {
 }
 
 #[test]
+fn workspace_body_only_save_and_watch_keep_the_in_flight_graph() {
+    let project = TestProject::new();
+    let original = "package sample\nfunc Edit() { _ = 1 }\n";
+    let api = project.write("api.go", original);
+    let mut session = Session::start(&project);
+    session.open(&api, original);
+    let load = WorkspaceLoad {
+        generation: session.running().engine.workspace_load().generation,
+        include_tests: true,
+    };
+    session.deliver(load, Ok(project.workspace(&["api.go"], true)));
+    session.scheduler().request_workspace_from(load, "test");
+    assert_eq!(session.begin_load(), load);
+
+    project.write("api.go", "package sample\nfunc Edit() { _ = 42 }\n");
+    session.notify(
+        DidSaveTextDocument::METHOD,
+        json!({ "textDocument": { "uri": path_uri(&api).unwrap() } }),
+    );
+    project.write("api.go", "package sample\nfunc Edit() { _ = 123 }\n");
+    session.watch(&api, FileChangeType::CHANGED);
+    assert!(!session.scheduler().workspace_file_event);
+    assert_eq!(session.running().engine.workspace_load(), load);
+
+    session.deliver(load, Ok(project.workspace(&["api.go"], true)));
+    assert!(session.scheduler().loading.is_none());
+    assert!(session.scheduler().requested.is_none());
+}
+
+#[test]
 fn save_does_not_replace_queued_create_or_delete() {
     let project = TestProject::new();
     let path = project.root.join("api.go");
     let mut session = Session::start(&project);
     for change in [FileChangeType::CREATED, FileChangeType::DELETED] {
         let now = Instant::now();
-        session.scheduler().watch_file(path.clone(), change, now);
+        let running = session.running();
+        running
+            .scheduler
+            .watch_file(&mut running.engine, path.clone(), change, now);
+        running.scheduler.watch_file(
+            &mut running.engine,
+            path.clone(),
+            FileChangeType::CHANGED,
+            now,
+        );
         session.notify(
             DidSaveTextDocument::METHOD,
             json!({ "textDocument": { "uri": path_uri(&path).unwrap() } }),
@@ -271,6 +444,57 @@ fn save_does_not_replace_queued_create_or_delete() {
             session.scheduler().take_watched_files(now + WATCH_WINDOW),
             Some(vec![(path.clone(), change)]),
         );
+    }
+}
+
+#[test]
+fn workspace_body_saves_never_start_a_reload_after_the_disk_baseline() {
+    let project = TestProject::new();
+    let path = project.write("api.go", "package sample\nfunc F() int { return 1 }\n");
+    let mut session = Session::start(&project);
+    session.open(
+        &path,
+        "package overlay\nimport \"fmt\"\nvar _ = fmt.Println\n",
+    );
+    let load = WorkspaceLoad {
+        include_tests: true,
+        ..session.running().engine.workspace_load()
+    };
+    session.deliver(load, Ok(project.workspace(&["api.go"], true)));
+    let uri = path_uri(&path).unwrap();
+    for (version, watched) in [(2, false), (3, true), (4, false), (5, true)] {
+        let disk_text = format!("package sample\nfunc F() int {{ return {version}0 }}\n");
+        project.write("api.go", &disk_text);
+        session.edit(
+            &path,
+            version,
+            &format!("package overlay\nvar Unsaved = {version}\n"),
+        );
+        if watched {
+            session.notify(
+                DidChangeWatchedFiles::METHOD,
+                json!({ "changes": [{ "uri": uri, "type": FileChangeType::CHANGED }] }),
+            );
+        }
+        session.notify(
+            DidSaveTextDocument::METHOD,
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        session.flush_watches();
+
+        let running = session.running();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        running
+            .scheduler
+            .start_workspace_load(&mut running.engine, &sender)
+            .unwrap();
+        drop(sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert_eq!(running.engine.workspace_load(), load);
+        assert!(running.scheduler.loading.is_none());
     }
 }
 
@@ -291,9 +515,9 @@ fn partial_test_view_prewarm_keeps_both_production_groups() {
     session.deliver(production, Workspace::load_roots(&folders, false));
     let (load, _) = session.scheduler().prewarm.take().unwrap();
     session.scheduler().loading = Some(load);
-    session.scheduler().prewarming_tests = Some(PrewarmingTests {
-        cancelled: Arc::new(AtomicBool::new(false)),
-        promoted: false,
+    session.scheduler().workspace_job = Some(WorkspaceJob {
+        cancel: CancelToken::default(),
+        test_prewarm: Some(TestPrewarm::Background),
     });
     std::fs::remove_dir_all(&folders[1]).unwrap();
     let partial = Workspace::load_roots(&folders, true).unwrap();
@@ -318,47 +542,15 @@ fn partial_test_view_prewarm_keeps_both_production_groups() {
 
 #[test]
 fn completed_test_view_prewarm_waits_for_interactive_completion() {
-    struct ActiveCompletion;
-
-    impl DeferredQuery for ActiveCompletion {
-        fn is_completion(&self) -> bool {
-            true
-        }
-
-        fn run(&self, _: &mut Engine) -> Result<RequestProgress> {
-            Ok(QueryProgress::Searching(Box::new(Self)))
-        }
-    }
-
-    impl SearchTask for ActiveCompletion {
-        fn advance(&mut self, _: &mut Engine) -> Result<bool> {
-            Ok(true)
-        }
-
-        fn finish(self: Box<Self>) -> RequestResult {
-            Ok(Value::Null)
-        }
-    }
-
     let project = TestProject::new();
-    project.write("api.go", "package sample\n");
+    let text = "package sample\nvar Exported int\nvar _ = Ex\n";
+    let path = project.write("api.go", text);
     project.write("api_test.go", "package sample\n");
     let mut session = Session::start(&project);
+    session.open(&path, text);
     let (load, _) = start_prewarm(&mut session, &project);
-    {
-        let State::Running(running) = &mut session.state else {
-            unreachable!()
-        };
-        running
-            .scheduler
-            .submit(
-                &mut running.engine,
-                &session.server,
-                1.into(),
-                ActiveCompletion,
-            )
-            .unwrap();
-    }
+    session.running().engine.use_empty_completion_sdk();
+    session.request(1, Completion::METHOD, position(&path, 2, 10));
 
     session.deliver(load, Ok(test_graph(&project)));
     let running = session.running();
@@ -374,7 +566,7 @@ fn completed_test_view_prewarm_waits_for_interactive_completion() {
         QueryProgress::Pending(_)
     ));
 
-    session.step();
+    session.step_completion();
     assert!(session.reply(1).error.is_none());
     let State::Running(running) = &mut session.state else {
         unreachable!()

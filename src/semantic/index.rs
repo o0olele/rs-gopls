@@ -16,48 +16,46 @@ use tree_sitter::Parser;
 
 use super::completion::{
     InferredMemo, Trace,
+    disk_observation::{DirectoryObservations, DirectoryWatch},
     prefilter::{BYTE_LIMIT, FileNames, SOURCE_LIMIT, Stamp},
     render::package_name,
-    sdk_names::scan_function_bodies,
+    sdk_names::scan_function_bodies_cancellable,
 };
+use super::disk_selection::PackageSelection;
 use super::navigation_trace::{NavigationProbe, record};
+use super::open_overlay::PendingOpen;
+use super::package_index::{
+    self, DeclarationIdentity, PackageDeclFile, PackageDeclIndex, PackageDeclKey,
+    PackageFileRevision, PackageLookup, PackageLookupFiles,
+};
 use super::references::{DependencySource, ReferenceDependencies};
-use super::shared_disk::{FileReadTicket, SharedDiskCache};
-use super::source::{Import, Source, SourceRevision, TextEditDelta, check_cancelled, node_text};
+use super::shared_disk::{
+    DiskSourceRev, FileObservation, FileReadTicket, PreparedDeclarations, QueryReadMemo,
+    SharedDeclarations, SharedDiskCache,
+};
+use super::source::{
+    Import, Source, SourceRevision, TextEditDelta, check_cancelled, check_optional_cancelled,
+    node_text,
+};
 use crate::symbols::{self, FileSymbols, TypeDetails};
 use crate::workspace::{Package, Workspace, path_key};
 
 mod declaration_summary;
 mod reference_identifiers;
 
-use declaration_summary::DeclarationSummary;
+pub(super) use declaration_summary::DeclarationSummary;
 pub(super) use reference_identifiers::ReferenceIdentifiers;
+
+static UNCANCELLED: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct FileIndex {
     pub(super) symbols: FileSymbols,
     pub(super) imports: Arc<[Import]>,
-    pub(super) package_signature: u64,
+    pub(super) package_selection: Option<PackageSelection>,
     pub(super) package_name: Option<String>,
 }
 
 impl FileIndex {
-    fn package_signature(source: &Source) -> u64 {
-        let root = source.tree.root_node();
-        let mut cursor = root.walk();
-        let mut signature = DefaultHasher::new();
-        hash_build_constraints(&source.text, &mut signature);
-        for node in root.named_children(&mut cursor) {
-            match node.kind() {
-                "package_clause" | "import_declaration" => {
-                    node_text(node, &source.text).hash(&mut signature)
-                }
-                "comment" => {}
-                _ => break,
-            }
-        }
-        signature.finish()
-    }
-
     fn new(source: &Source) -> Self {
         let symbols = symbols::collect(
             &source.tree,
@@ -82,91 +80,35 @@ impl FileIndex {
         Self {
             symbols,
             imports: source.imports.clone(),
-            package_signature: Self::package_signature(source),
+            package_selection: PackageSelection::from_source(source),
             package_name: package_name(source).map(str::to_owned),
         }
     }
 }
 
-fn hash_build_constraints(text: &str, signature: &mut DefaultHasher) {
-    // go/build accepts legacy constraints in the leading run of line comments
-    // only through its last blank line. Modern directives take precedence.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut legacy = Vec::new();
-    let mut legacy_end = 0;
-    let mut modern = Vec::new();
-    let mut leading_line_comments = true;
-    let mut block_comment = false;
-    'lines: for line in text.lines() {
-        let mut line = line.trim();
-        if leading_line_comments {
-            if line.is_empty() {
-                legacy_end = legacy.len();
-                continue;
-            }
-            if let Some(comment) = line.strip_prefix("//") {
-                if let Some(expression) = build_expression(comment.trim_start(), "+build") {
-                    legacy.push(expression);
-                }
-            } else {
-                leading_line_comments = false;
-            }
-        }
-        if !block_comment && let Some(expression) = build_expression(line, "//go:build") {
-            modern.push(expression);
-        }
-        while !line.is_empty() {
-            if block_comment {
-                let Some((_, rest)) = line.split_once("*/") else {
-                    continue 'lines;
-                };
-                line = rest.trim_start();
-                block_comment = false;
-            } else if line.starts_with("//") {
-                continue 'lines;
-            } else if let Some(rest) = line.strip_prefix("/*") {
-                line = rest.trim_start();
-                block_comment = true;
-            } else {
-                break 'lines;
-            }
-        }
-    }
-    modern.hash(signature);
-    if modern.is_empty() {
-        legacy[..legacy_end].hash(signature);
-    }
-}
-
-fn build_expression<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
-    let suffix = line.strip_prefix(directive)?;
-    let expression = suffix.trim_start();
-    (suffix.is_empty() || suffix.len() != expression.len()).then_some(expression)
-}
-
 pub(super) struct IndexedSource {
     source: Source,
     declarations: Arc<OnceLock<Arc<FileIndex>>>,
+    shared_declarations: Arc<OnceLock<Arc<SharedDeclarations>>>,
     declaration_summary: Arc<OnceLock<Option<Arc<DeclarationSummary>>>>,
     reference_identifiers: Arc<OnceLock<Arc<ReferenceIdentifiers>>>,
     pub(super) document_version: Option<i32>,
     pub(super) open_generation: u64,
     pub(super) content_revision: u64,
     pub(super) declaration_revision: u64,
-    declarations_only: bool,
 }
 
 #[derive(Clone)]
 pub(super) struct IndexedSourceRevision {
     source: SourceRevision,
     declarations: Arc<OnceLock<Arc<FileIndex>>>,
+    shared_declarations: Arc<OnceLock<Arc<SharedDeclarations>>>,
     declaration_summary: Arc<OnceLock<Option<Arc<DeclarationSummary>>>>,
     reference_identifiers: Arc<OnceLock<Arc<ReferenceIdentifiers>>>,
     document_version: Option<i32>,
     open_generation: u64,
     content_revision: u64,
     declaration_revision: u64,
-    pub(super) declarations_only: bool,
 }
 
 impl IndexedSourceRevision {
@@ -174,13 +116,13 @@ impl IndexedSourceRevision {
         IndexedSource {
             source: self.source.into_source(),
             declarations: self.declarations,
+            shared_declarations: self.shared_declarations,
             declaration_summary: self.declaration_summary,
             reference_identifiers: self.reference_identifiers,
             document_version: self.document_version,
             open_generation: self.open_generation,
             content_revision: self.content_revision,
             declaration_revision: self.declaration_revision,
-            declarations_only: self.declarations_only,
         }
     }
 }
@@ -190,13 +132,13 @@ impl IndexedSource {
         Self {
             source,
             declarations: Arc::default(),
+            shared_declarations: Arc::default(),
             declaration_summary: Arc::default(),
             reference_identifiers: Arc::default(),
             document_version,
             open_generation: 0,
             content_revision: 0,
             declaration_revision: 0,
-            declarations_only: false,
         }
     }
 
@@ -236,26 +178,58 @@ impl IndexedSource {
     }
 
     fn cancellable_declarations(&self, cancelled: &AtomicBool) -> Result<&FileIndex> {
+        self.declaration_index(cancelled)?;
+        Ok(self.declarations.get().expect("declarations collected"))
+    }
+
+    pub(super) fn declaration_index(&self, cancelled: &AtomicBool) -> Result<Arc<FileIndex>> {
         check_cancelled(cancelled)?;
         if let Some(declarations) = self.declarations.get() {
-            return Ok(declarations);
+            return Ok(Arc::clone(declarations));
         }
         let declarations = Arc::new(FileIndex::cancellable(&self.source, cancelled)?);
         check_cancelled(cancelled)?;
-        Ok(self.declarations.get_or_init(|| declarations))
+        Ok(Arc::clone(self.declarations.get_or_init(|| declarations)))
+    }
+
+    pub(super) fn cached_file_index(&self) -> Option<&Arc<FileIndex>> {
+        self.declarations.get()
+    }
+
+    pub(super) fn remember_file_index(&self, index: Arc<FileIndex>) {
+        let _ = self.declarations.set(index);
+    }
+
+    pub(super) fn shared_declarations(
+        &self,
+        cancelled: &AtomicBool,
+    ) -> Result<Arc<SharedDeclarations>> {
+        check_cancelled(cancelled)?;
+        if let Some(declarations) = self.shared_declarations.get() {
+            return Ok(Arc::clone(declarations));
+        }
+        let declarations = Arc::new(SharedDeclarations::collect(self, cancelled)?);
+        check_cancelled(cancelled)?;
+        Ok(Arc::clone(
+            self.shared_declarations.get_or_init(|| declarations),
+        ))
+    }
+
+    pub(super) fn cached_overlay_declarations(&self) -> Option<&Arc<SharedDeclarations>> {
+        self.shared_declarations.get()
     }
 
     pub(super) fn revision(&self) -> IndexedSourceRevision {
         IndexedSourceRevision {
             source: self.source.revision(),
             declarations: self.declarations.clone(),
+            shared_declarations: Arc::clone(&self.shared_declarations),
             declaration_summary: Arc::clone(&self.declaration_summary),
             reference_identifiers: Arc::clone(&self.reference_identifiers),
             document_version: self.document_version,
             open_generation: self.open_generation,
             content_revision: self.content_revision,
             declaration_revision: self.declaration_revision,
-            declarations_only: self.declarations_only,
         }
     }
 
@@ -269,6 +243,7 @@ impl IndexedSource {
         self.source.edit(parser, changes, observe)?;
         self.document_version = Some(version);
         self.declarations = Arc::default();
+        self.shared_declarations = Arc::default();
         self.declaration_summary = Arc::default();
         self.reference_identifiers = Arc::default();
         Ok(())
@@ -291,7 +266,8 @@ impl Deref for IndexedSource {
 }
 
 pub(super) struct DiskIndex {
-    pub(super) declarations: Arc<FileIndex>,
+    pub(super) declarations: Weak<FileIndex>,
+    text: Option<CachedNavigationText>,
     pub(super) fingerprint: u64,
     pub(super) stamp: Option<Stamp>,
     reference_source: Option<CachedReferenceSource>,
@@ -306,12 +282,14 @@ struct CachedReferenceSource {
 impl DiskIndex {
     pub(super) fn from_prepared(prepared: &PreparedReferenceSource) -> Self {
         Self {
-            declarations: prepared
-                .revision
-                .declarations
-                .get()
-                .expect("prepared source must have declarations")
-                .clone(),
+            declarations: Arc::downgrade(
+                prepared
+                    .revision
+                    .declarations
+                    .get()
+                    .expect("prepared source must have declarations"),
+            ),
+            text: Some(prepared.text.downgrade()),
             fingerprint: prepared.fingerprint,
             stamp: prepared.text.stamp,
             reference_source: None,
@@ -319,29 +297,40 @@ impl DiskIndex {
     }
 
     pub(super) fn references_text(&self, text: *const String) -> bool {
-        self.reference_source
+        self.text
             .as_ref()
-            .is_some_and(|source| source.text.text.as_ptr() == text)
+            .is_some_and(|cached| cached.text.as_ptr() == text)
     }
 
     #[cfg(test)]
-    pub(super) fn new(source: &Source) -> Self {
+    pub(super) fn test_observation(source: &Source) -> (Self, Arc<FileIndex>) {
+        let declarations = Arc::new(FileIndex::new(source));
+        (
+            Self {
+                declarations: Arc::downgrade(&declarations),
+                text: None,
+                fingerprint: source.fingerprint(),
+                stamp: None,
+                reference_source: None,
+            },
+            declarations,
+        )
+    }
+
+    pub(super) fn from_declarations(prepared: &PreparedDeclarations) -> Self {
         Self {
-            declarations: Arc::new(FileIndex::new(source)),
-            fingerprint: source.fingerprint(),
-            stamp: None,
+            declarations: Arc::downgrade(&prepared.declarations.index),
+            text: Some(prepared.text.downgrade()),
+            fingerprint: prepared.fingerprint,
+            stamp: prepared.text.stamp,
             reference_source: None,
         }
     }
 
-    fn from_indexed(source: &IndexedSource, fingerprint: u64) -> Self {
-        source.declarations();
-        Self {
-            declarations: Arc::clone(source.declarations.get().unwrap()),
-            fingerprint,
-            stamp: None,
-            reference_source: None,
-        }
+    fn matches_revision(&self, text: &NavigationText) -> bool {
+        self.text
+            .as_ref()
+            .is_some_and(|cached| cached.same_revision(text) && cached.matches(Some(&text.text)))
     }
 }
 
@@ -365,6 +354,10 @@ pub(super) struct CachedNavigationText {
 }
 
 impl CachedNavigationText {
+    pub(super) fn read_ticket(&self) -> Option<&FileReadTicket> {
+        self.ticket.as_ref()
+    }
+
     pub(super) fn same_revision(&self, text: &NavigationText) -> bool {
         self.ticket
             .as_ref()
@@ -376,6 +369,12 @@ impl CachedNavigationText {
         self.ticket
             .as_ref()
             .is_some_and(|ticket| ticket.matches_disk(path))
+    }
+
+    pub(super) fn is_current(&self, path: &Path, cache: &SharedDiskCache) -> bool {
+        self.ticket.as_ref().is_some_and(|ticket| {
+            cache.validates_ticket(path, ticket, self.text.upgrade().as_ref())
+        })
     }
 
     pub(super) fn upgrade(&self) -> Option<NavigationText> {
@@ -394,37 +393,66 @@ impl CachedNavigationText {
 }
 
 impl NavigationText {
-    pub(super) fn read_cancellable(path: &Path, cancelled: &AtomicBool) -> Result<Self> {
-        Self::read_chunks(path, cancelled).with_context(|| format!("reading {}", path.display()))
+    fn is_captured(&self) -> bool {
+        self.read_ticket
+            .as_ref()
+            .is_none_or(FileReadTicket::is_captured)
     }
 
-    fn read_chunks(path: &Path, cancelled: &AtomicBool) -> Result<Self> {
+    #[cfg(test)]
+    pub(super) fn read_cancellable(path: &Path, cancelled: &AtomicBool) -> Result<Self> {
+        Self::read_chunks(path, None, cancelled)?
+            .with_context(|| format!("reading {}", path.display()))
+    }
+
+    pub(super) fn read_observation(
+        path: &Path,
+        observation: FileObservation,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<Self>> {
+        Self::read_chunks(path, Some(observation), cancelled)
+            .with_context(|| format!("reading {}", path.display()))
+    }
+
+    fn read_chunks(
+        path: &Path,
+        expected: Option<FileObservation>,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<Self>> {
         check_cancelled(cancelled)?;
         let mut file = fs::File::open(path)?;
-        let metadata = file.metadata().ok();
-        let length = metadata
-            .as_ref()
-            .and_then(|metadata| usize::try_from(metadata.len()).ok())
-            .unwrap_or_default();
-        let mut text = Vec::with_capacity(length);
+        let observation = file.metadata().ok().map(FileObservation::from_metadata);
+        if expected.is_some() && expected != observation {
+            return Ok(None);
+        }
+        let stamp = observation.map(|file| file.stamp);
+        let length = stamp.map_or(0, |stamp| stamp.revision_parts().1);
+        let mut text = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
         let mut buffer = [0; 64 * 1024];
+        let mut body = file.by_ref().take(expected.map_or(u64::MAX, |_| length));
         loop {
             check_cancelled(cancelled)?;
-            match file.read(&mut buffer) {
+            match body.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => text.extend_from_slice(&buffer[..read]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
         }
+        // When serving an observed revision, do not read a growing file past
+        // the reservation made by a prefilter subscriber.
+        if expected.is_some() && (text.len() as u64 != length || file.read(&mut buffer[..1])? != 0)
+        {
+            return Ok(None);
+        }
         let text = String::from_utf8(text)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()))?;
         check_cancelled(cancelled)?;
-        Ok(Self {
+        Ok(Some(Self {
             text: Arc::new(text),
-            stamp: metadata.map(Stamp::from),
+            stamp,
             read_ticket: None,
-        })
+        }))
     }
 
     pub(super) fn downgrade(&self) -> CachedNavigationText {
@@ -546,7 +574,9 @@ pub(super) struct IndexReader<'a> {
     pub(super) workspace: &'a Workspace,
     pub(super) parser: &'a mut Parser,
     pub(super) shared_disk: &'a Arc<SharedDiskCache>,
+    pub(super) foreground: Option<&'a QueryReadMemo>,
     pub(super) documents: &'a HashMap<PathBuf, IndexedSource>,
+    pub(super) pending_documents: Option<&'a HashMap<PathBuf, PendingOpen>>,
     pub(super) disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
     pub(super) navigation_texts: &'a mut HashMap<PathBuf, CachedNavigationText>,
     pub(super) owned_reference: Option<(&'a Path, Rc<IndexedSource>)>,
@@ -559,6 +589,139 @@ pub(super) struct IndexReader<'a> {
     pub(super) inferred_weights: &'a mut HashMap<InferredMemo, i32>,
     pub(super) cancelled: Option<&'a AtomicBool>,
     pub(super) diagnostic_types: Option<HashMap<String, TypeDetailsMemo>>,
+    pub(super) diagnostic_observations: Option<DiagnosticObservations>,
+    pub(super) package_indexes: HashMap<String, Option<Arc<PackageDeclIndex>>>,
+    pub(super) request_declarations: RequestDeclarations,
+    pub(super) use_captured_disk: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum SourceRev {
+    Overlay {
+        open_generation: u64,
+        content_revision: u64,
+    },
+    Disk(DiskSourceRev),
+    Missing,
+}
+
+impl SourceRev {
+    pub(super) fn overlay(source: &IndexedSource) -> Option<Self> {
+        source.document_version.map(|_| Self::Overlay {
+            open_generation: source.open_generation,
+            content_revision: source.content_revision,
+        })
+    }
+}
+
+pub(super) fn overlay_revision(
+    key: &Path,
+    documents: &HashMap<PathBuf, IndexedSource>,
+    pending_documents: Option<&HashMap<PathBuf, PendingOpen>>,
+) -> Option<(u64, u64)> {
+    if let Some(pending) = pending_documents.and_then(|pending| pending.get(key)) {
+        return Some((pending.open_generation, pending.content_revision));
+    }
+    let source = documents.get(key)?;
+    Some((source.open_generation, source.content_revision))
+}
+
+pub(super) fn track_overlay(
+    memo: &QueryReadMemo,
+    key: &Path,
+    documents: &HashMap<PathBuf, IndexedSource>,
+    pending_documents: Option<&HashMap<PathBuf, PendingOpen>>,
+) {
+    let mut overlays = memo.overlays.borrow_mut();
+    if !overlays.contains_key(key) {
+        overlays.insert(
+            key.to_owned(),
+            overlay_revision(key, documents, pending_documents),
+        );
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RequestDeclarations {
+    entries: HashMap<PathBuf, Rc<PreparedDeclarations>>,
+    bytes: usize,
+}
+
+/// Cache the directory listing once a diagnostic actually scans siblings.
+#[derive(Default)]
+pub(super) struct DiagnosticObservations {
+    generation: u64,
+    visits: HashMap<PathBuf, usize>,
+    directories: DirectoryObservations,
+}
+
+impl DiagnosticObservations {
+    fn observe(
+        &mut self,
+        file: &Path,
+        generation: u64,
+        batch: bool,
+    ) -> Option<(FileObservation, u64)> {
+        if !cfg!(windows) {
+            return None;
+        }
+        if self.generation != generation {
+            *self = Self {
+                generation,
+                ..Self::default()
+            };
+        }
+        const BATCH_MIN: usize = 4;
+        let parent = file.parent()?;
+        let visits = if let Some(visits) = self.visits.get_mut(parent) {
+            visits
+        } else {
+            if self.visits.len() >= 32 {
+                self.visits.clear();
+            }
+            self.visits.entry(parent.to_owned()).or_default()
+        };
+        if batch {
+            *visits = BATCH_MIN;
+        } else {
+            *visits = (*visits + 1).min(BATCH_MIN);
+        }
+        if *visits < BATCH_MIN {
+            return None;
+        }
+        self.directories
+            .observe(file)
+            .map(|observation| (observation, generation))
+    }
+}
+
+impl RequestDeclarations {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn insert(&mut self, key: PathBuf, source: Rc<PreparedDeclarations>) {
+        const ENTRIES: usize = 256;
+        const BYTES: usize = 16 * 1024 * 1024;
+        let weight = declaration_weight(&source);
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes -= declaration_weight(&previous);
+        }
+        if self.entries.len() >= ENTRIES || self.bytes.saturating_add(weight) > BYTES {
+            self.clear();
+        }
+        self.bytes = self.bytes.saturating_add(weight);
+        self.entries.insert(key, source);
+    }
+}
+
+fn declaration_weight(source: &PreparedDeclarations) -> usize {
+    source
+        .declarations
+        .cache_weight()
+        .saturating_add(source.text.text.capacity())
 }
 
 enum ReferenceInput {
@@ -571,14 +734,37 @@ type TypeDetailsMemo = HashMap<String, Option<(PathBuf, TypeDetails)>>;
 
 pub(super) struct CompletionRead {
     pub(super) trace: Option<Trace>,
-    pub(super) prefetched: HashMap<PathBuf, String>,
-    sources: VecDeque<(PathBuf, Rc<IndexedSource>)>,
-    pub(super) document: Option<(Rc<IndexedSource>, Stamp)>,
+    pub(super) prefetched: HashMap<PathBuf, NavigationText>,
+    sources: VecDeque<(PathBuf, CompletionSource)>,
+    pub(super) document: Option<(Rc<IndexedSource>, FileReadTicket)>,
     bytes: usize,
+    disk_observations: DirectoryObservations,
+    sdk_watch: Option<SdkRead>,
     // The completion task owns this value for a single graph and set of
     // overlays. Edits and graph replacements discard the task and its keys.
     types: HashMap<String, HashMap<String, Option<(PathBuf, TypeDetails)>>>,
     pub(super) type_kinds: HashMap<(String, String), (Option<CompletionItemKind>, bool)>,
+}
+
+struct SdkRead {
+    watch: Arc<DirectoryWatch>,
+    generation: u64,
+    trusted_names: bool,
+}
+
+#[derive(Clone)]
+enum CompletionSource {
+    Declarations(Rc<PreparedDeclarations>),
+    Syntax(Rc<IndexedSource>),
+}
+
+impl CompletionSource {
+    fn weight(&self) -> usize {
+        match self {
+            Self::Declarations(source) => declaration_weight(source),
+            Self::Syntax(source) => source.text.len(),
+        }
+    }
 }
 
 impl CompletionRead {
@@ -589,29 +775,84 @@ impl CompletionRead {
             sources: VecDeque::new(),
             document: None,
             bytes: 0,
+            disk_observations: DirectoryObservations::default(),
+            sdk_watch: None,
             types: HashMap::new(),
             type_kinds: HashMap::new(),
         }
     }
 
-    fn get(&mut self, key: &Path, allow_elided: bool) -> Option<Rc<IndexedSource>> {
-        let position = self.sources.iter().position(|(path, source)| {
-            path == key && (allow_elided || !source.declarations_only)
-        })?;
+    pub(super) fn observe_completion_sdk(&mut self, watch: Option<&Arc<DirectoryWatch>>) {
+        self.sdk_watch = watch.and_then(|watch| {
+            Some(SdkRead {
+                watch: Arc::clone(watch),
+                generation: watch.generation()?,
+                trusted_names: false,
+            })
+        });
+        if self.sdk_watch.is_some() {
+            // Earlier lookups may have listed the directory before this SDK
+            // generation was observed. Only fresh metadata can validate it.
+            self.disk_observations = DirectoryObservations::default();
+        }
+    }
+
+    pub(super) fn completion_sdk_is_current(&self) -> bool {
+        self.sdk_watch
+            .as_ref()
+            .is_none_or(|sdk| !sdk.trusted_names || sdk.watch.generation() == Some(sdk.generation))
+    }
+
+    pub(super) fn trust_completion_sdk_names(&mut self) -> Option<u64> {
+        let sdk = self.sdk_watch.as_mut()?;
+        sdk.trusted_names = true;
+        Some(sdk.generation)
+    }
+
+    fn get_syntax(&mut self, key: &Path, text: &str) -> Option<Rc<IndexedSource>> {
+        let CompletionSource::Syntax(source) = self.take_recent(key, |source| {
+            matches!(source, CompletionSource::Syntax(source) if source.text.as_str() == text)
+        })? else {
+            unreachable!("completion syntax entry")
+        };
+        Some(source)
+    }
+
+    pub(super) fn declarations(&mut self, key: &Path) -> Option<Rc<PreparedDeclarations>> {
+        let CompletionSource::Declarations(source) = self.take_recent(key, |entry| {
+            matches!(entry, CompletionSource::Declarations(_))
+        })?
+        else {
+            unreachable!("completion declaration entry")
+        };
+        Some(source)
+    }
+
+    fn take_recent(
+        &mut self,
+        key: &Path,
+        accepts: impl Fn(&CompletionSource) -> bool,
+    ) -> Option<CompletionSource> {
+        let position = self
+            .sources
+            .iter()
+            .position(|(path, entry)| path == key && accepts(entry))?;
         let entry = self.sources.remove(position).unwrap();
-        let source = Rc::clone(&entry.1);
+        let source = entry.1.clone();
         self.sources.push_back(entry);
         Some(source)
     }
 
-    fn store(&mut self, key: PathBuf, source: Rc<IndexedSource>) {
-        let len = source.text.len();
+    fn store(&mut self, key: PathBuf, source: CompletionSource) {
+        let len = source.weight();
         let doc_size = self.document.as_ref().map_or(0, |(doc, _)| doc.text.len());
         if len > BYTE_LIMIT - doc_size {
             return;
         }
-        if let Some(position) = self.sources.iter().position(|(path, _)| path == &key) {
-            self.bytes -= self.sources.remove(position).unwrap().1.text.len();
+        if let Some(position) = self.sources.iter().position(|(path, entry)| {
+            path == &key && std::mem::discriminant(entry) == std::mem::discriminant(&source)
+        }) {
+            self.bytes -= self.sources.remove(position).unwrap().1.weight();
         }
         self.make_room(1, len);
         self.bytes += len;
@@ -619,12 +860,12 @@ impl CompletionRead {
         self.report_size();
     }
 
-    pub(super) fn pin_document(&mut self, source: IndexedSource, stamp: Stamp) {
+    pub(super) fn pin_document(&mut self, source: IndexedSource, ticket: FileReadTicket) {
         let len = source.text.len();
         if len <= BYTE_LIMIT {
             self.make_room(1, len);
             self.bytes += len;
-            self.document = Some((Rc::new(source), stamp));
+            self.document = Some((Rc::new(source), ticket));
             self.report_size();
         }
     }
@@ -632,7 +873,7 @@ impl CompletionRead {
     fn make_room(&mut self, count: usize, len: usize) {
         let pinned = usize::from(self.document.is_some());
         while self.sources.len() + pinned + count > SOURCE_LIMIT || self.bytes + len > BYTE_LIMIT {
-            self.bytes -= self.sources.pop_front().unwrap().1.text.len();
+            self.bytes -= self.sources.pop_front().unwrap().1.weight();
         }
     }
 
@@ -646,10 +887,13 @@ impl CompletionRead {
     }
 
     #[cfg(test)]
-    pub(super) fn retained_sources(&self) -> Vec<std::rc::Weak<IndexedSource>> {
+    pub(super) fn retained_declarations(&self) -> Vec<std::rc::Weak<PreparedDeclarations>> {
         self.sources
             .iter()
-            .map(|(_, source)| Rc::downgrade(source))
+            .filter_map(|(_, entry)| match entry {
+                CompletionSource::Declarations(source) => Some(Rc::downgrade(source)),
+                CompletionSource::Syntax(_) => None,
+            })
             .collect()
     }
 }
@@ -699,32 +943,17 @@ impl PreparedReferenceSource {
 
     fn indexed_at(revision: Arc<IndexedSourceRevision>, path: PathBuf) -> IndexedSource {
         let mut indexed = revision.as_ref().clone().into_indexed();
-        indexed.source.path = path;
+        indexed.source.rebind_path(path);
         indexed
     }
 }
 
 impl IndexedSourceRevision {
-    pub(super) fn parse_disk(
-        parser: &mut Parser,
-        path: &Path,
-        text: Arc<String>,
+    pub(super) fn from_disk_source(
+        source: Source,
         cancelled: &AtomicBool,
-        allow_elided: bool,
     ) -> Result<(Self, usize)> {
-        let bodies = allow_elided.then(|| scan_function_bodies(&text)).flatten();
-        let (source, declarations_only) = if let Some(bodies) = bodies {
-            Source::parse_dependency_declarations(parser, path, text, &bodies, cancelled)?
-        } else {
-            (
-                Source::parse_cancellable(parser, path, text, cancelled)?,
-                false,
-            )
-        };
-        let source = IndexedSource {
-            declarations_only,
-            ..IndexedSource::new(source, None)
-        };
+        let source = IndexedSource::new(source, None);
         source.cancellable_declarations(cancelled)?;
         let nodes = source.tree.root_node().descendant_count();
         Ok((source.revision(), nodes))
@@ -741,11 +970,37 @@ impl AsRef<IndexedSource> for ReferenceSource<'_> {
 }
 
 impl<'a> IndexReader<'a> {
+    pub(super) fn has_overlay(&self, key: &Path) -> bool {
+        self.documents.contains_key(key) || self.pending_overlay(key).is_some()
+    }
+
+    fn pending_overlay(&self, key: &Path) -> Option<&PendingOpen> {
+        self.pending_documents?.get(key)
+    }
+
+    fn check_pending_overlay(&self, key: &Path) -> Result<()> {
+        check_optional_cancelled(self.cancelled)?;
+        if let Some(memo) = self.foreground {
+            track_overlay(memo, key, self.documents, self.pending_documents);
+        }
+        if let Some(pending) = self.pending_overlay(key) {
+            return Err(pending.ready.pending().into());
+        }
+        Ok(())
+    }
+
     pub(super) fn navigation_text(
         &mut self,
         path: &Path,
         key: &Path,
     ) -> Result<(Arc<String>, bool)> {
+        self.check_pending_overlay(key)?;
+        if let Some(memo) = self.foreground {
+            let text = self
+                .shared_disk
+                .read_foreground(path, memo, self.navigation)?;
+            return Ok((text.text, true));
+        }
         if let Some(text) = self.cached_navigation_text(key) {
             return Ok((text.text, false));
         }
@@ -758,10 +1013,32 @@ impl<'a> IndexReader<'a> {
     }
 
     pub(super) fn reference_source(&mut self, path: &Path) -> Result<Option<ReferenceSource<'a>>> {
-        self.get_source(path, false)
+        let key = path_key(path);
+        self.check_pending_overlay(&key)?;
+        let probe = self.navigation;
+        record(probe, |counts| counts.scanned_files += 1);
+        if let Some(source) = self.cached_reference_source(&key) {
+            record(probe, |counts| counts.ast_access(true));
+            return Ok(Some(source));
+        }
+        record(probe, |counts| counts.ast_access(false));
+        let started = self.implementation_parse_time.map(|_| Instant::now());
+        let prepared = match self.load_navigation_source(path, &key) {
+            Ok(prepared) => prepared,
+            Err(error) if missing_source(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let source = self.store_disk_source(key, prepared);
+        if let Some(started) = started {
+            *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
+        }
+        Ok(Some(ReferenceSource::Disk(source)))
     }
 
     pub(super) fn cached_reference_source(&self, key: &Path) -> Option<ReferenceSource<'a>> {
+        if let Some(memo) = self.foreground {
+            track_overlay(memo, key, self.documents, self.pending_documents);
+        }
         if let Some(source) = self.documents.get(key) {
             return Some(ReferenceSource::Open(source));
         }
@@ -770,14 +1047,17 @@ impl<'a> IndexReader<'a> {
         {
             return Some(ReferenceSource::Disk(Rc::clone(source)));
         }
+        if self.foreground.is_some() {
+            // The foreground shared loader handles verified disk cache hits.
+            return None;
+        }
         let cached = self.disk_index.get(key)?.reference_source.as_ref()?;
         let source = cached.revision.upgrade()?;
-        if self.reference_dependencies.is_none()
-            && !cached.text.ticket.as_ref().is_some_and(|ticket| {
-                self.shared_disk
-                    .validates_ticket(key, ticket, cached.text.text.upgrade().as_ref())
-            })
-        {
+        let usable = match self.captured_implementation_text(key) {
+            Some(text) => cached.text.matches(Some(&text.text)),
+            None => cached.text.is_current(key, self.shared_disk),
+        };
+        if !usable {
             return None;
         }
         Some(ReferenceSource::Disk(Rc::new(
@@ -795,9 +1075,7 @@ impl<'a> IndexReader<'a> {
         key: PathBuf,
         prepared: PreparedReferenceSource,
     ) -> bool {
-        if self.documents.contains_key(&key)
-            || !self.shared_disk.validates_read(&key, &prepared.text)
-        {
+        if self.has_overlay(&key) || !self.shared_disk.validates_read(&key, &prepared.text) {
             return false;
         }
         self.navigation_texts
@@ -809,43 +1087,171 @@ impl<'a> IndexReader<'a> {
     pub(super) fn declaration_source(
         &mut self,
         path: &Path,
-    ) -> Result<Option<ReferenceSource<'a>>> {
-        self.get_source(path, true)
+    ) -> Result<Option<Arc<SharedDeclarations>>> {
+        let key = path_key(path);
+        self.check_pending_overlay(&key)?;
+        if let Some(source) = self.overlay_or_owned(&key) {
+            return self.indexed_declarations(source).map(Some);
+        }
+        match self.ensure_declarations(path, &key) {
+            Ok(()) => Ok(Some(Arc::clone(
+                &self.request_declarations.entries[&key].declarations,
+            ))),
+            Err(error) if missing_source(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
-    fn get_source(
+    pub(super) fn indexed_declarations(
+        &self,
+        source: &IndexedSource,
+    ) -> Result<Arc<SharedDeclarations>> {
+        if let Some(memo) = self.foreground {
+            return self
+                .shared_disk
+                .source_declarations_foreground(source, memo);
+        }
+        if source.document_version.is_some() {
+            return source.shared_declarations(self.cancelled.unwrap_or(&UNCANCELLED));
+        }
+        // The Stage 2 worker holds a full disk snapshot even when the
+        // shared declaration projection was built from elided syntax.
+        self.shared_disk.source_declarations(source, self.cancelled)
+    }
+
+    pub(super) fn source_revision(&self, path: &Path) -> Result<SourceRev> {
+        let key = path_key(path);
+        self.check_pending_overlay(&key)?;
+        if let Some(source) = self.documents.get(&key) {
+            return Ok(SourceRev::overlay(source).expect("open document revision"));
+        }
+        let text = match self.foreground {
+            Some(memo) => self
+                .shared_disk
+                .read_foreground(path, memo, self.navigation),
+            None => self.shared_disk.read(path, self.cancelled, self.navigation),
+        };
+        match text {
+            Ok(text) => Ok(SourceRev::Disk(
+                text.read_ticket
+                    .expect("disk read ticket")
+                    .source_revision(),
+            )),
+            Err(error) if missing_source(&error) => Ok(SourceRev::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn builtin_path(&self, root: &Path) -> Result<PathBuf> {
+        if self.foreground.is_none() && (self.completion.is_none() || self.cancelled.is_none()) {
+            return self.workspace.builtin_source(root).map(Path::to_owned);
+        }
+        if let Some(path) = self.workspace.known_builtin_source() {
+            return path;
+        }
+        let environment = self.workspace.environment();
+        let path = if let Some(memo) = self.foreground {
+            self.shared_disk
+                .builtin_path_foreground(root, environment, memo)?
+        } else {
+            self.shared_disk.builtin_path_cancellable(
+                root,
+                environment,
+                self.cancelled.expect("completion cancellation"),
+            )?
+        };
+        self.workspace.remember_builtin_source(path.clone());
+        Ok(path)
+    }
+
+    pub(super) fn verified_declaration_text(&self, key: &Path) -> Option<CachedNavigationText> {
+        let prepared = self.request_declarations.entries.get(key)?;
+        self.shared_disk
+            .validates_read(key, &prepared.text)
+            .then(|| prepared.text.downgrade())
+    }
+
+    pub(super) fn declaration_ticket(&self, key: &Path) -> Option<&FileReadTicket> {
+        self.request_declarations
+            .entries
+            .get(key)?
+            .text
+            .read_ticket
+            .as_ref()
+    }
+
+    pub(super) fn completion_revision(&self, path: &Path) -> Option<SourceRev> {
+        self.completion.as_ref()?;
+        let key = path_key(path);
+        if let Some(source) = self.documents.get(&key) {
+            return SourceRev::overlay(source);
+        }
+        self.declaration_ticket(&key)
+            .map(|ticket| SourceRev::Disk(ticket.source_revision()))
+    }
+
+    pub(super) fn declaration_syntax(
         &mut self,
         path: &Path,
-        allow_elided: bool,
     ) -> Result<Option<ReferenceSource<'a>>> {
+        if self.completion.is_none() {
+            return self.reference_source(path);
+        }
         let key = path_key(path);
-        let probe = self.navigation;
-        record(probe, |counts| counts.scanned_files += 1);
-        if let Some(source) = self.cached_reference_source(&key) {
-            record(probe, |counts| counts.ast_access(true));
-            return Ok(Some(source));
+        self.check_pending_overlay(&key)?;
+        if let Some(source) = self.documents.get(&key) {
+            return Ok(Some(ReferenceSource::Open(source)));
         }
-        record(probe, |counts| counts.ast_access(false));
-        if let Some(request) = &mut self.completion {
-            if let Some(source) = request.get(&key, allow_elided) {
-                return Ok(Some(ReferenceSource::Disk(source)));
-            }
-            return match self.completion_source(path, &key, allow_elided) {
-                Ok(source) => Ok(Some(ReferenceSource::Disk(source))),
-                Err(error) if missing_source(&error) => Ok(None),
-                Err(error) => Err(error),
-            };
-        }
-        let started = self.implementation_parse_time.map(|_| Instant::now());
-        let prepared = match self.load_navigation_source(path, &key) {
-            Ok(prepared) => prepared,
+        match self.ensure_declarations(path, &key) {
+            Ok(()) => {}
             Err(error) if missing_source(&error) => return Ok(None),
             Err(error) => return Err(error),
-        };
-        let source = self.store_disk_source(key, prepared);
-        if let Some(started) = started {
-            *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
         }
+        let text = self.request_declarations.entries[&key].text.clone();
+        if let Some(source) = self
+            .completion
+            .as_mut()
+            .and_then(|request| request.get_syntax(&key, &text.text))
+        {
+            return Ok(Some(ReferenceSource::Disk(source)));
+        }
+        if let Some(source) = self.shared_disk.cached_parse(path, &text) {
+            return Ok(Some(ReferenceSource::Disk(Rc::new(source.into_indexed()))));
+        }
+        let started = self.trace().map(|trace| (trace.clone(), Instant::now()));
+        let elided = {
+            let _parse = self.trace().map(|trace| trace.phase("tree_sitter"));
+            match scan_function_bodies_cancellable(&text.text, self.cancelled)? {
+                Some(bodies) if !bodies.is_empty() => Source::try_parse_dependency_declarations(
+                    self.parser,
+                    path,
+                    text.text.clone(),
+                    &bodies,
+                    self.cancelled.unwrap_or(&UNCANCELLED),
+                )?,
+                _ => None,
+            }
+        };
+        let declarations_only = elided.is_some();
+        let source = Rc::new(match elided {
+            Some(source) => IndexedSource::new(source, None),
+            None => self
+                .shared_disk
+                .parse_snapshot_with(self.parser, path, text, self.cancelled, self.navigation)?
+                .into_indexed(),
+        });
+        if let Some((trace, started)) = started {
+            if declarations_only {
+                trace.declaration_parse();
+            } else {
+                trace.parse();
+            }
+            trace.index_time(path, source.text.len(), declarations_only, started);
+        }
+        self.completion
+            .as_mut()
+            .unwrap()
+            .store(key, CompletionSource::Syntax(Rc::clone(&source)));
         Ok(Some(ReferenceSource::Disk(source)))
     }
 
@@ -854,13 +1260,18 @@ impl<'a> IndexReader<'a> {
         path: &Path,
         key: &Path,
     ) -> Result<PreparedReferenceSource> {
+        if let Some(memo) = self.foreground {
+            return self
+                .shared_disk
+                .load_foreground(path, memo, self.navigation);
+        }
         if let Some(dependencies) = self.reference_dependencies {
             let prefetched = dependencies
                 .observations
                 .cached_text(self.shared_disk, path, key);
             if let Some(source) = prefetched
                 .as_ref()
-                .and_then(|text| self.shared_disk.cached_parse(path, text, false))
+                .and_then(|text| self.shared_disk.cached_parse(path, text))
             {
                 record(self.navigation, |counts| counts.text_hits += 1);
                 return Ok(source);
@@ -877,25 +1288,19 @@ impl<'a> IndexReader<'a> {
                 .remember(key, Some(&prepared.text));
             return Ok(prepared);
         }
-        let prefetched = self
-            .navigation_texts
-            .get(key)
-            .and_then(CachedNavigationText::upgrade);
-        match (prefetched, self.cancelled) {
-            (Some(text), None) => {
-                // Exact implementation matching follows the bytes used by
-                // candidate discovery even if the file changes mid-search.
-                self.shared_disk
-                    .parse_snapshot(self.parser, path, text, self.navigation)
-            }
-            (prefetched, cancelled) => self.shared_disk.load_prefetched(
-                self.parser,
-                path,
-                prefetched,
-                cancelled,
-                self.navigation,
-            ),
+        if let Some(text) = self.captured_implementation_text(key) {
+            return self
+                .shared_disk
+                .parse_snapshot(self.parser, path, text, self.navigation);
         }
+        let prefetched = self.cached_navigation_text(key);
+        self.shared_disk.load_prefetched(
+            self.parser,
+            path,
+            prefetched,
+            self.cancelled,
+            self.navigation,
+        )
     }
 
     fn store_disk_source(
@@ -903,24 +1308,28 @@ impl<'a> IndexReader<'a> {
         key: PathBuf,
         prepared: PreparedReferenceSource,
     ) -> Rc<IndexedSource> {
-        self.store_reference_index(key, &prepared);
+        if self.foreground.is_none() && self.shared_disk.validates_read(&key, &prepared.text) {
+            self.store_reference_index(key, &prepared);
+        }
         Rc::new(prepared.into_indexed())
     }
 
     fn store_reference_index(&mut self, key: PathBuf, prepared: &PreparedReferenceSource) {
-        let mut index = DiskIndex::from_prepared(prepared);
-        index.reference_source =
-            (!prepared.revision.declarations_only).then(|| CachedReferenceSource {
-                revision: Arc::downgrade(&prepared.revision),
-                text: prepared.text.downgrade(),
-                path: prepared.path.clone(),
-            });
         let hit = self
             .disk_index
             .get(&key)
-            .is_some_and(|disk| disk.fingerprint == index.fingerprint);
+            .is_some_and(|disk| disk.matches_revision(&prepared.text));
         record(self.navigation, |counts| counts.declaration_access(hit));
-        self.disk_index.insert(key, index);
+        if !hit {
+            self.disk_index
+                .insert(key.clone(), DiskIndex::from_prepared(prepared));
+        }
+        let index = self.disk_index.get_mut(&key).unwrap();
+        index.reference_source = Some(CachedReferenceSource {
+            revision: Arc::downgrade(&prepared.revision),
+            text: prepared.text.downgrade(),
+            path: prepared.path.clone(),
+        });
     }
 
     pub(super) fn files<'p>(&self, package: &'p Package) -> Cow<'p, [PathBuf]> {
@@ -937,47 +1346,223 @@ impl<'a> IndexReader<'a> {
         }
     }
 
+    pub(super) fn prepare_package_index(
+        &mut self,
+        package: &Package,
+    ) -> Result<Option<Arc<PackageDeclIndex>>> {
+        self.package_index(package, true)
+    }
+
+    pub(super) fn lookup_files<'p>(
+        &mut self,
+        package: &'p Package,
+    ) -> Result<PackageLookupFiles<'p>> {
+        Ok(match self.package_index(package, false)? {
+            Some(index) => PackageLookupFiles::Indexed(index),
+            None => PackageLookupFiles::All(self.files(package)),
+        })
+    }
+
+    fn package_index(
+        &mut self,
+        package: &Package,
+        populate: bool,
+    ) -> Result<Option<Arc<PackageDeclIndex>>> {
+        if !package_index::enabled()
+            || self.reference_dependencies.is_some()
+            || self.owned_reference.is_some()
+            || self.use_captured_disk
+            || self.completion.as_ref().is_some_and(|request| {
+                // Keep source selection on the same bytes as the prefilter
+                // while this request owns a frozen batch revision.
+                !request.prefetched.is_empty() || request.sources.iter().any(|(_, source)| {
+                    matches!(source, CompletionSource::Declarations(source) if source.text.is_captured())
+                })
+            })
+        {
+            return Ok(None);
+        }
+        if let Some(cached) = self.package_indexes.get(&package.id) {
+            if cached.is_some() || !populate {
+                return Ok(cached.clone());
+            }
+        }
+        let index = if populate || self.shared_disk.has_package_index(&package.id) {
+            self.load_package_index(package, populate)?
+        } else {
+            None
+        };
+        self.package_indexes
+            .insert(package.id.clone(), index.clone());
+        Ok(index)
+    }
+
+    fn load_package_index(
+        &mut self,
+        package: &Package,
+        populate: bool,
+    ) -> Result<Option<Arc<PackageDeclIndex>>> {
+        let cancelled = self.cancelled.unwrap_or(&UNCANCELLED);
+        let paths = self.files(package);
+        let batch = paths.len() >= 8;
+        let mut files = Vec::with_capacity(paths.len());
+        let mut revisions = Vec::with_capacity(paths.len());
+        for path in paths.iter() {
+            check_cancelled(cancelled)?;
+            let key = path_key(path);
+            let Some((declarations, revision)) =
+                self.package_decl_file(path, &key, populate, batch)?
+            else {
+                return Ok(None);
+            };
+            // Warm callers may have source prefilters that deliberately skip
+            // recovery artifacts. Preserve their existing traversal in that case.
+            if !populate
+                && (!declarations.reliable_package_scope
+                    || declarations.index.package_name.as_deref() != Some(&package.name))
+            {
+                return Ok(None);
+            }
+            revisions.push((path.clone(), revision));
+            files.push(PackageDeclFile {
+                path: path.clone(),
+                key,
+                declarations,
+            });
+        }
+        let key = PackageDeclKey::new(self.workspace, package, &files, revisions);
+        self.shared_disk
+            .package_index(key, &files, &package.name, populate, cancelled)
+    }
+
+    fn package_decl_file(
+        &mut self,
+        path: &Path,
+        key: &Path,
+        populate: bool,
+        batch: bool,
+    ) -> Result<Option<(Arc<SharedDeclarations>, PackageFileRevision)>> {
+        if !populate && self.pending_overlay(key).is_some() {
+            return Ok(None);
+        }
+        self.check_pending_overlay(key)?;
+        let (declarations, overlay, text, fingerprint) =
+            if let Some(source) = self.documents.get(key) {
+                let declarations = if populate {
+                    self.indexed_declarations(source)?
+                } else if let Some(projected) = source.shared_declarations.get() {
+                    projected.clone()
+                } else {
+                    return Ok(None);
+                };
+                let overlay = source
+                    .document_version
+                    .map(|_| (source.open_generation, source.declaration_revision));
+                let fingerprint = declarations.summary.is_none().then(|| source.fingerprint());
+                (declarations, overlay, source.text.clone(), fingerprint)
+            } else if let Some(prepared) = self.request_declarations.entries.get(key) {
+                (
+                    prepared.declarations.clone(),
+                    None,
+                    prepared.text.text.clone(),
+                    Some(prepared.fingerprint),
+                )
+            } else if populate {
+                match self.ensure_declarations_in_batch(path, key, batch) {
+                    Ok(()) => {}
+                    Err(error) if missing_source(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+                let prepared = &self.request_declarations.entries[key];
+                (
+                    prepared.declarations.clone(),
+                    None,
+                    prepared.text.text.clone(),
+                    Some(prepared.fingerprint),
+                )
+            } else if self.foreground.is_some() {
+                let Some((text, declarations)) = self.shared_disk.peek_foreground_declarations(key)
+                else {
+                    return Ok(None);
+                };
+                let fingerprint = declarations.summary.is_none().then(|| {
+                    text.read_ticket
+                        .as_ref()
+                        .expect("verified disk read")
+                        .fingerprint()
+                });
+                (declarations, None, text.text, fingerprint)
+            } else {
+                let Some(text) = self.shared_disk.cached_read(path, key) else {
+                    return Ok(None);
+                };
+                let Some(declarations) = self.shared_disk.cached_declarations(&text) else {
+                    return Ok(None);
+                };
+                let fingerprint = declarations
+                    .summary
+                    .is_none()
+                    .then(|| text_fingerprint(&text.text));
+                (declarations, None, text.text, fingerprint)
+            };
+        let content = match &declarations.summary {
+            Some(summary) => DeclarationIdentity::Summary(summary.clone()),
+            None => {
+                DeclarationIdentity::Exact(fingerprint.expect("exact revision fingerprint"), text)
+            }
+        };
+        let revision = PackageFileRevision {
+            overlay,
+            reliable_declarations: declarations.reliable_declarations,
+            reliable_package_scope: declarations.reliable_package_scope,
+            content,
+        };
+        Ok(Some((declarations, revision)))
+    }
+
     pub(super) fn file_index(&mut self, file: &Path) -> Result<&FileIndex> {
         let key = path_key(file);
         self.file_index_at(file, &key)
     }
 
     fn file_index_at(&mut self, file: &Path, key: &Path) -> Result<&FileIndex> {
+        self.check_pending_overlay(key)?;
         if let Some(source) = self.documents.get(key) {
             record(self.navigation, |counts| {
                 counts.declaration_access(source.declarations.get().is_some());
             });
-            return if let Some(cancelled) = self.cancelled {
+            return if let Some(memo) = self.foreground {
+                if source.cached_file_index().is_none() {
+                    self.shared_disk
+                        .source_declarations_foreground(source, memo)?;
+                }
+                Ok(source.declarations())
+            } else if let Some(cancelled) = self.cancelled {
                 source.cancellable_declarations(cancelled)
             } else {
                 Ok(source.declarations())
             };
         }
-        let indexed = self.disk_index.contains_key(key);
-        record(self.navigation, |counts| counts.declaration_access(indexed));
-        if self.completion.is_some() {
-            if !indexed {
-                self.completion_source(file, key, true)?;
-            }
-            return Ok(&self.disk_index[key].declarations);
+        if self
+            .owned_reference
+            .as_ref()
+            .is_some_and(|(origin, _)| *origin == key)
+        {
+            return Ok(self.owned_reference.as_ref().unwrap().1.declarations());
         }
-        if !indexed {
-            self.index_navigation_file(file, key, false)?;
-        }
-        Ok(&self.disk_index[key].declarations)
+        self.ensure_declarations(file, key)?;
+        Ok(&self.request_declarations.entries[key].declarations.index)
     }
 
     pub(super) fn trace(&self) -> Option<&Trace> {
         self.completion.as_ref()?.trace.as_ref()
     }
 
-    pub(super) fn known_index(&self, key: &Path) -> Option<&FileIndex> {
-        if let Some(source) = self.documents.get(key) {
-            return Some(source.declarations());
-        }
-        self.disk_index
-            .get(key)
-            .map(|entry| entry.declarations.as_ref())
+    fn overlay_or_owned(&self, key: &Path) -> Option<&IndexedSource> {
+        self.documents.get(key).or_else(|| {
+            let (origin, source) = self.owned_reference.as_ref()?;
+            (*origin == key).then_some(source)
+        })
     }
 
     pub(super) fn content_identity(&self, key: &Path) -> Option<ContentIdentity> {
@@ -986,20 +1571,16 @@ impl<'a> IndexReader<'a> {
             .and_then(|source| source.document_version)
             .map(ContentIdentity::Buffer)
             .or_else(|| {
+                self.request_declarations
+                    .entries
+                    .get(key)
+                    .map(|index| ContentIdentity::Disk(index.fingerprint))
+            })
+            .or_else(|| {
                 self.disk_index
                     .get(key)
                     .map(|index| ContentIdentity::Disk(index.fingerprint))
             })
-    }
-
-    fn completion_source(
-        &mut self,
-        path: &Path,
-        key: &Path,
-        allow_elided: bool,
-    ) -> Result<Rc<IndexedSource>> {
-        let text = self.completion_text(path, key, false, false)?;
-        self.index_text(path, key, text, allow_elided)
     }
 
     fn completion_text(
@@ -1008,7 +1589,8 @@ impl<'a> IndexReader<'a> {
         key: &Path,
         prefilter: bool,
         project: bool,
-    ) -> Result<String> {
+    ) -> Result<NavigationText> {
+        check_optional_cancelled(self.cancelled)?;
         if let Some(text) = self
             .completion
             .as_mut()
@@ -1019,80 +1601,36 @@ impl<'a> IndexReader<'a> {
             }
             return Ok(text);
         }
-        if let Some(trace) = self.trace() {
+        let (text, produced) =
+            self.shared_disk
+                .read_with_status(path, self.cancelled, self.navigation)?;
+        if produced && let Some(trace) = self.trace() {
             trace.read(key, prefilter, project, self.disk_index.contains_key(key));
         }
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+        Ok(text)
     }
 
-    fn index_text(
+    pub(super) fn cached_completion_names(
         &mut self,
         path: &Path,
         key: &Path,
-        text: String,
-        allow_elided: bool,
-    ) -> Result<Rc<IndexedSource>> {
-        let _phase = self.trace().map(|trace| trace.phase("file_index"));
-        let sample = self
-            .trace()
-            .map(|trace| (trace.clone(), std::time::Instant::now()));
-        let fingerprint = text_fingerprint(&text);
-        let external = self.workspace.package_of_file(path).is_some_and(|package| {
-            package.is_external() && !self.workspace.is_project_package(package)
-        });
-        if external
-            && allow_elided
-            && !self.disk_names.contains_key(key)
-            && let Ok(metadata) = fs::metadata(path)
-        {
-            self.disk_names
-                .insert(key.to_owned(), FileNames::new(metadata.into(), &text, true));
-        }
-        let names = self
-            .disk_names
-            .get(key)
-            .filter(|names| names.fingerprint == fingerprint);
-        let bodies = if allow_elided {
-            names
-                .filter(|names| names.elide_bodies)
-                .and_then(|names| names.names.as_ref())
-                .map_or(&[][..], |names| names.bodies.as_slice())
-        } else {
-            &[]
+    ) -> Option<&FileNames> {
+        let names = self.disk_names.get_mut(key)?;
+        let Some(request) = &mut self.completion else {
+            return names.matches_disk(path).then_some(names);
         };
-        let (source, declarations_only) = {
-            let _parse = self.trace().map(|trace| trace.phase("tree_sitter"));
-            Source::parse_declarations(self.parser, path.to_owned(), text, bodies)?
-        };
-        if let Some(trace) = self.trace() {
-            if declarations_only {
-                trace.declaration_parse();
-            } else {
-                trace.parse();
-            }
-        }
-        let source = Rc::new(IndexedSource {
-            declarations_only,
-            ..IndexedSource::new(source, None)
-        });
-        if self
-            .disk_index
-            .get(key)
-            .is_none_or(|entry| entry.fingerprint != fingerprint)
+        let mut sdk = request.sdk_watch.as_mut();
+        if let Some(sdk) = &mut sdk
+            && names.sdk_generation == Some(sdk.generation)
         {
-            let _phase = self.trace().map(|trace| trace.phase("index_summaries"));
-            self.disk_index.insert(
-                key.to_owned(),
-                DiskIndex::from_indexed(&source, fingerprint),
-            );
+            sdk.trusted_names = true;
+            return Some(names);
         }
-        if let Some(request) = &mut self.completion {
-            request.store(key.to_owned(), Rc::clone(&source));
+        let valid = names.matches_observation(request.disk_observations.observe(path));
+        if valid && names.sdk_generation.is_some() {
+            names.sdk_generation = sdk.map(|sdk| sdk.generation);
         }
-        if let Some((trace, started)) = sample {
-            trace.index_time(path, source.text.len(), declarations_only, started);
-        }
-        Ok(source)
+        valid.then_some(names)
     }
 
     pub(super) fn type_details(
@@ -1101,6 +1639,7 @@ impl<'a> IndexReader<'a> {
         name: &str,
         project: bool,
     ) -> Result<Option<(PathBuf, TypeDetails)>> {
+        check_optional_cancelled(self.cancelled)?;
         if let Some(cached) = self
             .diagnostic_types
             .as_ref()
@@ -1124,16 +1663,15 @@ impl<'a> IndexReader<'a> {
             });
         }
         let mut result = None;
-        for file in self.files(package).iter() {
+        let files = self.lookup_files(package)?;
+        for file in files.iter(PackageLookup::Type(name)) {
             let index = if self.completion.is_some() && !package.load_error {
-                self.filtered_index(file, project, package.is_external(), |names| {
-                    names.may_declare_type(name)
-                })?
+                self.filtered_index(file, project, |names| names.may_declare_type(name))?
             } else {
                 Some(self.file_index(file)?)
             };
             if let Some(details) = index.and_then(|index| index.symbols.type_details(name)) {
-                result = Some((file.clone(), details.clone()));
+                result = Some((file.to_owned(), details.clone()));
                 break;
             }
         }
@@ -1157,31 +1695,40 @@ impl<'a> IndexReader<'a> {
         &mut self,
         file: &Path,
         project: bool,
-        external: bool,
         mut accepts: impl FnMut(&FileNames) -> bool,
     ) -> Result<Option<&FileIndex>> {
         let key = path_key(file);
-        if self.documents.contains_key(&key) || self.disk_index.contains_key(&key) {
-            return Ok(self.known_index(&key));
+        self.check_pending_overlay(&key)?;
+        if self.overlay_or_owned(&key).is_some()
+            || self.request_declarations.entries.contains_key(&key)
+        {
+            return self.file_index_at(file, &key).map(Some);
         }
-        if let Some(names) = self.disk_names.get(&key) {
-            return if accepts(names) {
-                self.file_index(file).map(Some)
+        if let Some(prepared) = self.cached_declaration_source(file, &key) {
+            self.remember_declarations(key.clone(), prepared);
+            return self.file_index_at(file, &key).map(Some);
+        }
+        if let Some(names) = self.cached_completion_names(file, &key) {
+            let matches = accepts(names);
+            check_optional_cancelled(self.cancelled)?;
+            return if matches {
+                self.file_index_at(file, &key).map(Some)
             } else {
                 Ok(None)
             };
         }
         let text = self.completion_text(file, &key, true, project)?;
-        if let Ok(metadata) = fs::metadata(file) {
-            let names = FileNames::new(metadata.into(), &text, external && !project);
+        if let Some(names) = FileNames::from_read(&text, self.cancelled)? {
             let matches = accepts(&names);
+            check_optional_cancelled(self.cancelled)?;
             self.disk_names.insert(key.clone(), names);
             if !matches {
                 return Ok(None);
             }
         }
-        self.index_text(file, &key, text, true)?;
-        Ok(self.known_index(&key))
+        let prepared = self.load_declarations_for(file, Some(text))?;
+        self.remember_declarations(key.clone(), prepared);
+        self.file_index_at(file, &key).map(Some)
     }
 
     pub(super) fn find_reference_index<T>(
@@ -1231,7 +1778,7 @@ impl<'a> IndexReader<'a> {
                                         dependencies
                                             .observations
                                             .remember(&key, Some(&source.text));
-                                        self.store_reference_index(key.clone(), &source);
+                                        self.remember_declarations(key.clone(), source);
                                     }
                                     DependencySource::Absent(text) => {
                                         dependencies.observations.remember(&key, Some(&text));
@@ -1257,7 +1804,9 @@ impl<'a> IndexReader<'a> {
         spelling: &str,
         dependencies: &ReferenceDependencies<'_>,
     ) -> Result<ReferenceInput> {
-        if self.documents.contains_key(key) || self.disk_index.contains_key(key) {
+        if self.overlay_or_owned(key).is_some()
+            || self.request_declarations.entries.contains_key(key)
+        {
             return Ok(ReferenceInput::Indexed);
         }
         let Some(text) = dependencies
@@ -1266,9 +1815,18 @@ impl<'a> IndexReader<'a> {
         else {
             return Ok(ReferenceInput::Cold(None));
         };
-        if let Some(source) = self.shared_disk.cached_parse(file, &text, true) {
+        if let Some(declarations) = self.shared_disk.cached_declarations(&text) {
             record(self.navigation, |counts| counts.text_hits += 1);
-            self.store_reference_index(key.to_owned(), &source);
+            let fingerprint = text_fingerprint(&text.text);
+            self.remember_declarations(
+                key.to_owned(),
+                PreparedDeclarations {
+                    declarations,
+                    text,
+                    fingerprint,
+                    path: file.to_owned(),
+                },
+            );
             return Ok(ReferenceInput::Indexed);
         }
         if self
@@ -1293,9 +1851,10 @@ impl<'a> IndexReader<'a> {
         if self.reference_dependencies.is_some() {
             return self.find_reference_index(package, spelling, lookup);
         }
-        for file in self.files(package).iter() {
+        let files = self.lookup_files(package)?;
+        for file in files.iter(PackageLookup::Symbol(spelling, None)) {
             if let Some(range) = lookup(self.file_index(file)?) {
-                return Ok(Some((file.clone(), range)));
+                return Ok(Some((file.to_owned(), range)));
             }
         }
         Ok(None)
@@ -1313,6 +1872,7 @@ impl<'a> IndexReader<'a> {
             .iter()
             .filter(|import| import.alias.as_deref() == Some("."))
         {
+            check_optional_cancelled(self.cancelled)?;
             if let Some(package) = workspace.resolve_import(from, &import.path)
                 && let Some(location) = self.find(package, name, |index| {
                     index.symbols.declaration(name).map(|symbol| symbol.range)
@@ -1341,36 +1901,191 @@ pub(super) fn missing_source(error: &anyhow::Error) -> bool {
 }
 
 impl IndexReader<'_> {
-    fn index_navigation_file(&mut self, file: &Path, key: &Path, needs_type: bool) -> Result<()> {
-        let started = self.implementation_parse_time.map(|_| Instant::now());
-        let probe = self.navigation;
-        record(probe, |counts| counts.ast_access(false));
-        if needs_type {
-            let (text, _) = self.navigation_text(file, key)?;
-            if !text.contains("type") {
+    fn captured_implementation_text(&self, key: &Path) -> Option<NavigationText> {
+        if !self.use_captured_disk {
+            return None;
+        }
+        self.request_declarations
+            .entries
+            .get(key)
+            .map(|source| source.text.clone())
+            .or_else(|| {
+                self.navigation_texts
+                    .get(key)
+                    .and_then(CachedNavigationText::upgrade)
+            })
+    }
+
+    fn cached_declaration_source(&self, path: &Path, key: &Path) -> Option<PreparedDeclarations> {
+        let index = self.disk_index.get(key)?;
+        let text = index.text.as_ref()?.upgrade()?;
+        if !self.shared_disk.validates_read(path, &text) {
+            return None;
+        }
+        let declarations = self.shared_disk.cached_declarations(&text)?;
+        Some(PreparedDeclarations {
+            declarations,
+            text,
+            fingerprint: index.fingerprint,
+            path: path.to_owned(),
+        })
+    }
+
+    fn load_declarations_for(
+        &mut self,
+        file: &Path,
+        text: Option<NavigationText>,
+    ) -> Result<PreparedDeclarations> {
+        let phase = self.trace().map(|trace| trace.phase("file_index"));
+        let result = match text {
+            Some(text) if text.is_captured() => self.shared_disk.declarations_snapshot(
+                self.parser,
+                file,
+                text,
+                self.cancelled,
+                self.navigation,
+            ),
+            text => self.shared_disk.load_declarations(
+                self.parser,
+                file,
+                text,
+                self.cancelled,
+                self.navigation,
+            ),
+        };
+        drop(phase);
+        result
+    }
+
+    fn ensure_declarations(&mut self, file: &Path, key: &Path) -> Result<()> {
+        self.ensure_declarations_in_batch(file, key, false)
+    }
+
+    fn ensure_declarations_in_batch(&mut self, file: &Path, key: &Path, batch: bool) -> Result<()> {
+        if let Some(cancelled) = self.cancelled {
+            check_cancelled(cancelled)?;
+        }
+        let pinned = self.request_declarations.entries.contains_key(key);
+        record(self.navigation, |counts| counts.declaration_access(pinned));
+        if pinned {
+            return Ok(());
+        }
+        if let Some(observations) = &mut self.diagnostic_observations {
+            let observed = observations.observe(file, self.shared_disk.generation(), batch);
+            if let Some(prepared) = self
+                .shared_disk
+                .cached_declaration_read(file, key, observed)
+            {
+                self.request_declarations
+                    .insert(key.to_owned(), Rc::new(prepared));
                 return Ok(());
             }
         }
-        let prepared = self.load_navigation_source(file, key)?;
-        self.store_reference_index(key.to_owned(), &prepared);
+        self.index_navigation_file(file, key)
+    }
+
+    fn index_navigation_file(&mut self, file: &Path, key: &Path) -> Result<()> {
+        let started = self.implementation_parse_time.map(|_| Instant::now());
+        let probe = self.navigation;
+        record(probe, |counts| counts.scanned_files += 1);
+        if let Some(memo) = self.foreground {
+            let prepared = self
+                .shared_disk
+                .load_declarations_foreground(file, memo, probe)?;
+            self.request_declarations
+                .insert(key.to_owned(), Rc::new(prepared));
+            return Ok(());
+        }
+        if let Some(saved) = self
+            .completion
+            .as_mut()
+            .and_then(|request| request.declarations(key))
+        {
+            if saved.text.is_captured() || self.shared_disk.validates_read(file, &saved.text) {
+                self.request_declarations.clear();
+                self.request_declarations.insert(key.to_owned(), saved);
+                return Ok(());
+            }
+        }
+        let captured = self.captured_implementation_text(key).or_else(|| {
+            self.reference_dependencies?
+                .observations
+                .cached_text(self.shared_disk, file, key)
+        });
+        let prepared = if let Some(text) = captured {
+            // Candidate discovery and exact matching use the same bytes.
+            self.shared_disk.declarations_snapshot(
+                self.parser,
+                file,
+                text,
+                self.cancelled,
+                probe,
+            )?
+        } else if let Some(cached) = self.cached_declaration_source(file, key) {
+            cached
+        } else {
+            let text = if self.completion.is_some() {
+                Some(self.completion_text(file, key, false, false)?)
+            } else {
+                self.cached_navigation_text(key)
+            };
+            self.load_declarations_for(file, text)?
+        };
+        if let Some(dependencies) = self.reference_dependencies {
+            dependencies
+                .observations
+                .remember(key, Some(&prepared.text));
+        }
+        self.remember_declarations(key.to_owned(), prepared);
         if let Some(started) = started {
             *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
         }
         Ok(())
     }
 
+    fn remember_declarations(&mut self, key: PathBuf, prepared: PreparedDeclarations) {
+        if self
+            .shared_disk
+            .validates_read(&prepared.path, &prepared.text)
+        {
+            let mut index = DiskIndex::from_declarations(&prepared);
+            if let Some(previous) = self.disk_index.get_mut(&key)
+                && previous.matches_revision(&prepared.text)
+            {
+                index.reference_source = previous.reference_source.take();
+            }
+            self.disk_index.insert(key.clone(), index);
+        }
+        let prepared = Rc::new(prepared);
+        if let Some(request) = &mut self.completion {
+            self.request_declarations.clear();
+            request.store(
+                key.clone(),
+                CompletionSource::Declarations(Rc::clone(&prepared)),
+            );
+        }
+        self.request_declarations.insert(key, prepared);
+    }
+
     pub(super) fn candidate_index(&mut self, file: &Path) -> Result<Option<&FileIndex>> {
         let key = path_key(file);
+        self.check_pending_overlay(&key)?;
         if let Some(source) = self.documents.get(&key) {
             return Ok(Some(source.declarations()));
         }
-        if !self.disk_index.contains_key(&key) {
-            self.index_navigation_file(file, &key, true)?;
+        if !self.request_declarations.entries.contains_key(&key) {
+            let text = match self.captured_implementation_text(&key) {
+                Some(text) => text.text,
+                None => self.navigation_text(file, &key)?.0,
+            };
+            if !text.contains("type") {
+                return Ok(None);
+            }
+            self.ensure_declarations(file, &key)?;
         }
-        Ok(self
-            .disk_index
-            .get(&key)
-            .map(|index| index.declarations.as_ref()))
+        Ok(Some(
+            &self.request_declarations.entries[&key].declarations.index,
+        ))
     }
 }
 
@@ -1519,18 +2234,18 @@ mod tests {
         for index in 0..=SOURCE_LIMIT {
             let (path, source) = file(&format!("{index}.go"), 64);
             weak.push(Rc::downgrade(&source));
-            cache.store(path, source);
+            cache.store(path, CompletionSource::Syntax(source));
         }
         assert_eq!(cache.sources.len(), SOURCE_LIMIT);
         assert!(weak[0].upgrade().is_none());
         let (path, source) = file("large.go", BYTE_LIMIT);
         weak.push(Rc::downgrade(&source));
-        cache.store(path, source);
+        cache.store(path, CompletionSource::Syntax(source));
         assert_eq!(cache.sources.len(), 1);
         assert_eq!(cache.bytes, BYTE_LIMIT);
         let (path, source) = file("oversize.go", BYTE_LIMIT + 1);
         weak.push(Rc::downgrade(&source));
-        cache.store(path, source);
+        cache.store(path, CompletionSource::Syntax(source));
         assert_eq!(cache.sources.len(), 1);
         assert!(weak.last().unwrap().upgrade().is_none());
         drop(cache);

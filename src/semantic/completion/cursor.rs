@@ -1,14 +1,17 @@
 use std::ops::Range;
-use std::sync::LazyLock;
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
-use lsp_types::Position;
+use lsp_types::{Position, Range as LspRange};
 use regex::Regex;
-use tree_sitter::{InputEdit, Node, Parser};
+use tree_sitter::{InputEdit, Node, Parser, Tree};
 
 use crate::semantic::{
     snapshot::DocumentSnapshot,
-    source::{Source, node_text},
+    source::{Source, check_optional_cancelled, node_text},
 };
 
 use super::Trace;
@@ -29,7 +32,7 @@ impl Edit {
 
 pub(super) struct Probe {
     pub(super) edit: Edit,
-    syntax: Option<Source>,
+    syntax: Option<(Source, usize)>,
     early: Option<Early>,
 }
 
@@ -95,14 +98,16 @@ impl Probe {
         parser: &mut Parser,
         position: Position,
         trace: Option<&Trace>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<Option<Self>> {
+        check_optional_cancelled(cancelled)?;
         let Some(offset) = document.offset(position) else {
             return Ok(None);
         };
         let text = document.text();
         let root = document.root_node();
-        let replace = word_range(text, offset);
-        let early = literal(root, text, offset)
+        let replace = word_range(text, offset, cancelled);
+        let early = literal(root, text, offset, cancelled)
             .map(|literal| match literal {
                 Literal::Suppress => (Early::Suppressed, replace.clone()),
                 Literal::Import { inner, close } => (Early::ImportPath(close), inner),
@@ -111,6 +116,7 @@ impl Probe {
                 package_clause(root, text, replace.start)
                     .then(|| (Early::PackageClause, replace.clone()))
             });
+        check_optional_cancelled(cancelled)?;
         if let Some((early, replace)) = early {
             return Ok(Some(Self {
                 edit: Edit { replace, offset },
@@ -133,6 +139,7 @@ impl Probe {
                 replace.clone(),
                 after_dot,
                 trace,
+                cancelled,
             )?
         };
         Ok(Some(Self {
@@ -143,14 +150,51 @@ impl Probe {
     }
 
     pub(super) fn source<'a>(&'a self, document: &'a DocumentSnapshot<'_>) -> &'a Source {
-        self.syntax.as_ref().unwrap_or(document.indexed())
+        self.syntax
+            .as_ref()
+            .map_or(document.indexed(), |(source, _)| source)
+    }
+
+    pub(super) fn original_range(
+        &self,
+        document: &DocumentSnapshot<'_>,
+        selection: Range<usize>,
+    ) -> Option<LspRange> {
+        let original = match &self.syntax {
+            Some((_, repaired_end)) if selection.start >= *repaired_end => {
+                let original_end = self.edit.replace.end;
+                (original_end + selection.start - repaired_end)
+                    ..(original_end + selection.end - repaired_end)
+            }
+            Some(_) if selection.end > self.edit.replace.start => return None,
+            _ => selection,
+        };
+        document.text().get(original.clone())?;
+        Some(document.byte_range(original))
     }
 
     pub(super) fn anchor<'a>(&self, source: &'a Source) -> Node<'a> {
         leaf(source.tree.root_node(), self.edit.replace.start)
     }
 
-    pub(super) fn site<'a>(&self, source: &'a Source, original: &str) -> Site<'a> {
+    pub(super) fn site<'a>(
+        &self,
+        source: &'a Source,
+        original: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Site<'a>> {
+        check_optional_cancelled(cancelled)?;
+        let site = self.classify_site(source, original, cancelled);
+        check_optional_cancelled(cancelled)?;
+        Ok(site)
+    }
+
+    fn classify_site<'a>(
+        &self,
+        source: &'a Source,
+        original: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Site<'a> {
         match self.early {
             Some(Early::Suppressed) => return Site::Suppressed,
             Some(Early::PackageClause) => return Site::PackageClause,
@@ -203,7 +247,7 @@ impl Probe {
         if let Some(site) = type_position(anchor, line_left, guard, &source.text) {
             return site;
         }
-        if let Some((body, mode)) = literal_site(anchor, &source.text) {
+        if let Some((body, mode)) = literal_site(anchor, &source.text, cancelled) {
             return Site::StructLiteral { body, mode };
         }
         if is_file_top_level(anchor) {
@@ -282,11 +326,17 @@ pub(super) fn is_keyword(name: &str) -> bool {
     )
 }
 
-fn word_range(text: &str, offset: usize) -> Range<usize> {
-    let start = text[..offset].trim_end_matches(identifier_char).len();
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+}
+
+fn word_range(text: &str, offset: usize, cancelled: Option<&AtomicBool>) -> Range<usize> {
+    let start = text[..offset]
+        .trim_end_matches(|ch| !is_cancelled(cancelled) && identifier_char(ch))
+        .len();
     let end = offset
         + text[offset..]
-            .find(|ch| !identifier_char(ch))
+            .find(|ch| is_cancelled(cancelled) || !identifier_char(ch))
             .unwrap_or(text.len() - offset);
     start..end
 }
@@ -315,7 +365,12 @@ enum Literal {
     },
 }
 
-fn literal(root: Node<'_>, text: &str, offset: usize) -> Option<Literal> {
+fn literal(
+    root: Node<'_>,
+    text: &str,
+    offset: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Literal> {
     for node in [leaf(root, offset.saturating_sub(1)), leaf(root, offset)] {
         for token in ancestors(node) {
             if offset <= token.start_byte() || offset > token.end_byte() {
@@ -344,27 +399,30 @@ fn literal(root: Node<'_>, text: &str, offset: usize) -> Option<Literal> {
                     if !token.has_error() && !text[inner.clone()].contains(['\n', '\r']) {
                         return Some(Literal::Import { inner, close: None });
                     }
-                    return broken_literal(text, offset);
+                    return broken_literal(text, offset, cancelled);
                 }
                 _ => {}
             }
         }
     }
     root.has_error()
-        .then(|| broken_literal(text, offset))
+        .then(|| broken_literal(text, offset, cancelled))
         .flatten()
 }
 
 /// The parser can leave an unfinished quote or block comment as unrelated
 /// tokens inside ERROR. In that case, find the lexical delimiter and import
 /// group directly in the original buffer.
-fn broken_literal(text: &str, offset: usize) -> Option<Literal> {
+fn broken_literal(text: &str, offset: usize, cancelled: Option<&AtomicBool>) -> Option<Literal> {
     let bytes = text.as_bytes();
     let mut at = 0;
     let mut braces = 0usize;
     let mut in_import = false;
     let mut import_group = false;
     while at < offset {
+        if is_cancelled(cancelled) {
+            return None;
+        }
         match bytes[at] {
             b'/' if bytes.get(at + 1) == Some(&b'/') => {
                 let end = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
@@ -386,6 +444,9 @@ fn broken_literal(text: &str, offset: usize) -> Option<Literal> {
                 let start = at + 1;
                 at = start;
                 while at < bytes.len() && bytes[at] != quote {
+                    if is_cancelled(cancelled) {
+                        return None;
+                    }
                     match bytes[at] {
                         b'\n' | b'\r' if quote != b'`' => break,
                         b'\\'
@@ -434,7 +495,7 @@ fn broken_literal(text: &str, offset: usize) -> Option<Literal> {
                 at += 1;
             }
             b if b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() => {
-                let end = text[at..].find(|ch| !identifier_char(ch));
+                let end = text[at..].find(|ch| is_cancelled(cancelled) || !identifier_char(ch));
                 let length = end.unwrap_or(text.len() - at);
                 if length == 0 {
                     at += text[at..].chars().next()?.len_utf8();
@@ -457,7 +518,9 @@ fn repair(
     replace: Range<usize>,
     after_dot: bool,
     trace: Option<&Trace>,
-) -> Result<Option<Source>> {
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<(Source, usize)>> {
+    check_optional_cancelled(cancelled)?;
     let follow = &source.text[replace.end..];
     // A newline after a complete identifier terminates the statement. The
     // placeholder prevents the next line's identifier from becoming a selector.
@@ -477,6 +540,7 @@ fn repair(
     };
     let mut text = source.text.as_ref().clone();
     let marker = format!("{PLACEHOLDER}{separator}");
+    let mut repaired_end = replace.start + marker.len();
     text.replace_range(replace.clone(), &marker);
     let mut tree = source.tree.clone();
     let start = source.lines.point(replace.start);
@@ -488,7 +552,7 @@ fn repair(
         old_end_position: source.lines.point(replace.end),
         new_end_position: tree_sitter::Point::new(start.row, start.column + marker.len()),
     });
-    let mut repaired = Source::parse(parser, source.path.clone(), text, Some(&tree))?;
+    let mut repaired = parse_probe(parser, &source.path, text, Some(&tree), cancelled)?;
     let anchor = leaf(repaired.tree.root_node(), replace.start);
     if follow
         .trim_start_matches([' ', '\t', '\r'])
@@ -501,15 +565,16 @@ fn repair(
         // An unclosed literal can absorb the next assignment as part of
         // another literal whose apparent type is the completion marker.
         let mut text = std::sync::Arc::unwrap_or_clone(repaired.text);
-        text.insert(replace.start + marker.len(), '}');
+        text.insert(repaired_end, '}');
+        repaired_end += 1;
         if let Some(trace) = trace {
             trace.parse();
         }
-        repaired = Source::parse(parser, source.path.clone(), text, None)?;
+        repaired = parse_probe(parser, &source.path, text, None, cancelled)?;
     }
     let root = repaired.tree.root_node();
     if root.has_error() && ancestors(leaf(root, replace.start)).any(|node| node.is_error()) {
-        let closers = missing_closers(root);
+        let closers = missing_closers(root, cancelled)?;
         if !closers.is_empty() {
             let mut text = std::sync::Arc::unwrap_or_clone(repaired.text);
             if root
@@ -522,10 +587,25 @@ fn repair(
             if let Some(trace) = trace {
                 trace.parse();
             }
-            repaired = Source::parse(parser, source.path.clone(), text, None)?;
+            repaired = parse_probe(parser, &source.path, text, None, cancelled)?;
         }
     }
-    Ok(Some(repaired))
+    Ok(Some((repaired, repaired_end)))
+}
+
+fn parse_probe(
+    parser: &mut Parser,
+    path: &std::path::Path,
+    text: String,
+    previous: Option<&Tree>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Source> {
+    match cancelled {
+        Some(cancelled) => {
+            Source::parse_incremental_cancellable(parser, path, Arc::new(text), previous, cancelled)
+        }
+        None => Source::parse(parser, path.to_owned(), text, previous),
+    }
 }
 
 fn starts_assignment(text: &str) -> bool {
@@ -545,10 +625,11 @@ fn starts_assignment(text: &str) -> bool {
             .is_some_and(|rest| !rest.starts_with('='))
 }
 
-fn missing_closers(root: Node<'_>) -> String {
+fn missing_closers(root: Node<'_>, cancelled: Option<&AtomicBool>) -> Result<String> {
     let mut stack = Vec::new();
     let mut walk = root.walk();
     loop {
+        check_optional_cancelled(cancelled)?;
         let node = walk.node();
         if !node.is_missing() {
             match node.kind() {
@@ -566,7 +647,7 @@ fn missing_closers(root: Node<'_>) -> String {
         }
         while !walk.goto_next_sibling() {
             if !walk.goto_parent() {
-                return stack.into_iter().rev().collect();
+                return Ok(stack.into_iter().rev().collect());
             }
         }
     }
@@ -711,13 +792,20 @@ fn type_position<'a>(anchor: Node<'a>, left: &str, guard: bool, text: &str) -> O
     })
 }
 
-fn literal_site<'a>(anchor: Node<'a>, text: &str) -> Option<(Node<'a>, LiteralMode)> {
+fn literal_site<'a>(
+    anchor: Node<'a>,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Option<(Node<'a>, LiteralMode)> {
     let body = ancestors(anchor)
         .take_while(|node| !matches!(node.kind(), "block" | "argument_list" | "type_arguments"))
         .find(|node| node.kind() == "literal_value")?;
-    let active = body.named_children(&mut body.walk()).find(|node| {
-        node.start_byte() <= anchor.start_byte() && anchor.end_byte() <= node.end_byte()
-    });
+    let active = body
+        .named_children(&mut body.walk())
+        .take_while(|_| !is_cancelled(cancelled))
+        .find(|node| {
+            node.start_byte() <= anchor.start_byte() && anchor.end_byte() <= node.end_byte()
+        });
     if let Some(element) = active {
         if element.kind() == "keyed_element" {
             let key = element.child_by_field_name("key")?;
@@ -741,6 +829,7 @@ fn literal_site<'a>(anchor: Node<'a>, text: &str) -> Option<(Node<'a>, LiteralMo
     let mut unkeyed = false;
     for element in body
         .named_children(&mut body.walk())
+        .take_while(|_| !is_cancelled(cancelled))
         .filter(|node| Some(*node) != active)
     {
         match element.kind() {

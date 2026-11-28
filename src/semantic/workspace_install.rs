@@ -3,11 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+use anyhow::Result;
+use tree_sitter::Parser;
+
 use crate::telemetry;
-use crate::workspace::{Workspace, WorkspaceLoad, path_key};
+use crate::workspace::{CancelToken, Workspace, WorkspaceLoad, path_key};
 
 use super::completion::prefilter::{FileNames, Stamp};
+use super::disk_selection::DiskPackageSelection;
 use super::index::{CachedNavigationText, DiskIndex, FileIndex};
+use super::shared_disk::FileObservation;
 use super::{Engine, GraphChanges};
 
 pub(super) struct WorkspaceCacheChanges {
@@ -20,6 +25,7 @@ pub(crate) struct WorkspaceCacheSnapshot {
     graph_generation: u64,
     sdk_root: Option<PathBuf>,
     files: HashMap<PathBuf, CacheObservation>,
+    selection_inputs: HashMap<PathBuf, Option<FileObservation>>,
 }
 
 #[derive(Default)]
@@ -47,7 +53,7 @@ impl CacheObservation {
 
     fn disk_current(&self, disk: &DiskIndex) -> bool {
         self.disk.as_ref().is_some_and(|(stamp, previous)| {
-            *stamp == disk.stamp && previous.as_ptr() == Arc::as_ptr(&disk.declarations)
+            *stamp == disk.stamp && Weak::ptr_eq(previous, &disk.declarations)
         }) && self.current_stamp.is_some()
             && (self.current_stamp == disk.stamp
                 || self.names.is_some_and(|(stamp, fingerprint)| {
@@ -62,15 +68,48 @@ impl CacheObservation {
 pub(crate) struct LoadedWorkspace {
     pub(crate) workspace: Workspace,
     validation: WorkspaceCacheSnapshot,
+    package_selections: HashMap<PathBuf, DiskPackageSelection>,
 }
 
 impl WorkspaceCacheSnapshot {
+    #[cfg(test)]
     pub(crate) fn validate(mut self, workspace: Workspace) -> LoadedWorkspace {
+        for (path, observation) in &mut self.selection_inputs {
+            *observation = FileObservation::read(path).ok();
+        }
+        self.validate_inner(workspace, None)
+            .expect("uncancellable workspace validation")
+    }
+
+    pub(crate) fn observe_package_selections(&mut self, cancel: &CancelToken) -> Result<()> {
+        for (path, observation) in &mut self.selection_inputs {
+            cancel.check()?;
+            *observation = FileObservation::read(path).ok();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_cancellable(
+        self,
+        workspace: Workspace,
+        cancel: &CancelToken,
+    ) -> Result<LoadedWorkspace> {
+        self.validate_inner(workspace, Some(cancel))
+    }
+
+    fn validate_inner(
+        mut self,
+        workspace: Workspace,
+        cancel: Option<&CancelToken>,
+    ) -> Result<LoadedWorkspace> {
         let started = telemetry::now();
         let sdk = workspace.sdk_root().map(path_key).or(self.sdk_root.take());
         let mut graph_stamp_paths = 0;
         let mut metadata_paths = 0;
         for (path, observation) in &mut self.files {
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             if let Some(stamp) = workspace.selected_file_stamp(path) {
                 // The graph loader already sampled selected paths for diagnostic identities.
                 observation.current_stamp = stamp;
@@ -85,6 +124,28 @@ impl WorkspaceCacheSnapshot {
                 observation.current_stamp = fs::metadata(path).ok().map(Stamp::from);
             }
         }
+        let mut package_selections = HashMap::new();
+        if !self.selection_inputs.is_empty() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_go::LANGUAGE.into())
+                .expect("Go grammar must match the tree-sitter runtime");
+            for (path, before) in self.selection_inputs.drain() {
+                if let Some(cancel) = cancel {
+                    cancel.check()?;
+                }
+                if let Some(before) = before
+                    && workspace.selected_file_stamp(&path) == Some(Some(before.stamp))
+                    && let Some(selection) =
+                        DiskPackageSelection::read_observed(&mut parser, &path, before)
+                {
+                    package_selections.insert(path, selection);
+                }
+            }
+        }
+        if let Some(cancel) = cancel {
+            cancel.check()?;
+        }
         if let Some(started) = started {
             telemetry::event!("workspace_cache_validation", {
                 "target_generation": self.load.generation,
@@ -95,10 +156,11 @@ impl WorkspaceCacheSnapshot {
                 "graph_stamp_paths": graph_stamp_paths,
             });
         }
-        LoadedWorkspace {
+        Ok(LoadedWorkspace {
             workspace,
             validation: self,
-        }
+            package_selections,
+        })
     }
 }
 
@@ -120,13 +182,21 @@ impl Engine {
         }
         for (path, disk) in &self.state.disk_index {
             files.entry(path.clone()).or_default().disk =
-                Some((disk.stamp, Arc::downgrade(&disk.declarations)));
+                Some((disk.stamp, disk.declarations.clone()));
         }
         WorkspaceCacheSnapshot {
             load,
             graph_generation: self.state.completion_graph_generation,
             sdk_root: self.completion_imports.sdk_root().as_deref().map(path_key),
             files,
+            selection_inputs: self
+                .state
+                .documents
+                .keys()
+                .chain(self.state.pending_documents.keys())
+                .chain(self.state.diagnostic_file_changes.keys())
+                .map(|path| (path.clone(), None))
+                .collect(),
         }
     }
 
@@ -186,6 +256,7 @@ impl Engine {
         LoadedWorkspace {
             workspace,
             validation,
+            package_selections,
         }: LoadedWorkspace,
     ) -> bool {
         let changed = self.take_workspace_cache_changes(load);
@@ -240,6 +311,17 @@ impl Engine {
             self.implementation_sources.invalidate(path);
             false
         });
+        for (path, selection) in package_selections {
+            if !changed.contains(&path)
+                || self
+                    .state
+                    .diagnostic_file_changes
+                    .get(&path)
+                    .is_none_or(|change| change.stamp == Some(selection.stamp))
+            {
+                self.state.disk_package_selections.insert(path, selection);
+            }
+        }
         let cache_validation_ms = cache_started.map(telemetry::elapsed);
         self.implementation_sources.retain_workspace(&workspace);
         self.state.workspace = Some(Arc::new(workspace));
@@ -274,7 +356,7 @@ mod tests {
     use crate::semantic::index::NavigationText;
     use crate::semantic::source::Source;
 
-    fn cache(engine: &mut Engine, path: &Path) {
+    fn cache(engine: &mut Engine, path: &Path) -> Arc<FileIndex> {
         let text = NavigationText::read_cancellable(path, &AtomicBool::new(false)).unwrap();
         let source = Source::parse(
             &mut engine.state.parser,
@@ -283,15 +365,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut index = DiskIndex::new(&source);
+        let (mut index, declarations) = DiskIndex::test_observation(&source);
         index.stamp = text.stamp;
         let key = path_key(path);
-        engine.state.completion_names.insert(
-            key.clone(),
-            FileNames::new(text.stamp.unwrap(), &text.text, false),
-        );
+        engine
+            .state
+            .completion_names
+            .insert(key.clone(), FileNames::new(text.stamp.unwrap(), &text.text));
         engine.state.disk_index.insert(key.clone(), index);
         engine.state.navigation_texts.insert(key, text.downgrade());
+        declarations
     }
 
     #[test]
@@ -324,10 +407,182 @@ mod tests {
         let mut engine = Engine::new(project.root.clone());
         let load = engine.workspace_load();
         assert!(engine.install_workspace(load, project.workspace(selected, false)));
-        cache(&mut engine, &path);
+        let _declarations = cache(&mut engine, &path);
         project.write("conditional.go", after);
         engine.file_changed(&path, FileChangeType::CHANGED);
         assert_eq!(engine.workspace_load().generation, load.generation + 1);
+    }
+
+    #[test]
+    fn workspace_install_backfills_open_disk_selection_independently_of_the_overlay() {
+        let project = TestProject::new();
+        project.write("go.mod", "module example.test/sample\n\ngo 1.22\n");
+        let path = project.write("api.go", "package sample\nfunc Value() int { return 1 }\n");
+        let mut engine = Engine::new(project.root.clone());
+        let load = engine.workspace_load();
+        let overlay = "package overlay\nimport \"bytes\"\nvar _ bytes.Buffer\n";
+        engine.open(path.clone(), overlay.into(), 1).unwrap();
+        let initial = Workspace::load(&project.root, false).unwrap();
+        let expected = package_selection_view(&initial);
+        assert!(engine.install_workspace(load, initial));
+        let key = path_key(&path);
+        assert!(engine.state.disk_package_selections.contains_key(&key));
+        assert!(!engine.state.disk_index.contains_key(&key));
+        for value in [22, 333, 4444] {
+            project.write(
+                "api.go",
+                &format!("package sample\nfunc Value() int {{ return {value} }}\n"),
+            );
+            assert_eq!(
+                engine.observe_file_change(&path, FileChangeType::CHANGED, true),
+                None
+            );
+            assert_eq!(engine.state.documents[&key].text.as_str(), overlay);
+        }
+        engine.close(&path);
+        project.write(
+            "api.go",
+            "package sample\nfunc Value() int { return 55555 }\n",
+        );
+        assert_eq!(
+            engine.observe_file_change(&path, FileChangeType::CHANGED, true),
+            None
+        );
+        assert_eq!(engine.workspace_load(), load);
+        let rebuilt = Workspace::load(&project.root, false).unwrap();
+        assert_eq!(package_selection_view(&rebuilt), expected);
+        assert_eq!(
+            engine.state.workspace.as_ref().unwrap().package_errors(),
+            rebuilt.package_errors()
+        );
+    }
+
+    fn package_selection_view(workspace: &Workspace) -> Vec<(String, String, Vec<PathBuf>, bool)> {
+        workspace
+            .navigation_packages()
+            .map(|package| {
+                (
+                    package.id.clone(),
+                    package.name.clone(),
+                    package.files.clone(),
+                    package.load_error,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_first_cold_save_backfills_even_without_an_overlay_disk_index() {
+        let project = TestProject::new();
+        let path = project.write("api.go", "package sample\nfunc Value() int { return 1 }\n");
+        let mut engine = Engine::new(project.root.clone());
+        let load = engine.workspace_load();
+        // The document opened after this worker captured the observed paths.
+        let snapshot = engine.workspace_cache_snapshot(load);
+        engine
+            .open(path.clone(), "package overlay\n".into(), 1)
+            .unwrap();
+        let loaded = snapshot.validate(project.workspace(&["api.go"], false));
+        assert!(engine.install_loaded_workspace(load, loaded));
+        assert!(engine.state.disk_package_selections.is_empty());
+
+        project.write("api.go", "package sample\nfunc Value() int { return 22 }\n");
+        let first = engine.observe_file_change(&path, FileChangeType::CHANGED, true);
+        assert_eq!(first.unwrap().1, "cold_file");
+        project.write(
+            "api.go",
+            "package sample\nfunc Value() int { return 333 }\n",
+        );
+        assert_eq!(
+            engine.observe_file_change(&path, FileChangeType::CHANGED, true),
+            None
+        );
+        assert!(!engine.state.disk_index.contains_key(&path_key(&path)));
+    }
+
+    #[test]
+    fn workspace_disk_selection_changes_are_not_hidden_by_an_open_overlay() {
+        let cases = [
+            ("package sample\n", "package renamed\n"),
+            ("package sample\n", "package sample\nimport _ \"fmt\"\n"),
+            (
+                "package sample\n",
+                "//go:build rs_gopls_unset_build_tag\n\npackage sample\n",
+            ),
+            (
+                "package sample\n/*\n#cgo CFLAGS: -DFIRST\n*/\nimport \"C\"\n",
+                "package sample\n/*\n#cgo CFLAGS: -DSECOND\n*/\nimport \"C\"\n",
+            ),
+            (
+                "package sample\n// #cgo CFLAGS: -DFIRST\nimport \"C\"\n",
+                "package sample\n// #cgo CFLAGS: -DFIRST\n\nimport \"C\"\n",
+            ),
+            (
+                "package sample\nimport _ \"embed\"\n\n//go:embed first.txt\nvar data string\n",
+                "package sample\nimport _ \"embed\"\n\n//go:embed second.txt\nvar data string\n",
+            ),
+            (
+                "package sample\nimport _ \"\\x65mbed\"\nvar data = \x60\n//go:embed first.txt\n\x60\n",
+                "package sample\nimport _ \"\\x65mbed\"\n//go:embed first.txt\nvar data string\n",
+            ),
+        ];
+        for (before, after) in cases {
+            let project = TestProject::new();
+            let path = project.write("api.go", before);
+            let mut engine = Engine::new(project.root.clone());
+            let load = engine.workspace_load();
+            assert!(engine.install_workspace(load, project.workspace(&["api.go"], false)));
+            engine.open(path.clone(), before.into(), 1).unwrap();
+            project.write("api.go", after);
+            assert!(!engine.watched_package_selection_is_unchanged(&path, FileChangeType::CHANGED));
+            assert_eq!(
+                engine
+                    .observe_file_change(&path, FileChangeType::CHANGED, true)
+                    .unwrap()
+                    .1,
+                "signature_changed",
+                "{after}",
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_lifecycle_events_reload_even_when_package_selection_spelling_matches() {
+        let project = TestProject::new();
+        let original = project.write("api.go", "package sample\n");
+        let renamed = project.root.join("renamed.go");
+        let mut engine = Engine::new(project.root.clone());
+        let load = engine.workspace_load();
+        assert!(engine.install_workspace(load, project.workspace(&["api.go"], false)));
+        engine
+            .open(original.clone(), "package sample\n".into(), 1)
+            .unwrap();
+        assert!(
+            engine
+                .observe_file_change(&original, FileChangeType::CREATED, true)
+                .is_some()
+        );
+        fs::rename(&original, &renamed).unwrap();
+        engine.watched_files_changed(&[
+            (original.clone(), FileChangeType::DELETED),
+            (renamed.clone(), FileChangeType::CREATED),
+        ]);
+        let next = engine.workspace_load();
+        assert_eq!(next.generation, load.generation + 1);
+        assert!(
+            !engine
+                .state
+                .disk_package_selections
+                .contains_key(&path_key(&original))
+        );
+        assert!(engine.install_workspace(next, project.workspace(&["renamed.go"], false)));
+        let graph = engine.state.workspace.as_ref().unwrap();
+        assert!(graph.package_of_file(&original).is_none());
+        assert!(graph.package_of_file(&renamed).is_some());
+
+        let unknown = project.write("unobserved.go", "package sample\n");
+        engine.file_changed(&unknown, FileChangeType::CHANGED);
+        assert_eq!(engine.workspace_load().generation, next.generation + 1);
     }
 
     #[test]
@@ -343,16 +598,20 @@ mod tests {
         engine.open(caller.clone(), text.into(), 1).unwrap();
         let initial = engine.diagnostics_report(&caller).unwrap().0.clone();
         assert!(initial.items.is_empty());
-        engine
-            .state
-            .shared_disk
-            .load(&mut engine.state.parser, &dependency, None, None)
-            .unwrap();
+        engine.state.shared_disk.clear_full_cache();
+        assert_eq!(
+            engine.state.shared_disk.projection_counts(&dependency),
+            (0, 1)
+        );
 
         let updated = "package sample\nfunc Value() int { return 1234 }\n";
         project.write("dep.go", updated);
         engine.watched_files_changed(&[(dependency.clone(), FileChangeType::CHANGED)]);
         assert_eq!(engine.workspace_load(), load);
+        assert_eq!(
+            engine.state.shared_disk.projection_counts(&dependency),
+            (0, 2)
+        );
         let disk = engine
             .state
             .shared_disk
@@ -394,9 +653,8 @@ mod tests {
             engine.install_workspace(engine.workspace_load(), project.workspace(&files, false))
         );
         engine.open(edit.clone(), text.into(), 1).unwrap();
-        for path in [&stable, &edit, &watch, &stale, &replace] {
-            cache(&mut engine, path);
-        }
+        let _initial_declarations =
+            [&stable, &edit, &watch, &stale, &replace].map(|path| cache(&mut engine, path));
         let load = WorkspaceLoad {
             include_tests: true,
             ..engine.workspace_load()
@@ -422,9 +680,7 @@ mod tests {
             .unwrap();
         engine.file_changed(&watch, FileChangeType::CHANGED);
         assert_eq!(engine.workspace_load().generation, load.generation);
-        for path in [&watch, &new, &replace] {
-            cache(&mut engine, path);
-        }
+        let _updated_declarations = [&watch, &new, &replace].map(|path| cache(&mut engine, path));
         assert!(engine.install_loaded_workspace(load, loaded));
 
         let stable = path_key(&stable);

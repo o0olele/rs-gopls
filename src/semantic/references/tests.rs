@@ -62,7 +62,7 @@ fn span(line: u32, start: u32, end: u32) -> Range {
 }
 
 #[test]
-fn diagnostic_and_reference_workers_share_cold_reads_and_parses() {
+fn diagnostic_and_reference_workers_share_reads_and_declarations() {
     for large in [false, true] {
         let project = TestProject::new();
         let original = "package sample\nconst Needle = 7\n";
@@ -107,7 +107,8 @@ fn diagnostic_and_reference_workers_share_cold_reads_and_parses() {
         );
         let report = computation.join().unwrap();
         assert_eq!(report.is_none(), large);
-        assert_eq!(cache.counts(&usage), (1, 1));
+        assert_eq!(cache.counts(&usage).0, 1);
+        assert_eq!(cache.projection_counts(&usage), (1, 1));
 
         cache.set_hook(None);
         let report = engine
@@ -120,7 +121,8 @@ fn diagnostic_and_reference_workers_share_cold_reads_and_parses() {
             references(&mut engine, &target, Position::new(1, 6), false),
             expected
         );
-        assert_eq!(cache.counts(&usage), (1, 1));
+        assert_eq!(cache.counts(&usage).0, 1);
+        assert_eq!(cache.projection_counts(&usage), (1, 1));
     }
 }
 

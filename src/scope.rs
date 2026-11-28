@@ -1,10 +1,13 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Result;
 use tree_sitter::Node;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Binding<'tree> {
     pub(crate) name: Node<'tree>,
+    pub(crate) scope: Option<Node<'tree>>,
     pub(crate) explicit_type: Option<Node<'tree>>,
     pub(crate) initializer: Option<Node<'tree>>,
     pub(crate) result_index: usize,
@@ -42,9 +45,19 @@ pub(crate) fn visible_bindings<'tree>(
     offset: usize,
     text: &str,
 ) -> Vec<VisibleBinding<'tree>> {
+    visible_bindings_cancellable(root, offset, text, None).expect("uncancelled lexical bindings")
+}
+
+pub(crate) fn visible_bindings_cancellable<'tree>(
+    root: Node<'tree>,
+    offset: usize,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<VisibleBinding<'tree>>> {
     let mut collector = VisibleBindings {
         offset,
         text,
+        cancelled,
         depth: 0,
         seen: HashSet::new(),
         bindings: Vec::new(),
@@ -59,7 +72,7 @@ pub(crate) fn visible_bindings<'tree>(
         previous.and_then(|byte| recovered_function_body(root, byte, offset, text))
     {
         collector.recovered_body(body, function);
-        return collector.bindings;
+        return collector.finish();
     }
     if anchor == root
         && let Some(byte) = previous
@@ -69,6 +82,9 @@ pub(crate) fn visible_bindings<'tree>(
         // missing closing brace. Recover only a block that is still open.
         let mut node = Some(tail);
         while let Some(scope) = node {
+            if collector.cancelled() {
+                return collector.finish();
+            }
             if scope.kind() == "block" && collector.in_braces(scope) {
                 anchor = scope;
                 break;
@@ -78,21 +94,34 @@ pub(crate) fn visible_bindings<'tree>(
     }
     let mut current = Some(anchor);
     while let Some(scope) = current {
+        if collector.cancelled() {
+            break;
+        }
         collector.scope(scope);
         current = scope.parent();
     }
-    collector.bindings
+    collector.finish()
 }
 
 struct VisibleBindings<'tree, 'text> {
     offset: usize,
     text: &'text str,
+    cancelled: Option<&'text AtomicBool>,
     depth: usize,
     seen: HashSet<&'text str>,
     bindings: Vec<VisibleBinding<'tree>>,
 }
 
 impl<'tree> VisibleBindings<'tree, '_> {
+    fn cancelled(&self) -> bool {
+        is_cancelled(self.cancelled)
+    }
+
+    fn finish(self) -> Result<Vec<VisibleBinding<'tree>>> {
+        anyhow::ensure!(!self.cancelled(), "lexical binding collection cancelled");
+        Ok(self.bindings)
+    }
+
     fn add(&mut self, binding: Binding<'tree>, kind: VisibleBindingKind) {
         let name = &self.text[binding.name.byte_range()];
         if name == "_" || name.is_empty() || !self.seen.insert(name) {
@@ -125,6 +154,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             "for_statement" => {
                 let mut cursor = scope.walk();
                 for clause in scope.named_children(&mut cursor) {
+                    if self.cancelled() {
+                        return;
+                    }
                     match clause.kind() {
                         "for_clause" => self.initializer(clause),
                         "range_clause"
@@ -163,6 +195,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             .children(&mut body.walk())
             .take_while(|child| child.start_byte() < offset)
         {
+            if self.cancelled() {
+                return;
+            }
             match child.kind() {
                 "{" => blocks.push(Vec::new()),
                 "}" => {
@@ -182,6 +217,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
                 self.type_parameters(function);
             }
             for statement in block {
+                if self.cancelled() {
+                    return;
+                }
                 self.statement(statement);
             }
             self.depth += 1;
@@ -192,9 +230,11 @@ impl<'tree> VisibleBindings<'tree, '_> {
         let mut cursor = node.walk();
         let offset = self.offset;
         node.children(&mut cursor)
+            .take_while(|_| !self.cancelled())
             .any(|child| child.kind() == "{" && child.end_byte() <= offset)
             && node
                 .children(&mut cursor)
+                .take_while(|_| !self.cancelled())
                 .find(|child| child.kind() == "}" && !child.is_missing())
                 .is_none_or(|close| offset <= close.start_byte())
     }
@@ -220,6 +260,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             .named_children(&mut list.walk())
             .take_while(|node| node.start_byte() < offset)
         {
+            if self.cancelled() {
+                return;
+            }
             self.statement(node);
         }
     }
@@ -252,6 +295,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             .filter(Node::is_named)
             .enumerate()
         {
+            if self.cancelled() {
+                return;
+            }
             self.add(explicit_binding(node, name, index), kind);
         }
     }
@@ -259,6 +305,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
     fn left_bindings(&mut self, node: Node<'tree>, kind: VisibleBindingKind) {
         if let Some(left) = node.child_by_field_name("left") {
             for (index, name) in identifiers(left) {
+                if self.cancelled() {
+                    return;
+                }
                 let binding = if kind == VisibleBindingKind::ShortVar {
                     short_binding(node, name, index)
                 } else {
@@ -284,6 +333,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
                 continue;
             };
             for parameter in list.named_children(&mut list.walk()) {
+                if self.cancelled() {
+                    return;
+                }
                 self.named_bindings(parameter, kind);
             }
         }
@@ -295,6 +347,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             .filter(|list| list.start_byte() <= self.offset)
         {
             for parameter in list.named_children(&mut list.walk()) {
+                if self.cancelled() {
+                    return;
+                }
                 self.named_bindings(parameter, VisibleBindingKind::TypeParameter);
             }
         }
@@ -305,6 +360,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             && let Some((_, arguments)) = receiver_type_parameters(declaration)
         {
             for name in receiver_parameter_names(arguments) {
+                if self.cancelled() {
+                    return;
+                }
                 self.add(
                     binding(name, None, None, 0),
                     VisibleBindingKind::TypeParameter,
@@ -320,7 +378,7 @@ impl<'tree> VisibleBindings<'tree, '_> {
         let offset = self.offset;
         let case = switch
             .named_children(&mut switch.walk())
-            .take_while(|node| node.start_byte() <= offset)
+            .take_while(|node| node.start_byte() <= offset && !self.cancelled())
             .filter(|node| {
                 matches!(
                     node.kind(),
@@ -338,6 +396,9 @@ impl<'tree> VisibleBindings<'tree, '_> {
             && let Some(alias) = switch.child_by_field_name("alias")
         {
             for (_, name) in identifiers(alias) {
+                if self.cancelled() {
+                    return;
+                }
                 self.add(
                     case_alias_binding(switch, case, name, self.text),
                     VisibleBindingKind::TypeSwitch,
@@ -390,7 +451,16 @@ pub(crate) fn lexical_binding<'tree>(
     name: &str,
     text: &str,
 ) -> Option<Binding<'tree>> {
-    lexical_binding_with(reference, name, text, &|node| node.parent())
+    lexical_binding_cancellable(reference, name, text, None)
+}
+
+pub(crate) fn lexical_binding_cancellable<'tree>(
+    reference: Node<'tree>,
+    name: &str,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Binding<'tree>> {
+    lexical_binding_with_cancellation(reference, name, text, &|node| node.parent(), cancelled)
 }
 
 pub(crate) fn lexical_binding_with<'tree>(
@@ -398,6 +468,20 @@ pub(crate) fn lexical_binding_with<'tree>(
     name: &str,
     text: &str,
     parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+) -> Option<Binding<'tree>> {
+    lexical_binding_with_cancellation(reference, name, text, parent_of, None)
+}
+
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn lexical_binding_with_cancellation<'tree>(
+    reference: Node<'tree>,
+    name: &str,
+    text: &str,
+    parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+    cancelled: Option<&AtomicBool>,
 ) -> Option<Binding<'tree>> {
     if name == "_" {
         return None;
@@ -408,14 +492,17 @@ pub(crate) fn lexical_binding_with<'tree>(
         scope
             .child_by_field_name("initializer")
             .filter(|node| node.end_byte() <= offset)
-            .and_then(|node| declaration(node, name, text))
+            .and_then(|node| declaration_cancellable(node, name, text, cancelled))
     };
 
     let mut child = reference;
     while let Some(scope) = parent_of(child) {
+        if is_cancelled(cancelled) {
+            return None;
+        }
         let binding = match scope.kind() {
             "statement_list" | "var_spec_list" | "const_declaration" | "type_declaration" => {
-                preceding_binding(child, scope, name, text, parent_of)
+                preceding_binding(child, scope, name, text, parent_of, cancelled)
             }
             "if_statement" | "expression_switch_statement" | "for_clause" => initializer(scope),
             "for_statement" if child.kind() == "block" => {
@@ -437,21 +524,23 @@ pub(crate) fn lexical_binding_with<'tree>(
             "function_declaration" | "method_declaration" | "func_literal"
                 if child.kind() == "block" =>
             {
-                function_binding(scope, name, text)
+                function_binding(scope, name, text, cancelled)
             }
-            "function_declaration" => type_parameter_binding(scope, offset, name, text),
+            "function_declaration" => type_parameter_binding(scope, offset, name, text, cancelled),
             "method_declaration" => receiver_type_parameter_binding(scope, name, text),
-            "type_spec" | "type_alias" => type_parameter_binding(scope, offset, name, text)
-                .or_else(|| {
+            "type_spec" | "type_alias" => {
+                type_parameter_binding(scope, offset, name, text, cancelled).or_else(|| {
                     let statement = parent_of(parent_of(scope)?)?;
                     (statement.kind() != "source_file")
-                        .then(|| declaration(scope, name, text))
+                        .then(|| declaration_cancellable(scope, name, text, cancelled))
                         .flatten()
-                }),
+                })
+            }
             _ => None,
         };
-        if binding.is_some() {
-            return binding;
+        if let Some(mut binding) = binding {
+            binding.scope.get_or_insert(scope);
+            return Some(binding);
         }
         child = scope;
     }
@@ -464,10 +553,14 @@ fn preceding_binding<'tree>(
     name: &str,
     text: &str,
     parent_of: &impl Fn(Node<'tree>) -> Option<Node<'tree>>,
+    cancelled: Option<&AtomicBool>,
 ) -> Option<Binding<'tree>> {
     let mut binding = None;
     for node in previous_named_siblings(child, statement_list) {
-        if let Some(found) = declaration(node, name, text) {
+        if is_cancelled(cancelled) {
+            return None;
+        }
+        if let Some(found) = declaration_cancellable(node, name, text, cancelled) {
             if parent_of(found.name)
                 .and_then(parent_of)
                 .is_none_or(|node| node.kind() != "short_var_declaration")
@@ -492,7 +585,7 @@ fn preceding_binding<'tree>(
             "function_declaration" | "method_declaration" | "func_literal"
         )
     {
-        return function_binding(function, name, text).or(Some(binding));
+        return function_binding(function, name, text, cancelled).or(Some(binding));
     }
     Some(binding)
 }
@@ -553,11 +646,12 @@ fn function_binding<'tree>(
     function: Node<'tree>,
     name: &str,
     text: &str,
+    cancelled: Option<&AtomicBool>,
 ) -> Option<Binding<'tree>> {
     ["parameters", "receiver", "result", "type_parameters"]
         .into_iter()
         .filter_map(|field| function.child_by_field_name(field))
-        .find_map(|node| declaration(node, name, text))
+        .find_map(|node| declaration_cancellable(node, name, text, cancelled))
         .or_else(|| receiver_type_parameter_binding(function, name, text))
 }
 
@@ -598,11 +692,12 @@ fn type_parameter_binding<'tree>(
     offset: usize,
     name: &str,
     text: &str,
+    cancelled: Option<&AtomicBool>,
 ) -> Option<Binding<'tree>> {
     declaration_node
         .child_by_field_name("type_parameters")
         .filter(|list| list.start_byte() <= offset)
-        .and_then(|list| declaration(list, name, text))
+        .and_then(|list| declaration_cancellable(list, name, text, cancelled))
 }
 
 fn type_case_binding<'tree>(
@@ -646,7 +741,10 @@ fn case_alias_binding<'tree>(
     } else {
         None
     };
-    binding(name, explicit_type, initializer, 0)
+    Binding {
+        scope: Some(case),
+        ..binding(name, explicit_type, initializer, 0)
+    }
 }
 
 pub(crate) fn reference_binding<'tree>(node: Node<'tree>, text: &str) -> Option<Node<'tree>> {
@@ -740,6 +838,15 @@ pub(crate) fn declaration_binding_with<'tree>(
 }
 
 fn declaration<'tree>(node: Node<'tree>, name: &str, text: &str) -> Option<Binding<'tree>> {
+    declaration_cancellable(node, name, text, None)
+}
+
+fn declaration_cancellable<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Binding<'tree>> {
     let mut cursor = node.walk();
     match node.kind() {
         "var_declaration"
@@ -750,10 +857,13 @@ fn declaration<'tree>(node: Node<'tree>, name: &str, text: &str) -> Option<Bindi
         | "type_parameter_list"
         | "labeled_statement" => node
             .named_children(&mut cursor)
-            .find_map(|child| declaration(child, name, text)),
+            .take_while(|_| !is_cancelled(cancelled))
+            .find_map(|child| declaration_cancellable(child, name, text, cancelled)),
         "short_var_declaration" => {
             let names = node.child_by_field_name("left")?;
-            let (index, name) = identifier_in_list(names, name, text)?;
+            let (index, name) = identifiers(names)
+                .take_while(|_| !is_cancelled(cancelled))
+                .find(|(_, node)| text.get(node.byte_range()) == Some(name))?;
             Some(short_binding(node, name, index))
         }
         "type_spec"
@@ -766,6 +876,7 @@ fn declaration<'tree>(node: Node<'tree>, name: &str, text: &str) -> Option<Bindi
         | "field_declaration" => {
             let (index, name) = node
                 .children_by_field_name("name", &mut cursor)
+                .take_while(|_| !is_cancelled(cancelled))
                 .filter(Node::is_named)
                 .enumerate()
                 .find(|(_, candidate)| text.get(candidate.byte_range()) == Some(name))?;
@@ -859,6 +970,7 @@ fn binding<'tree>(
 ) -> Binding<'tree> {
     Binding {
         name,
+        scope: None,
         explicit_type,
         initializer,
         result_index,

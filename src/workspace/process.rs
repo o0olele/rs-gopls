@@ -1,6 +1,9 @@
 use std::io::Read;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -8,10 +11,31 @@ use anyhow::{Context, Result, anyhow, ensure};
 
 use super::CommandTrace;
 
+#[derive(Clone, Default)]
+pub(crate) struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    pub(crate) fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        check_load_cancelled(Some(self.flag()))
+    }
+
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.0
+    }
+}
+
 pub(crate) fn check_load_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
     ensure!(
         cancelled.is_none_or(|cancelled| !cancelled.load(Ordering::Relaxed)),
-        "cancelled Go test-view prewarm"
+        "cancelled Go workspace load"
     );
     Ok(())
 }
@@ -38,7 +62,12 @@ pub(super) fn read_command<T: Send + 'static>(
     cancelled: Option<&AtomicBool>,
     read_stdout: impl FnOnce(ChildStdout) -> Result<T> + Send + 'static,
 ) -> Result<(ExitStatus, Result<T>, Vec<u8>)> {
-    check_load_cancelled(cancelled)?;
+    if let Err(error) = check_load_cancelled(cancelled) {
+        if let Some(trace) = &mut trace {
+            trace.cancelled();
+        }
+        return Err(error);
+    }
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -75,6 +104,9 @@ fn wait_for_output<T>(
     let mut status = None;
     loop {
         if let Err(error) = check_load_cancelled(Some(cancelled)) {
+            if let Some(trace) = &mut trace {
+                trace.cancelled();
+            }
             if status.is_none() {
                 let _ = child.kill();
                 thread::spawn(move || {

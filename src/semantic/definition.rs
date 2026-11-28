@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use lsp_types::{Position, Range};
 
-use super::Engine;
 use super::navigation_trace::{NavigationKind, NavigationProbe, active, record, sample};
 use super::query::QueryProgress;
 use super::snapshot::{DocumentSnapshot, EngineSnapshot};
 use super::source::{ReferenceQuery, is_declaration_name, is_test_source};
+use super::{Engine, QueryReadMemo};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionKind {
@@ -18,17 +18,41 @@ pub(crate) enum DefinitionKind {
 type DefinitionProgress = QueryProgress<Option<(PathBuf, Range)>>;
 
 impl Engine {
+    #[cfg(test)]
     pub(crate) fn definition(
         &mut self,
         path: &Path,
         position: Position,
         kind: DefinitionKind,
     ) -> Result<DefinitionProgress> {
+        self.definition_query(path, position, kind, None)
+    }
+
+    pub(crate) fn definition_foreground(
+        &mut self,
+        path: &Path,
+        position: Position,
+        kind: DefinitionKind,
+        memo: &QueryReadMemo,
+    ) -> Result<DefinitionProgress> {
+        self.definition_query(path, position, kind, Some(memo))
+    }
+
+    fn definition_query(
+        &mut self,
+        path: &Path,
+        position: Position,
+        kind: DefinitionKind,
+        memo: Option<&QueryReadMemo>,
+    ) -> Result<DefinitionProgress> {
         let probe = active(NavigationKind::Definition);
         let probe = probe.as_deref();
         let _exec = sample(probe, |counts| &mut counts.exec);
         record(probe, |counts| counts.definition_route = "empty");
         let mut snapshot = self.state.snapshot(self.include_tests);
+        if let Some(memo) = memo {
+            snapshot = snapshot.with_foreground(memo);
+        }
         let Some(document) = snapshot.navigation_document(path, probe)? else {
             return Ok(QueryProgress::Ready(None));
         };

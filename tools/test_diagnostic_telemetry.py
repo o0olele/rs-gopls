@@ -30,7 +30,10 @@ _TEMP_PREFIX = "rs-gopls-telemetry-workspace-"
 _TIMEOUT = 30
 _REFRESH = "workspace/diagnostic/refresh"
 _HASH = r"^h:[0-9a-f]{16}$"
-_LANES = {"foreground", "reserve", "background", "large"}
+_LANE_STAGES = {
+    "foreground": "stage1", "reserve": "stage1", "large_preview": "stage1",
+    "background": "stage2", "background_2": "stage2", "large": "stage2",
+}
 _CODES = {
     "syntax.error", "package.load", "import.unused", "import.invalid", "import.self",
     "import.cycle", "import.duplicate_alias", "name.unresolved", "name.unexported",
@@ -44,6 +47,19 @@ _CODES = {
 
 def _invalid_constant(value):
     raise ValueError(f"invalid JSON constant {value}")
+
+
+def _cleanup_workspace(temporary):
+    # A Go command launched by the relay can briefly retain its cwd on Windows.
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            temporary.cleanup()
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.025)
 
 
 class _RefreshClient(LspClient):
@@ -71,7 +87,7 @@ class DiagnosticTelemetryTests(unittest.TestCase):
             self.skipTest("Go is required for the stdio telemetry fixture")
         self.server = executable(_BINARY)
         temporary = tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX)
-        self.addCleanup(temporary.cleanup)
+        self.addCleanup(_cleanup_workspace, temporary)
         self.root = Path(temporary.name).resolve()
         self.fixture = dual_gopath(self.root / "project")
         self.environment = {
@@ -224,7 +240,8 @@ class DiagnosticTelemetryTests(unittest.TestCase):
             self.assertRegex(row["document"], _HASH)
             self.assertIn(row["stage"], ("stage1", "stage2"))
             self.assertIn(row["context_completeness"], ("partial", "full"))
-            self.assertIn(row["lane"], _LANES)
+            self.assertIn(row["lane"], _LANE_STAGES)
+            self.assertEqual(row["stage"], _LANE_STAGES[row["lane"]])
             for field in ("queue_wait_ms", "merge_wait_ms", "runnable_queue_wait_ms", "context_wait_ms"):
                 self.assertGreaterEqual(row[field], 0)
             self.assertAlmostEqual(row["queue_wait_ms"], row["worker_started_ms"] - row["enqueued_ms"], delta=0.02)
@@ -535,6 +552,18 @@ class DiagnosticTelemetryTests(unittest.TestCase):
         self.assertGreater(terminal_worker["context_wait_ms"], 0)
         self.assertIn(terminal_worker["cold_dep_reads"], (0, 1))
         self.assertEqual(terminal_worker["cold_dep_parses"], 1)
+        stats = terminal_worker["shared_disk"]
+        self.assertGreater(stats["mutex_acquired"], 0)
+        self.assertGreaterEqual(stats["mutex_wait_ms"], 0)
+        self.assertGreaterEqual(stats["try_lock_busy"], 0)
+        for key in ("cache_hits", "producer_requested", "joins"):
+            self.assertEqual(stats[key], sum(artifact.get(key, 0)
+                                             for artifact in stats.get("artifacts", {}).values()))
+        self.assertGreater(stats["artifacts"]["declarations"].get("producer_requested", 0)
+                           + stats["artifacts"]["declarations"].get("joins", 0), 0)
+        self.assertFalse(self._events(rows, "shared_disk_mutex"))
+        self.assertFalse(any(row["outcome"] == "cache_hit"
+                             for row in self._events(rows, "shared_disk_lookup")))
         self.assertFalse(self._events(rows, "diagnostic_push_write"))
 
         sent = {row["refresh_id"]: row for row in self._events(rows, "diagnostic_refresh_send")}

@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::workspace_roots::GoBuildEnvironmentCache;
+
 pub(crate) type EnvironmentOverrides = BTreeMap<String, String>;
 
 #[derive(Clone)]
@@ -13,6 +15,7 @@ pub(crate) struct GoEnvironment {
     startup: Arc<BTreeMap<OsString, OsString>>,
     variables: Arc<BTreeMap<OsString, OsString>>,
     allows_module_auto: bool,
+    pub(crate) workspace_build_environments: Arc<GoBuildEnvironmentCache>,
 }
 
 impl GoEnvironment {
@@ -26,6 +29,7 @@ impl GoEnvironment {
             startup: Arc::clone(&startup),
             variables: startup,
             allows_module_auto: false,
+            workspace_build_environments: Arc::default(),
         }
     }
 
@@ -47,10 +51,16 @@ impl GoEnvironment {
             variables.extend(overrides);
             Arc::new(variables)
         };
+        let workspace_build_environments = if variables == self.variables {
+            Arc::clone(&self.workspace_build_environments)
+        } else {
+            Arc::default()
+        };
         Self {
             startup: Arc::clone(&self.startup),
             variables,
             allows_module_auto,
+            workspace_build_environments,
         }
     }
 

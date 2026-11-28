@@ -1,8 +1,9 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,7 @@ use crate::symbols::{self, FileOutline};
 use super::editor::HighlightCache;
 
 pub(super) const LARGE_OPEN_BYTES: usize = 512 * 1024;
+static NEXT_SYNTAX_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(super) struct OpenText {
@@ -50,7 +52,7 @@ impl OpenText {
         cancelled: &AtomicBool,
     ) -> Result<Source> {
         check_cancelled(cancelled)?;
-        let tree = parse_cancellable_tree(parser, &self.text, cancelled, || {})?;
+        let tree = parse_cancellable_tree(parser, &self.text, None, cancelled, || {})?;
         Source::from_tree(path, self.text, self.lines, tree, Some(cancelled))
     }
 }
@@ -71,6 +73,38 @@ fn edit_offsets(
         bail!("edit ends before it begins");
     }
     Ok((start, end))
+}
+
+pub(super) fn text_change_ranges(
+    previous: &str,
+    current: &str,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let start = previous.floor_char_boundary(
+        previous
+            .bytes()
+            .zip(current.bytes())
+            .take_while(|(a, b)| a == b)
+            .count(),
+    );
+    let shared_tail = previous[start..]
+        .bytes()
+        .rev()
+        .zip(current[start..].bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let previous_end = previous.ceil_char_boundary(previous.len() - shared_tail);
+    let current_end = current.len() - (previous.len() - previous_end);
+    (start..previous_end, start..current_end)
+}
+
+fn edited_end_point(start: Point, inserted: &str) -> Point {
+    match inserted.rfind('\n') {
+        Some(last_break) => Point::new(
+            start.row + inserted.bytes().filter(|byte| *byte == b'\n').count(),
+            inserted.len() - last_break - 1,
+        ),
+        None => Point::new(start.row, start.column + inserted.len()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -127,21 +161,24 @@ impl EditorNames {
     }
 
     pub(super) fn cache_weight(&self) -> usize {
-        self.files.keys().map(|name| name.len() + 64).sum::<usize>()
-            + self
-                .methods
-                .iter()
-                .map(|name| name.len() + 48)
-                .sum::<usize>()
-            + self
-                .imports
-                .keys()
-                .map(|name| name.len() + 64)
-                .sum::<usize>()
+        fn buckets<T>(capacity: usize) -> usize {
+            (capacity * 8).div_ceil(7) * (size_of::<T>() + 1)
+        }
+
+        size_of::<Self>()
+            + buckets::<(String, FileName)>(self.files.capacity())
+            + self.files.keys().map(String::capacity).sum::<usize>()
+            + buckets::<String>(self.methods.capacity())
+            + self.methods.iter().map(String::capacity).sum::<usize>()
+            + buckets::<(String, Option<std::ops::Range<usize>>)>(self.imports.capacity())
+            + self.imports.keys().map(String::capacity).sum::<usize>()
+            + self.raw_imports.capacity() * size_of::<Import>()
             + self
                 .raw_imports
                 .iter()
-                .map(|import| import.path.len() + import.alias.as_ref().map_or(0, String::len) + 72)
+                .map(|import| {
+                    import.path.capacity() + import.alias.as_ref().map_or(0, String::capacity)
+                })
                 .sum::<usize>()
     }
 
@@ -245,6 +282,7 @@ pub(super) struct Source {
     pub(super) text: Arc<String>,
     pub(super) lines: LineIndex,
     pub(super) tree: Tree,
+    pub(super) syntax_revision: u64,
     pub(super) imports: std::sync::Arc<[Import]>,
     pub(super) diagnostic_imports: std::sync::Arc<[DiagnosticImport]>,
     pub(super) editor_names: Arc<EditorNames>,
@@ -252,7 +290,7 @@ pub(super) struct Source {
     pub(super) outline: OnceCell<FileOutline>,
     reference_names: Arc<OnceLock<HashMap<String, Vec<usize>>>>,
     highlight_names: Arc<HighlightNames>,
-    fingerprint: OnceCell<u64>,
+    fingerprint: Arc<OnceLock<u64>>,
 }
 
 #[derive(Clone)]
@@ -261,13 +299,14 @@ pub(super) struct SourceRevision {
     text: Arc<String>,
     lines: LineIndex,
     tree: Tree,
+    syntax_revision: u64,
     imports: Arc<[Import]>,
     diagnostic_imports: Arc<[DiagnosticImport]>,
     editor_names: Arc<EditorNames>,
     highlights: Arc<HighlightCache>,
     reference_names: Arc<OnceLock<HashMap<String, Vec<usize>>>>,
     highlight_names: Arc<HighlightNames>,
-    fingerprint: Option<u64>,
+    fingerprint: Arc<OnceLock<u64>>,
 }
 
 impl SourceRevision {
@@ -277,6 +316,7 @@ impl SourceRevision {
             text: self.text,
             lines: self.lines,
             tree: self.tree,
+            syntax_revision: self.syntax_revision,
             imports: self.imports,
             diagnostic_imports: self.diagnostic_imports,
             editor_names: self.editor_names,
@@ -284,7 +324,7 @@ impl SourceRevision {
             outline: OnceCell::new(),
             reference_names: self.reference_names,
             highlight_names: self.highlight_names,
-            fingerprint: self.fingerprint.map_or_else(OnceCell::new, OnceCell::from),
+            fingerprint: self.fingerprint,
         }
     }
 }
@@ -313,6 +353,7 @@ impl Source {
         Self::from_tree(path, text, lines, tree, None)
     }
 
+    #[cfg(test)]
     pub(super) fn parse_declarations(
         parser: &mut Parser,
         path: PathBuf,
@@ -330,23 +371,57 @@ impl Source {
             .map(|source| (source, false))
     }
 
-    pub(super) fn parse_dependency_declarations(
+    pub(super) fn try_parse_dependency_declarations(
         parser: &mut Parser,
         path: &Path,
         text: Arc<String>,
         bodies: &[std::ops::Range<usize>],
         cancelled: &AtomicBool,
-    ) -> Result<(Self, bool)> {
+    ) -> Result<Option<Self>> {
         let lines = LineIndex::new_cancellable(&text, cancelled)?;
-        let elided = Self::parse_without_bodies(parser, &text, &lines, bodies, Some(cancelled))?;
-        let declarations_only = elided.is_some();
-        let tree = match elided {
-            Some(tree) => tree,
-            None => parse_cancellable_tree(parser, &text, cancelled, || {})?,
+        let tree = if bodies.is_empty() {
+            Some(parse_cancellable_tree(
+                parser,
+                &text,
+                None,
+                cancelled,
+                || {},
+            )?)
+        } else {
+            Self::parse_without_bodies(parser, &text, &lines, bodies, Some(cancelled))?
         };
-        let source = Self::from_tree(path.to_owned(), text, lines, tree, Some(cancelled))?;
-        check_cancelled(cancelled)?;
-        Ok((source, declarations_only))
+        let Some(tree) = tree else {
+            return Ok(None);
+        };
+        let root = tree.root_node();
+        if root.has_error() {
+            return Ok(None);
+        }
+        // Confirm the lexer skipped exactly the interiors of top-level blocks.
+        // Anonymous result types and package initializers must stay intact.
+        let mut bodies = bodies.iter().peekable();
+        for decl in root.named_children(&mut root.walk()) {
+            check_cancelled(cancelled)?;
+            if !matches!(decl.kind(), "function_declaration" | "method_declaration") {
+                continue;
+            }
+            let Some(block) = decl.child_by_field_name("body") else {
+                continue;
+            };
+            if bodies
+                .peek()
+                .is_some_and(|range| range.start == block.start_byte() + 1)
+            {
+                let range = bodies.next().unwrap();
+                if range.end + 1 != block.end_byte() || block.named_child_count() != 0 {
+                    return Ok(None);
+                }
+            }
+        }
+        if bodies.next().is_some() {
+            return Ok(None);
+        }
+        Self::from_tree(path.to_owned(), text, lines, tree, Some(cancelled)).map(Some)
     }
 
     fn parse_without_bodies(
@@ -380,7 +455,7 @@ impl Source {
         });
         if parser.set_included_ranges(&included).is_ok() {
             let tree = if let Some(cancelled) = cancelled {
-                parse_cancellable_tree(parser, text, cancelled, || {}).map(Some)
+                parse_cancellable_tree(parser, text, None, cancelled, || {}).map(Some)
             } else {
                 Ok(parser.parse(text, None))
             };
@@ -406,6 +481,7 @@ impl Source {
             text,
             lines,
             tree,
+            syntax_revision: NEXT_SYNTAX_REVISION.fetch_add(1, Ordering::Relaxed),
             imports: imports.into(),
             diagnostic_imports: diagnostic_imports.into(),
             editor_names: Arc::new(editor_names),
@@ -413,14 +489,44 @@ impl Source {
             outline: OnceCell::new(),
             reference_names: Arc::default(),
             highlight_names: Arc::default(),
-            fingerprint: OnceCell::new(),
+            fingerprint: Arc::default(),
         })
     }
 
     pub(super) fn fingerprint(&self) -> u64 {
-        *self
-            .fingerprint
-            .get_or_init(|| super::index::text_fingerprint(&self.text))
+        if let Some(&fingerprint) = self.fingerprint.get() {
+            return fingerprint;
+        }
+        let fingerprint = super::index::text_fingerprint(&self.text);
+        let _ = self.fingerprint.set(fingerprint);
+        fingerprint
+    }
+
+    pub(super) fn fingerprint_cancellable(&self, cancelled: Option<&AtomicBool>) -> Result<u64> {
+        let Some(cancelled) = cancelled else {
+            return Ok(self.fingerprint());
+        };
+        check_cancelled(cancelled)?;
+        if let Some(&fingerprint) = self.fingerprint.get() {
+            return Ok(fingerprint);
+        }
+        let mut hasher = DefaultHasher::new();
+        for bytes in self.text.as_bytes().chunks(64 * 1024) {
+            check_cancelled(cancelled)?;
+            hasher.write(bytes);
+        }
+        // Hash for str feeds its UTF-8 bytes followed by this terminator.
+        hasher.write_u8(0xff);
+        let fingerprint = hasher.finish();
+        let _ = self.fingerprint.set(fingerprint);
+        Ok(fingerprint)
+    }
+
+    pub(super) fn rebind_path(&mut self, path: PathBuf) {
+        if self.path != path {
+            self.path = path;
+            self.syntax_revision = NEXT_SYNTAX_REVISION.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(super) fn revision(&self) -> SourceRevision {
@@ -429,13 +535,14 @@ impl Source {
             text: Arc::clone(&self.text),
             lines: self.lines.clone(),
             tree: self.tree.clone(),
+            syntax_revision: self.syntax_revision,
             imports: self.imports.clone(),
             diagnostic_imports: self.diagnostic_imports.clone(),
             editor_names: self.editor_names.clone(),
             highlights: self.highlights.clone(),
             reference_names: self.reference_names.clone(),
             highlight_names: self.highlight_names.clone(),
-            fingerprint: self.fingerprint.get().copied(),
+            fingerprint: self.fingerprint.clone(),
         }
     }
 
@@ -456,8 +563,18 @@ impl Source {
         text: Arc<String>,
         cancelled: &AtomicBool,
     ) -> Result<Self> {
+        Self::parse_incremental_cancellable(parser, path, text, None, cancelled)
+    }
+
+    pub(super) fn parse_incremental_cancellable(
+        parser: &mut Parser,
+        path: &Path,
+        text: Arc<String>,
+        previous: Option<&Tree>,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
         check_cancelled(cancelled)?;
-        let tree = parse_cancellable_tree(parser, &text, cancelled, || {})?;
+        let tree = parse_cancellable_tree(parser, &text, previous, cancelled, || {})?;
         check_cancelled(cancelled)?;
         let lines = LineIndex::new_cancellable(&text, cancelled)?;
         let source = Self::from_tree(path.to_owned(), text, lines, tree, Some(cancelled))?;
@@ -477,41 +594,51 @@ impl Source {
         let mut tree = self.tree.clone();
         let mut lines = self.lines.clone();
         for change in changes {
-            let (start, end) = edit_offsets(&text, &lines, change)?;
-
-            let start_position = lines.point(start);
-            let new_end_position = match change.text.rfind('\n') {
-                Some(last_break) => Point::new(
-                    start_position.row + change.text.bytes().filter(|byte| *byte == b'\n').count(),
-                    change.text.len() - last_break - 1,
-                ),
-                None => Point::new(
-                    start_position.row,
-                    start_position.column + change.text.len(),
-                ),
+            let (start, end, inserted) = if change.range.is_none() {
+                let (old, new) = text_change_ranges(&text, &change.text);
+                (old.start, old.end, &change.text[new])
+            } else {
+                let (start, end) = edit_offsets(&text, &lines, change)?;
+                (start, end, change.text.as_str())
             };
+            let start_position = lines.point(start);
+            let new_end_position = edited_end_point(start_position, inserted);
             if let Some(observer) = &mut observe
-                && !observer(TextEditDelta {
-                    range: change.range,
-                    bytes: start..end,
-                    inserted: &change.text,
-                    new_end_line: new_end_position.row,
-                    text: &text,
-                    tree: &tree,
+                && !observer(if change.range.is_none() {
+                    TextEditDelta {
+                        range: None,
+                        bytes: 0..text.len(),
+                        inserted: &change.text,
+                        new_end_line: edited_end_point(Point::new(0, 0), &change.text).row,
+                        text: &text,
+                        tree: &tree,
+                    }
+                } else {
+                    TextEditDelta {
+                        range: change.range,
+                        bytes: start..end,
+                        inserted,
+                        new_end_line: new_end_position.row,
+                        text: &text,
+                        tree: &tree,
+                    }
                 })
             {
                 observe = None;
             }
+            if start == end && inserted.is_empty() {
+                continue;
+            }
             tree.edit(&InputEdit {
                 start_byte: start,
                 old_end_byte: end,
-                new_end_byte: start + change.text.len(),
+                new_end_byte: start + inserted.len(),
                 start_position,
                 old_end_position: lines.point(end),
                 new_end_position,
             });
-            lines.edit(start, end, &change.text);
-            text.replace_range(start..end, &change.text);
+            lines.edit(start, end, inserted);
+            text.replace_range(start..end, inserted);
         }
 
         *self = Self::parse_with_lines(
@@ -1010,13 +1137,21 @@ pub(super) fn node_text<'text>(node: Node<'_>, text: &'text str) -> &'text str {
 }
 
 pub(super) fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
-    anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "diagnostics cancelled");
+    anyhow::ensure!(
+        !cancelled.load(Ordering::Relaxed),
+        "Go source processing cancelled"
+    );
     Ok(())
+}
+
+pub(crate) fn check_optional_cancelled(cancelled: Option<&AtomicBool>) -> Result<()> {
+    cancelled.map_or(Ok(()), check_cancelled)
 }
 
 fn parse_cancellable_tree(
     parser: &mut Parser,
     text: &str,
+    previous: Option<&Tree>,
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(),
 ) -> Result<Tree> {
@@ -1027,7 +1162,7 @@ fn parse_cancellable_tree(
     let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
     let tree = parser.parse_with_options(
         &mut |offset, _| &text.as_bytes()[offset.min(text.len())..],
-        None,
+        previous,
         Some(options),
     );
     if tree.is_none() {
@@ -1051,7 +1186,7 @@ fn private_parse_cancellation_stops_at_the_progress_callback_and_resets_parser()
         .unwrap();
     let cancelled = AtomicBool::new(false);
     let mut signalled = None;
-    let result = parse_cancellable_tree(&mut parser, &text, &cancelled, || {
+    let result = parse_cancellable_tree(&mut parser, &text, None, &cancelled, || {
         signalled = Some(Instant::now());
         cancelled.store(true, Ordering::Relaxed);
     });
@@ -1197,6 +1332,21 @@ mod tests {
         parser
     }
 
+    #[test]
+    fn cancellable_fingerprint_matches_existing_fingerprint_across_chunks() {
+        let mut parser = parser();
+        let text = format!("package sample\n// {}\n", "😀abc".repeat(30_000));
+        let source = Source::parse(&mut parser, PathBuf::from("sample.go"), text, None).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let fingerprint = source.fingerprint_cancellable(Some(&cancelled)).unwrap();
+        assert_eq!(
+            fingerprint,
+            crate::semantic::index::text_fingerprint(&source.text)
+        );
+        let captured = source.revision().into_source();
+        assert_eq!(captured.fingerprint.get(), Some(&fingerprint));
+    }
+
     fn change(range: Option<Range>, text: &str) -> TextDocumentContentChangeEvent {
         TextDocumentContentChangeEvent {
             range,
@@ -1313,6 +1463,38 @@ mod tests {
         );
         assert!(!source.tree.root_node().has_error());
         assert_eq!(source.lines.starts, LineIndex::new(&source.text).starts);
+    }
+
+    #[test]
+    fn full_text_change_keeps_unchanged_syntax_and_matches_a_fresh_parse() {
+        let mut parser = parser();
+        let original = "package p\r\nfunc Keep() int { return 1 }\r\nvar Value = \"😀\"\r\n";
+        let updated = "package p\r\nfunc Keep() int { return 1 }\r\nvar Value = \"😁\"\r\n";
+        let mut source = Source::parse(&mut parser, PathBuf::new(), original.into(), None).unwrap();
+        let unchanged = source.tree.root_node().named_child(1).unwrap().id();
+        source
+            .edit(
+                &mut parser,
+                &[change(None, updated)],
+                Some(&mut |delta| {
+                    assert_eq!(delta.range, None);
+                    assert_eq!(delta.bytes, 0..original.len());
+                    assert_eq!(delta.inserted, updated);
+                    false
+                }),
+            )
+            .unwrap();
+        let fresh = Source::parse(&mut parser, PathBuf::new(), updated.into(), None).unwrap();
+        assert_eq!(source.text, fresh.text);
+        assert_eq!(source.lines.starts, fresh.lines.starts);
+        assert_eq!(
+            source.tree.root_node().to_sexp(),
+            fresh.tree.root_node().to_sexp()
+        );
+        assert_eq!(
+            source.tree.root_node().named_child(1).unwrap().id(),
+            unchanged
+        );
     }
 
     #[test]

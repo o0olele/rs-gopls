@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -6,26 +7,31 @@ use anyhow::Result;
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position, Range};
 use tree_sitter::Node;
 
-use crate::scope::{
-    Binding, declaration_binding, lexical_binding, receiver_type_parameters, reference_binding,
-};
+use crate::rpc_telemetry;
+use crate::scope::{Binding, declaration_binding, lexical_binding, reference_binding};
 use crate::symbols::{FileSymbols, Symbol};
 
-use super::Engine;
 use super::index::{IndexedSource, draft_package};
 use super::presentation::{builtin_function, documentation, function_signature, syntax_text};
 use super::query::QueryProgress;
-use super::resolver::{Resolver, TypeKind, is_predeclared, is_predeclared_type};
+use super::resolver::{
+    Resolver, TypeKind, is_predeclared, is_predeclared_type, receiver_parameter_origin,
+};
+use super::shared_disk::QueryReadLimit;
 use super::snapshot::DocumentSnapshot;
 use super::source::{
     ReferenceQuery, Source, import_path, is_declaration_name, is_test_source, is_type_declaration,
     node_at_range, node_text,
 };
+use super::{Engine, QueryReadMemo, SharedLoadPending};
 use crate::workspace::{Package, path_key};
 
+mod package_docs;
 mod values;
 
-use values::value_signature;
+pub(super) use package_docs::HoverDocCache;
+use package_docs::PackageDocs;
+use values::{value_parts, value_signature};
 
 #[derive(Clone, Copy)]
 enum Target<'tree> {
@@ -98,23 +104,35 @@ impl Presentation {
 }
 
 impl Engine {
+    #[cfg(test)]
     pub fn hover(
         &mut self,
         path: &Path,
         position: Position,
     ) -> Result<QueryProgress<Option<Hover>>> {
-        self.hover_query(path, position, true)
+        self.hover_query(path, position, true, None)
     }
 
+    #[cfg(test)]
     pub fn hover_after_load_failure(
         &mut self,
         path: &Path,
         position: Position,
     ) -> Result<Option<Hover>> {
-        match self.hover_query(path, position, false)? {
+        match self.hover_query(path, position, false, None)? {
             QueryProgress::Ready(hover) => Ok(hover),
             _ => unreachable!("hover fallback uses only the query source"),
         }
+    }
+
+    pub(crate) fn hover_foreground(
+        &mut self,
+        path: &Path,
+        position: Position,
+        load_workspace: bool,
+        memo: &QueryReadMemo,
+    ) -> Result<QueryProgress<Option<Hover>>> {
+        self.hover_query(path, position, load_workspace, Some(memo))
     }
 
     fn hover_query(
@@ -122,8 +140,13 @@ impl Engine {
         path: &Path,
         position: Position,
         load_workspace: bool,
+        memo: Option<&QueryReadMemo>,
     ) -> Result<QueryProgress<Option<Hover>>> {
+        let anchor = rpc_telemetry::phase("anchor");
         let mut snapshot = self.state.snapshot(self.include_tests);
+        if let Some(memo) = memo {
+            snapshot = snapshot.with_foreground(memo);
+        }
         let document = match snapshot.document(path) {
             Ok(Some(document)) => document,
             Ok(None) => return Ok(QueryProgress::Ready(None)),
@@ -140,26 +163,50 @@ impl Engine {
         let Some(target) = Target::at(&document, position) else {
             return Ok(QueryProgress::Ready(None));
         };
+        drop(anchor);
         let ready = |presentation: Option<Presentation>| {
-            QueryProgress::Ready(presentation.map(|info| info.at(source.range(target.token()))))
+            QueryProgress::Ready(presentation.map(|info| {
+                let _markup = rpc_telemetry::phase("markup");
+                info.at(source.range(target.token()))
+            }))
         };
+        let symbol = rpc_telemetry::phase("symbol");
         let local = match target {
-            Target::Reference(reference) => Declaration::local(source, reference),
+            Target::Reference(reference) => Declaration::local(source, reference, |name| {
+                Ok(snapshot
+                    .navigation_symbols(source)?
+                    .symbols
+                    .declaration(name)
+                    .map(|symbol| symbol.range))
+            })?,
             _ => None,
         };
+        let local_index =
+            if local.is_some_and(|local| receiver_parameter_origin(local.name).is_some()) {
+                Some(snapshot.navigation_symbols(source)?)
+            } else {
+                None
+            };
+        let local_symbols = local_index.as_ref().map(|index| &index.symbols);
         if let Some(local) = local
-            && let Some(info) = local.present(source, None, !load_workspace)?
+            && let Some(info) = local.present(source, None, !load_workspace, local_symbols)?
         {
+            drop(symbol);
             return Ok(ready(Some(info)));
         }
         if !load_workspace {
-            return Ok(ready(match target {
-                Target::Package(name) => Some(package_in_file(source, name)),
+            let info = match target {
+                Target::Package(name) => {
+                    let _package_doc = rpc_telemetry::phase("package_doc");
+                    Some(package_in_file(source, name))
+                }
                 Target::Reference(ReferenceQuery::Name(name)) if local.is_none() => {
                     builtin_presentation(node_text(name, &source.text))
                 }
                 _ => None,
-            }));
+            };
+            drop(symbol);
+            return Ok(ready(info));
         }
 
         let test_source = is_test_source(path);
@@ -173,12 +220,22 @@ impl Engine {
             .workspace()
             .expect("package selection needs a workspace");
         let root = snapshot.root();
+        let package_docs = PackageDocs {
+            cache: snapshot.hover_doc_cache(),
+            graph_generation: snapshot.installed_graph_generation(),
+        };
         let mut resolver = snapshot.resolver(workspace);
         let info = if let Some(local) = local {
-            local.present(source, from.map(|from| (&mut resolver, from)), true)?
+            local.present(
+                source,
+                from.map(|from| (&mut resolver, from)),
+                true,
+                local_symbols,
+            )?
         } else {
-            resolver.hover_target(from, source, target, root)?
+            resolver.hover_target(from, source, target, root, package_docs)?
         };
+        drop(symbol);
         Ok(ready(info))
     }
 }
@@ -190,12 +247,13 @@ impl<'w> Resolver<'w, '_> {
         source: &IndexedSource,
         target: Target<'_>,
         root: &Path,
+        package_docs: PackageDocs<'_>,
     ) -> Result<Option<Presentation>> {
         let reference = match target {
             Target::Package(name) => {
                 let mut info = package_in_file(source, name);
                 if let Some(from) = from {
-                    info.documentation = self.package_documentation(from, source)?;
+                    info.documentation = package_docs.documentation(self, from)?;
                 }
                 return Ok(Some(info));
             }
@@ -220,7 +278,7 @@ impl<'w> Resolver<'w, '_> {
                 };
                 return Ok(Some(Presentation {
                     signature,
-                    documentation: self.package_documentation(package, source)?,
+                    documentation: package_docs.documentation(self, package)?,
                 }));
             }
             Target::Reference(reference) => reference,
@@ -235,7 +293,7 @@ impl<'w> Resolver<'w, '_> {
                     {
                         return Ok(Some(Presentation {
                             signature: format!("package {}", package.name),
-                            documentation: self.package_documentation(package, source)?,
+                            documentation: package_docs.documentation(self, package)?,
                         }));
                     }
                     self.source_name_location(from, source, name)?
@@ -245,6 +303,15 @@ impl<'w> Resolver<'w, '_> {
             if let Some((path, range)) = location {
                 if path_key(&path) == path_key(&source.path) {
                     return self.present_at(source, range, from);
+                }
+                if let Some(declarations) = self.indexes.declaration_source(&path)?
+                    && let Some(declaration) = declarations.presentation.get(&range)
+                    && let Some((signature, documentation)) = declaration.hover()
+                {
+                    return Ok(Some(Presentation {
+                        signature: signature.to_string(),
+                        documentation: documentation.to_string(),
+                    }));
                 }
                 if let Some(declaring_source) = self.indexes.reference_source(&path)? {
                     return self.present_at(declaring_source.as_ref(), range, from);
@@ -256,7 +323,7 @@ impl<'w> Resolver<'w, '_> {
                 && self.is_builtin_error(from, source, receiver)?
             {
                 let info = self
-                    .sdk_builtin(root, |symbols| symbols.member("error", "Error"))
+                    .sdk_builtin(root, |symbols| symbols.member("error", "Error"))?
                     .unwrap_or_else(|| Presentation {
                         signature: "func (error) Error() string".into(),
                         documentation: String::new(),
@@ -267,7 +334,7 @@ impl<'w> Resolver<'w, '_> {
         if let ReferenceQuery::Name(name) = reference
             && name.kind() != "package_identifier"
         {
-            return Ok(self.builtin_hover(root, node_text(name, &source.text)));
+            return self.builtin_hover(root, node_text(name, &source.text));
         }
         Ok(None)
     }
@@ -300,7 +367,7 @@ impl<'w> Resolver<'w, '_> {
             return Ok(None);
         };
         let package = self.declaring_package(source, from);
-        Declaration::new(source, name).present(source, Some((self, package)), true)
+        Declaration::new(source, name).present(source, Some((self, package)), true, None)
     }
 
     pub(super) fn declaring_package(&self, source: &Source, from: &'w Package) -> &'w Package {
@@ -310,65 +377,111 @@ impl<'w> Resolver<'w, '_> {
             .unwrap_or(from)
     }
 
-    fn package_documentation(&mut self, package: &Package, current: &Source) -> Result<String> {
-        let files = self.indexes.files(package);
-        let (preferred, other): (Vec<_>, Vec<_>) = files
-            .iter()
-            .partition(|path| path.file_name().is_some_and(|name| name == "doc.go"));
-        for path in preferred.into_iter().chain(other) {
-            let disk;
-            let source = if path_key(path) == path_key(&current.path) {
-                current
-            } else if let Some(source) = self.indexes.reference_source(path)? {
-                disk = source;
-                disk.as_ref()
-            } else {
-                continue;
-            };
-            let mut cursor = source.tree.root_node().walk();
-            let clause = source
-                .tree
-                .root_node()
-                .named_children(&mut cursor)
-                .find(|node| node.kind() == "package_clause");
-            if let Some(clause) = clause
-                && let Some(name) = clause
-                    .named_children(&mut clause.walk())
-                    .find(|node| node.kind() == "package_identifier")
-                && node_text(name, &source.text) == package.name
-            {
-                let doc = documentation(clause, &source.text);
-                if !doc.is_empty() {
-                    return Ok(doc);
-                }
-            }
+    fn builtin_hover(&mut self, root: &Path, name: &str) -> Result<Option<Presentation>> {
+        if !is_predeclared(name) {
+            return Ok(None);
         }
-        Ok(String::new())
-    }
-
-    fn builtin_hover(&mut self, root: &Path, name: &str) -> Option<Presentation> {
-        is_predeclared(name)
-            .then(|| {
-                self.sdk_builtin(root, |symbols| symbols.declaration(name))
-                    .or_else(|| builtin_presentation(name))
-            })
-            .flatten()
+        Ok(self
+            .sdk_builtin(root, |symbols| symbols.declaration(name))?
+            .or_else(|| builtin_presentation(name)))
     }
 
     fn sdk_builtin(
         &mut self,
         root: &Path,
         lookup: impl FnOnce(&FileSymbols) -> Option<&Symbol>,
-    ) -> Option<Presentation> {
-        let path = self.workspace.builtin_source(root).ok()?;
-        let source = self.indexes.reference_source(path).ok()??;
+    ) -> Result<Option<Presentation>> {
+        let Some(path) = optional_sdk_read(self.indexes.builtin_path(root))? else {
+            return Ok(None);
+        };
+        let Some(declarations) =
+            optional_sdk_read(self.indexes.declaration_source(&path))?.flatten()
+        else {
+            return Ok(None);
+        };
+        let Some(symbol) = lookup(&declarations.index.symbols) else {
+            return Ok(None);
+        };
+        if let Some(declaration) = declarations.presentation.get(&symbol.range)
+            && let Some((signature, documentation)) = declaration.hover()
+        {
+            return Ok(Some(Presentation {
+                signature: signature.to_string(),
+                documentation: documentation.to_string(),
+            }));
+        }
+        let Some(source) = optional_sdk_read(self.indexes.reference_source(&path))?.flatten()
+        else {
+            return Ok(None);
+        };
         let source = source.as_ref();
-        let symbol = lookup(&source.declarations().symbols)?;
-        let name = node_at_range(source, symbol.range)?;
-        Declaration::new(source, name)
-            .present(source, None, true)
-            .ok()?
+        let Some(name) = node_at_range(source, symbol.range) else {
+            return Ok(None);
+        };
+        optional_sdk_read(Declaration::new(source, name).present(source, None, true, None))
+            .map(Option::flatten)
     }
+}
+
+fn optional_sdk_read<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error)
+            if error.is::<SharedLoadPending>()
+                || error.is::<QueryReadLimit>()
+                || error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted) =>
+        {
+            Err(error)
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+pub(super) fn projected_signature<'a>(
+    source: &IndexedSource,
+    range: Range,
+    completion_detail: Option<&'a str>,
+) -> Option<Cow<'a, str>> {
+    let name = node_at_range(source, range)?;
+    let owner = field_declaration(name).or_else(|| declaration_owner(name))?;
+    if matches!(
+        owner.kind(),
+        "function_declaration" | "method_declaration" | "type_spec" | "type_alias"
+    ) {
+        return completion_detail.map(Cow::Borrowed);
+    }
+    let declaration = Declaration::new(source, name);
+    // Inferred declarations can depend on imports and other package files.
+    let syntax_only = matches!(
+        owner.kind(),
+        "method_elem" | "field_declaration" | "type_parameter_declaration"
+    ) || declaration.binding.is_some_and(|binding| {
+        let (explicit, initializer, index) = value_parts(owner, binding);
+        explicit.is_some()
+            || initializer.is_some_and(|value| values::literal_value_type(value, index).is_some())
+    });
+    if !syntax_only {
+        return None;
+    }
+    Some(Cow::Owned(
+        declaration.signature(source, owner, None, false).ok()??,
+    ))
+}
+
+pub(super) fn projected_package_documentation(source: &Source) -> Option<(&str, String)> {
+    let root = source.tree.root_node();
+    let clause = root
+        .named_children(&mut root.walk())
+        .find(|node| node.kind() == "package_clause")?;
+    let name = clause
+        .named_children(&mut clause.walk())
+        .find(|node| node.kind() == "package_identifier")?;
+    Some((
+        node_text(name, &source.text),
+        documentation(clause, &source.text),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -385,14 +498,18 @@ impl<'tree> Declaration<'tree> {
         }
     }
 
-    fn local(source: &'tree IndexedSource, reference: ReferenceQuery<'tree>) -> Option<Self> {
+    fn local(
+        source: &'tree IndexedSource,
+        reference: ReferenceQuery<'tree>,
+        file_declaration: impl FnOnce(&str) -> Result<Option<Range>>,
+    ) -> Result<Option<Self>> {
         let name = reference.name();
         if field_declaration(name).is_some_and(|field| field.child_by_field_name("name").is_none())
         {
-            return Some(Self::new(source, name));
+            return Ok(Some(Self::new(source, name)));
         }
         let ReferenceQuery::Name(name) = reference else {
-            return None;
+            return Ok(None);
         };
         if let Some(target) = reference_binding(name, &source.text) {
             let mut declaration = Self::new(source, target);
@@ -402,20 +519,17 @@ impl<'tree> Declaration<'tree> {
                         .filter(|binding| binding.name == target)
                         .or(declaration.binding);
             }
-            return Some(declaration);
+            return Ok(Some(declaration));
         }
         if is_declaration_name(name) {
-            return Some(Self::new(source, name));
+            return Ok(Some(Self::new(source, name)));
         }
         if name.kind() == "package_identifier" {
-            return None;
+            return Ok(None);
         }
-        let document = DocumentSnapshot::borrowed(&source.path, source);
-        let symbol = document
-            .declarations()
-            .declaration(node_text(name, &source.text))?;
-        let target = node_at_range(source, symbol.range)?;
-        Some(Self::new(source, target))
+        Ok(file_declaration(node_text(name, &source.text))?
+            .and_then(|range| node_at_range(source, range))
+            .map(|target| Self::new(source, target)))
     }
 
     fn present<'w>(
@@ -423,12 +537,44 @@ impl<'tree> Declaration<'tree> {
         source: &IndexedSource,
         context: Option<(&mut Resolver<'w, '_>, &'w Package)>,
         allow_partial: bool,
+        local_symbols: Option<&FileSymbols>,
     ) -> Result<Option<Presentation>> {
-        let name = node_text(self.name, &source.text);
         let Some(owner) = field_declaration(self.name).or_else(|| declaration_owner(self.name))
         else {
             return Ok(None);
         };
+        if owner.kind() == "type_elem" {
+            let name = node_text(self.name, &source.text);
+            let constraint =
+                receiver_parameter_constraint(source, self.name, context, local_symbols)?;
+            return Ok(match constraint {
+                Some(constraint) => Some(Presentation {
+                    signature: format!("type param {name} {constraint}"),
+                    documentation: documentation(owner, &source.text),
+                }),
+                None if allow_partial => Some(Presentation {
+                    signature: format!("type param {name}"),
+                    documentation: String::new(),
+                }),
+                None => None,
+            });
+        }
+        Ok(self
+            .signature(source, owner, context, allow_partial)?
+            .map(|signature| Presentation {
+                signature,
+                documentation: documentation(owner, &source.text),
+            }))
+    }
+
+    fn signature<'w>(
+        self,
+        source: &IndexedSource,
+        owner: Node<'_>,
+        context: Option<(&mut Resolver<'w, '_>, &'w Package)>,
+        allow_partial: bool,
+    ) -> Result<Option<String>> {
+        let name = node_text(self.name, &source.text);
         let signature = match owner.kind() {
             "function_declaration" | "method_declaration" | "method_elem" => {
                 let interface = (owner.kind() == "method_elem")
@@ -485,19 +631,6 @@ impl<'tree> Declaration<'tree> {
                     syntax_text(constraint, &source.text)
                 )
             }
-            "type_elem" => {
-                let Some(constraint) = receiver_parameter_constraint(source, self.name, context)?
-                else {
-                    if allow_partial {
-                        return Ok(Some(Presentation {
-                            signature: format!("type param {name}"),
-                            documentation: String::new(),
-                        }));
-                    }
-                    return Ok(None);
-                };
-                format!("type param {name} {constraint}")
-            }
             _ => {
                 let Some(binding) = self.binding else {
                     return Ok(None);
@@ -509,10 +642,7 @@ impl<'tree> Declaration<'tree> {
                 value
             }
         };
-        Ok(Some(Presentation {
-            signature,
-            documentation: documentation(owner, &source.text),
-        }))
+        Ok(Some(signature))
     }
 }
 
@@ -560,20 +690,12 @@ fn receiver_parameter_constraint<'w>(
     source: &IndexedSource,
     parameter: Node<'_>,
     context: Option<(&mut Resolver<'w, '_>, &'w Package)>,
+    local_symbols: Option<&FileSymbols>,
 ) -> Result<Option<String>> {
-    let origin = || {
-        let method = std::iter::successors(parameter.parent(), |node| node.parent())
-            .find(|node| node.kind() == "method_declaration")?;
-        let (base, arguments) = receiver_type_parameters(method)?;
-        let index = arguments
-            .named_children(&mut arguments.walk())
-            .filter(|element| element.kind() == "type_elem")
-            .position(|element| element.named_child(0) == Some(parameter))?;
-        Some((node_text(base, &source.text), index))
-    };
-    let Some((base, index)) = origin() else {
+    let Some((base, index)) = receiver_parameter_origin(parameter) else {
         return Ok(None);
     };
+    let base = node_text(base, &source.text);
     let constraint = |source: &Source, range| {
         let declaration = node_at_range(source, range)?.parent()?;
         let parameters = declaration.child_by_field_name("type_parameters")?;
@@ -592,14 +714,24 @@ fn receiver_parameter_constraint<'w>(
         }
         None
     };
-    if let Some(symbol) = source.declarations().symbols.declaration(base) {
+    if let Some(symbol) = local_symbols.and_then(|symbols| symbols.declaration(base)) {
         return Ok(constraint(source, symbol.range));
     }
-    if let Some((resolver, from)) = context
-        && let Some(symbol) = resolver.find_symbol(from, base, None)?
-        && let Some(definition) = resolver.indexes.reference_source(&symbol.file)?
-    {
-        return Ok(constraint(definition.as_ref(), symbol.symbol.range));
+    if let Some((resolver, from)) = context {
+        if local_symbols.is_none()
+            && let Some(symbol) = resolver
+                .indexes
+                .file_index(&source.path)?
+                .symbols
+                .declaration(base)
+        {
+            return Ok(constraint(source, symbol.range));
+        }
+        if let Some(symbol) = resolver.find_symbol(from, base, None)?
+            && let Some(definition) = resolver.indexes.reference_source(&symbol.file)?
+        {
+            return Ok(constraint(definition.as_ref(), symbol.symbol.range));
+        }
     }
     Ok(None)
 }
@@ -631,12 +763,17 @@ fn builtin_presentation(name: &str) -> Option<Presentation> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use std::{fs, path::PathBuf};
 
     use lsp_types::TextDocumentContentChangeEvent;
 
     use super::*;
+    use crate::semantic::CacheEvent;
     use crate::semantic::source::LineIndex;
+    use crate::test_support::TestProject;
     use crate::workspace::Workspace;
 
     fn fixture_root() -> PathBuf {
@@ -675,6 +812,29 @@ mod tests {
             QueryProgress::Ready(hover) => hover,
             _ => panic!("hover did not resolve after loading the workspace"),
         }
+    }
+
+    fn lookup_foreground(engine: &mut Engine, path: &Path, position: Position) -> Hover {
+        let memo = QueryReadMemo::default();
+        for _ in 0..64 {
+            match engine.hover_foreground(path, position, true, &memo) {
+                Ok(QueryProgress::Ready(Some(hover))) => return hover,
+                Err(error) if error.is::<SharedLoadPending>() => {
+                    let pending = error.downcast::<SharedLoadPending>().unwrap();
+                    while !pending.ready() {
+                        engine
+                            .shared_disk_wake()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                    }
+                }
+                Ok(QueryProgress::Ready(None)) => panic!("foreground hover did not find a target"),
+                Ok(QueryProgress::Pending(load)) => panic!("foreground hover requested {load:?}"),
+                Ok(QueryProgress::Searching(task)) => match task {},
+                Err(error) => panic!("foreground hover failed: {error:#}"),
+            }
+        }
+        panic!("foreground hover kept replaying");
     }
 
     fn markdown(hover: Hover) -> String {
@@ -1065,6 +1225,112 @@ func run(payload any) {
         engine.close(&helper);
         engine.close(&docs);
         assert_eq!(get_import(&mut engine), initial_doc);
+    }
+
+    #[test]
+    fn foreground_package_docs_revalidate_the_ordered_prefix() {
+        let project = TestProject::new();
+        let text = "package sample\nfunc run() {}\n";
+        let origin = project.write("main.go", text);
+        let extra = project.write(
+            "package.go",
+            "// Fallback package documentation.\npackage sample\n",
+        );
+        let preferred = project.write("doc.go", "package sample\n");
+        let workspace = project.workspace(&["package.go", "main.go", "doc.go"], false);
+        fs::remove_file(&preferred).unwrap();
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(engine.workspace_load(), workspace));
+        engine.open(origin.clone(), text.into(), 1).unwrap();
+        let position = Position::new(0, 9);
+        let docs = |engine: &mut Engine| markdown(lookup_foreground(engine, &origin, position));
+        let hits = |engine: &Engine| engine.state.hover_docs.borrow().hits;
+
+        let fallback = docs(&mut engine);
+        assert!(fallback.ends_with("Fallback package documentation."));
+        assert_eq!(docs(&mut engine), fallback);
+        assert_eq!(hits(&engine), 1);
+
+        engine
+            .open(preferred.clone(), "package sample\n".into(), 1)
+            .unwrap();
+        assert_eq!(docs(&mut engine), fallback);
+        assert_eq!(hits(&engine), 1);
+
+        engine
+            .edit(
+                &preferred,
+                &[TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "// Preferred package documentation.\npackage sample\n".into(),
+                }],
+                2,
+            )
+            .unwrap();
+        let preferred_doc = docs(&mut engine);
+        assert!(preferred_doc.ends_with("Preferred package documentation."));
+        assert_eq!(hits(&engine), 1);
+
+        engine
+            .open(
+                extra,
+                "// Edited fallback documentation.\npackage sample\n".into(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(docs(&mut engine), preferred_doc);
+        assert_eq!(hits(&engine), 2);
+
+        engine.close(&preferred);
+        assert!(docs(&mut engine).ends_with("Edited fallback documentation."));
+        assert_eq!(hits(&engine), 2);
+    }
+
+    #[test]
+    fn foreground_hover_uses_lightweight_member_presentation() {
+        let project = TestProject::new();
+        let text = "package sample\nfunc (box Box[Item]) run(value Item) { /* 😀 */ _ = Shape{}.Field; value.Run() }\n";
+        let origin = project.write("main.go", text);
+        let target = project.write("types.go", concat!(
+            "package sample\n",
+            "type Box[Value T] struct{}\n",
+            "type T interface {\n// Run describes the next step.\nRun()\n}\n",
+            "type Shape struct {\n// Field holds a label.\nField string `json:\"field\"` // used by clients\n}\n",
+                "func body() { skipped := 123; _ = skipped }\n",
+        ));
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["main.go", "types.go"], false)
+        ));
+        engine.open(origin.clone(), text.into(), 1).unwrap();
+        let full_parses = Arc::new(AtomicUsize::new(0));
+        let count = full_parses.clone();
+        engine.set_shared_disk_hook(Some(Arc::new(move |path, event| {
+            if path == path_key(&target) && event == CacheEvent::Parse {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        })));
+
+        for (anchor, token, expected) in [
+            (
+                "value.Run()",
+                "Run",
+                "```go\nfunc (T) Run()\n```\n\nRun describes the next step.",
+            ),
+            (
+                "Shape{}.Field",
+                "Field",
+                "```go\nfield Field string `json:\"field\"` of Shape type\n```\n\nField holds a label.\n\nused by clients",
+            ),
+        ] {
+            let range = token_range(text, anchor, token);
+            let hover = lookup_foreground(&mut engine, &origin, range.start);
+            assert_eq!(hover.range, Some(range));
+            assert_eq!(markdown(hover), expected);
+        }
+        assert_eq!(full_parses.load(Ordering::Relaxed), 0);
     }
 
     #[test]

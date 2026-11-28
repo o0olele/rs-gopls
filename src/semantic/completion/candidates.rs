@@ -1,27 +1,29 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use lsp_types::CompletionItemKind as Kind;
 use tree_sitter::Node;
 
-use crate::scope::{VisibleBinding, VisibleBindingKind, visible_bindings};
+use crate::scope::{VisibleBinding, VisibleBindingKind, visible_bindings_cancellable};
 use crate::semantic::{
     index::IndexedSource,
     presentation::{builtin_function, parameter_labels_with, result_label_with, syntax_text_with},
     resolver::{
         ResolvedSymbol, Resolver, TypeIdentity, TypeKind, is_predeclared_type, untyped_default,
     },
+    shared_disk::SharedDiskCache,
     snapshot::DocumentSnapshot,
-    source::{Source, is_test_source, node_at_range, node_text},
+    source::{Source, check_optional_cancelled, is_test_source, node_at_range, node_text},
 };
 use crate::symbols::{Container, Symbol, SymbolKind};
 use crate::workspace::{Package, is_symbol_source, path_key};
 
 use super::CompletionClientCapabilities;
 use super::cursor::{
-    Edit, Expression, LabelKind, LiteralMode, Site, ancestors, identifier_char, identifier_start,
+    Expression, LabelKind, LiteralMode, Probe, Site, ancestors, identifier_char, identifier_start,
     is_function, is_keyword,
 };
 use super::expected::{Expected, argument_or_result, is_interface, literal_type};
@@ -29,7 +31,7 @@ use super::imports::{FileImport, Selection, SymbolSearch, assumed_package_name, 
 use super::ranking::{
     Candidate, FIELD, Insert, KEYWORD, Match, SYMBOL, match_name, match_start, package_priority,
 };
-use super::render::{Target, describe, package_name};
+use super::render::{SourceRev, Target, describe, package_name};
 
 const FILE_KEYWORDS: &[&str] = &["package", "import", "func", "type", "const", "var"];
 const STMT_KEYWORDS: &[&str] = &[
@@ -84,16 +86,19 @@ pub(super) fn syntax_candidates(
     anchor: Node<'_>,
     prefix: &str,
     docs: &HashMap<PathBuf, IndexedSource>,
-) -> Option<Vec<Candidate>> {
+    disk: &SharedDiskCache,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<Vec<Candidate>>> {
+    check_optional_cancelled(cancelled)?;
     let candidates = match site {
         Site::Suppressed => Vec::new(),
-        Site::PackageClause => package_names(&source.path, docs, prefix),
+        Site::PackageClause => package_names(&source.path, docs, prefix, disk, cancelled)?,
         Site::FileTopLevel => keywords(FILE_KEYWORDS, prefix).collect(),
         Site::CaseClause => keywords(&["case", "default"], prefix).collect(),
-        Site::Label(kind) => labels(source, anchor, *kind, prefix),
-        _ => return None,
+        Site::Label(kind) => labels(source, anchor, *kind, prefix, cancelled)?,
+        _ => return Ok(None),
     };
-    Some(candidates)
+    Ok(Some(candidates))
 }
 
 pub(super) struct Collection {
@@ -106,21 +111,29 @@ pub(super) fn collect<'w>(
     source: &Source,
     anchor: Node<'_>,
     site: Site<'_>,
-    edit: &Edit,
+    probe: &Probe,
     graph: Option<(&mut Resolver<'w, '_>, &'w Package)>,
     caps: &CompletionClientCapabilities,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Collection> {
-    let prefix = edit.prefix(document.text());
-    let bindings = visible_bindings(source.tree.root_node(), anchor.start_byte(), &source.text);
+    let prefix = probe.edit.prefix(document.text());
+    let bindings = visible_bindings_cancellable(
+        source.tree.root_node(),
+        anchor.start_byte(),
+        &source.text,
+        cancelled,
+    )?;
     let mut collector = Collector {
         document,
         source,
+        probe,
         anchor,
         prefix,
-        followed_by_selector: document.text()[edit.replace.end..]
+        followed_by_selector: document.text()[probe.edit.replace.end..]
             .trim_start_matches([' ', '\t'])
             .starts_with('.'),
         caps,
+        cancelled,
         bindings,
         items: Vec::new(),
         declared: HashSet::new(),
@@ -129,12 +142,18 @@ pub(super) fn collect<'w>(
         expected: None,
     };
     let search = if let Some((resolver, package)) = graph {
+        let expected_type = resolver
+            .indexes
+            .trace()
+            .map(|trace| trace.phase("expected_type"));
         collector.expected = Expected::from_cursor(resolver, package, source, anchor)?;
+        drop(expected_type);
         collector.semantic(resolver, package, site)?
     } else {
-        collector.local_only(site);
+        collector.local_only(site)?;
         None
     };
+    check_optional_cancelled(cancelled)?;
     Ok(Collection {
         candidates: collector.items,
         search,
@@ -144,10 +163,12 @@ pub(super) fn collect<'w>(
 struct Collector<'a> {
     document: &'a DocumentSnapshot<'a>,
     source: &'a Source,
+    probe: &'a Probe,
     anchor: Node<'a>,
     prefix: &'a str,
     followed_by_selector: bool,
     caps: &'a CompletionClientCapabilities,
+    cancelled: Option<&'a AtomicBool>,
     bindings: Vec<VisibleBinding<'a>>,
     items: Vec<Candidate>,
     declared: HashSet<String>,
@@ -172,22 +193,21 @@ impl Collector<'_> {
         package: &'w Package,
         site: Site<'_>,
     ) -> Result<Option<SymbolSearch>> {
-        self.imports = self
-            .document
-            .raw_imports()
-            .map(|import| {
-                let target = resolver.workspace.resolve_import(package, &import.path);
-                let qualifier = import
-                    .alias
-                    .or_else(|| target.map(|package| package.name.clone()))
-                    .unwrap_or_else(|| assumed_package_name(&import.path));
-                FileImport {
-                    path: import.path,
-                    qualifier,
-                    in_graph: target.is_some(),
-                }
-            })
-            .collect();
+        let imports = resolver.indexes.trace().map(|trace| trace.phase("imports"));
+        for import in self.document.raw_imports() {
+            check_optional_cancelled(self.cancelled)?;
+            let target = resolver.workspace.resolve_import(package, &import.path);
+            let qualifier = import
+                .alias
+                .or_else(|| target.map(|package| package.name.clone()))
+                .unwrap_or_else(|| assumed_package_name(&import.path));
+            self.imports.push(FileImport {
+                path: import.path,
+                qualifier,
+                in_graph: target.is_some(),
+            });
+        }
+        drop(imports);
         match site {
             Site::Selector {
                 receiver,
@@ -251,7 +271,7 @@ impl Collector<'_> {
         }
     }
 
-    fn local_only(&mut self, site: Site<'_>) {
+    fn local_only(&mut self, site: Site<'_>) -> Result<()> {
         let names = match &site {
             Site::TypePosition {
                 is_receiver_type,
@@ -267,21 +287,22 @@ impl Collector<'_> {
                 literal: true,
                 ..Names::default()
             },
-            _ => return,
+            _ => return Ok(()),
         };
         if !names.receiver {
             for binding in &self.bindings {
+                check_optional_cancelled(self.cancelled)?;
                 self.declared.insert(binding.name.clone());
                 if (!names.types_only || is_type_binding(binding))
                     && binding.name != "init"
                     && let Some(matched) = match_name(self.prefix, &binding.name)
                 {
-                    self.items
-                        .push(local_candidate(self.source, binding, matched, self.caps));
+                    self.items.push(self.local_candidate(binding, matched));
                 }
             }
         }
         for (name, symbol) in self.document.declarations().declarations() {
+            check_optional_cancelled(self.cancelled)?;
             if name == "init"
                 || name == "_"
                 || !self.declared.insert(name.to_owned())
@@ -291,7 +312,7 @@ impl Collector<'_> {
             }
             if let Some(matched) = match_name(self.prefix, name) {
                 self.items.push(indexed_candidate(
-                    self.document.indexed(),
+                    self.document,
                     name,
                     symbol,
                     matched,
@@ -299,10 +320,11 @@ impl Collector<'_> {
                 ));
             }
         }
-        self.builtins(&names);
+        self.builtins(&names)?;
         if let Site::Expression(expression) = site {
             self.expression_keywords(&expression);
         }
+        Ok(())
     }
 
     fn unqualified<'w>(
@@ -312,6 +334,7 @@ impl Collector<'_> {
         names: Names,
     ) -> Result<()> {
         for binding in &self.bindings {
+            check_optional_cancelled(self.cancelled)?;
             self.declared.insert(binding.name.clone());
             if names.receiver
                 || binding.name == "init"
@@ -322,7 +345,7 @@ impl Collector<'_> {
             let Some(matched) = match_name(self.prefix, &binding.name) else {
                 continue;
             };
-            let mut candidate = local_candidate(self.source, binding, matched, self.caps);
+            let mut candidate = self.local_candidate(binding, matched);
             let ty = if let Some(explicit) = binding.binding.explicit_type {
                 resolver.source_type(package, self.source, explicit)
             } else if let Some(initializer) = binding.binding.initializer {
@@ -365,8 +388,13 @@ impl Collector<'_> {
         // Include the current document first, including a new test draft that
         // has not appeared in go list yet. Package declarations are a separate
         // scope, so a value binding can hide a type even in a type position.
+        let same_package = resolver
+            .indexes
+            .trace()
+            .map(|trace| trace.phase("same_package"));
         let mut package_names = HashSet::new();
         for (name, symbol) in self.document.declarations().declarations() {
+            check_optional_cancelled(self.cancelled)?;
             package_names.insert(name.to_owned());
             let resolved = ResolvedSymbol {
                 package,
@@ -374,6 +402,7 @@ impl Collector<'_> {
                 symbol: symbol.clone(),
                 receiver: None,
                 method_receiver: None,
+                completion_revision: SourceRev::document(self.document),
             };
             self.add_package_symbol(resolver, package, name, &resolved, names)?;
         }
@@ -382,15 +411,18 @@ impl Collector<'_> {
             |name| match_name(self.prefix, name).is_some(),
             &mut self.skipped_package_names,
         )? {
+            check_optional_cancelled(self.cancelled)?;
             if package_names.insert(name.clone())
                 && (is_test_source(self.document.path()) || !is_test_source(&resolved.file))
             {
                 self.add_package_symbol(resolver, package, &name, &resolved, names)?;
             }
         }
+        drop(same_package);
         if names.receiver {
             return Ok(());
         }
+        let imports = resolver.indexes.trace().map(|trace| trace.phase("imports"));
         let mut seen = self.declared.clone();
         for import in self
             .imports
@@ -398,12 +430,14 @@ impl Collector<'_> {
             .filter(|import| import.qualifier != ".")
             .chain(self.imports.iter().filter(|import| import.qualifier == "."))
         {
+            check_optional_cancelled(self.cancelled)?;
             let target = resolver.workspace.resolve_import(package, &import.path);
             match import.qualifier.as_str() {
                 "_" => {}
                 "." => {
                     if let Some(target) = target {
                         for (name, resolved) in resolver.package_declarations(package, target)? {
+                            check_optional_cancelled(self.cancelled)?;
                             if seen.insert(name.clone())
                                 && (!names.types_only
                                     || matches!(resolved.symbol.kind, SymbolKind::Type))
@@ -412,7 +446,7 @@ impl Collector<'_> {
                                 let mut candidate = resolved_candidate(
                                     resolver,
                                     package,
-                                    self.document.indexed(),
+                                    self.document,
                                     &name,
                                     &resolved,
                                     matched,
@@ -453,11 +487,19 @@ impl Collector<'_> {
         }
         // Dot imports that are already in the graph also shadow predeclared
         // names and participate in collision checks.
-        self.declared.extend(
-            seen.into_iter()
-                .filter(|name| !self.imports.iter().any(|import| import.qualifier == *name)),
-        );
-        self.builtins(&names);
+        let mut qualifiers = HashSet::new();
+        for import in &self.imports {
+            check_optional_cancelled(self.cancelled)?;
+            qualifiers.insert(import.qualifier.as_str());
+        }
+        for name in seen {
+            check_optional_cancelled(self.cancelled)?;
+            if !qualifiers.contains(name.as_str()) {
+                self.declared.insert(name);
+            }
+        }
+        drop(imports);
+        self.builtins(&names)?;
         Ok(())
     }
 
@@ -500,7 +542,7 @@ impl Collector<'_> {
         let mut candidate = resolved_candidate(
             resolver,
             package,
-            self.document.indexed(),
+            self.document,
             name,
             resolved,
             matched,
@@ -542,13 +584,27 @@ impl Collector<'_> {
             "identifier" | "package_identifier" | "type_identifier"
         )
         .then(|| node_text(receiver, &self.source.text));
+        let same_package = resolver
+            .indexes
+            .trace()
+            .map(|trace| trace.phase("same_package"));
         let shadowed = if let Some(name) = qualifier {
-            self.bindings.iter().any(|binding| binding.name == name)
+            let mut shadowed = false;
+            for binding in &self.bindings {
+                check_optional_cancelled(self.cancelled)?;
+                if binding.name == name {
+                    shadowed = true;
+                    break;
+                }
+            }
+            shadowed
                 || self.document.declarations().declaration(name).is_some()
                 || resolver.find_symbol(package, name, None)?.is_some()
         } else {
             false
         };
+        drop(same_package);
+        let imports = resolver.indexes.trace().map(|trace| trace.phase("imports"));
         if let Some(qualifier) = qualifier.filter(|_| !shadowed)
             && let Some((import, target)) =
                 self.source
@@ -557,6 +613,7 @@ impl Collector<'_> {
             for (name, resolved) in resolver.matching_exports(package, target, |name| {
                 match_name(self.prefix, name).is_some()
             })? {
+                check_optional_cancelled(self.cancelled)?;
                 if (types_only && !matches!(resolved.symbol.kind, SymbolKind::Type))
                     || name == "_"
                     || !crate::semantic::resolver::is_exported(&name)
@@ -569,7 +626,7 @@ impl Collector<'_> {
                 let mut candidate = resolved_candidate(
                     resolver,
                     package,
-                    self.document.indexed(),
+                    self.document,
                     &name,
                     &resolved,
                     matched,
@@ -582,17 +639,19 @@ impl Collector<'_> {
             }
             return Ok(None);
         }
+        drop(imports);
         if !types_only
             && let Some(ty) = resolver.infer_type(package, self.source, receiver, 0, 0)?
         {
             for member in resolver.visible_members(package, &ty)? {
+                check_optional_cancelled(self.cancelled)?;
                 let Some(matched) = match_name(self.prefix, &member.name) else {
                     continue;
                 };
                 let candidate = resolved_candidate(
                     resolver,
                     package,
-                    self.document.indexed(),
+                    self.document,
                     &member.name,
                     &member.resolved,
                     matched,
@@ -610,14 +669,19 @@ impl Collector<'_> {
         if type_switch_guard {
             return Ok(None);
         }
-        self.declared
-            .extend(self.bindings.iter().map(|binding| binding.name.clone()));
-        self.declared.extend(
-            resolver
-                .package_declarations(package, package)?
-                .into_iter()
-                .map(|(name, _)| name),
-        );
+        for binding in &self.bindings {
+            check_optional_cancelled(self.cancelled)?;
+            self.declared.insert(binding.name.clone());
+        }
+        let same_package = resolver
+            .indexes
+            .trace()
+            .map(|trace| trace.phase("same_package"));
+        for (name, _) in resolver.package_declarations(package, package)? {
+            check_optional_cancelled(self.cancelled)?;
+            self.declared.insert(name);
+        }
+        drop(same_package);
         let names = Names {
             types_only,
             address_of,
@@ -650,20 +714,22 @@ impl Collector<'_> {
             return Ok(true);
         }
         let fields = resolver.struct_fields(package, &ty)?;
-        let used: HashSet<_> = body
-            .named_children(&mut body.walk())
-            .filter_map(|node| node.child_by_field_name("key"))
-            .filter(|key| {
-                self.anchor.start_byte() < key.start_byte()
-                    || key.end_byte() < self.anchor.end_byte()
-            })
-            .map(|key| node_text(key, &self.source.text))
-            .collect();
+        let mut used = HashSet::new();
+        for node in body.named_children(&mut body.walk()) {
+            check_optional_cancelled(self.cancelled)?;
+            if let Some(key) = node.child_by_field_name("key")
+                && (self.anchor.start_byte() < key.start_byte()
+                    || key.end_byte() < self.anchor.end_byte())
+            {
+                used.insert(node_text(key, &self.source.text));
+            }
+        }
         let has_colon = self.source.text[self.anchor.end_byte()..]
             .trim_start_matches([' ', '\t'])
             .starts_with(':');
         let mut types = HashMap::new();
         for field in fields.iter().filter(|field| field.visible) {
+            check_optional_cancelled(self.cancelled)?;
             let path = &field.member.embedded_path;
             if let Some(ty) = &field.ty
                 && let Some(ty) =
@@ -675,6 +741,7 @@ impl Collector<'_> {
             }
         }
         for field in fields {
+            check_optional_cancelled(self.cancelled)?;
             let member = field.member;
             if !field.visible
                 || if member.embedded_path.is_empty() {
@@ -701,7 +768,7 @@ impl Collector<'_> {
             let mut candidate = resolved_candidate(
                 resolver,
                 package,
-                self.document.indexed(),
+                self.document,
                 &member.name,
                 &member.resolved,
                 matched,
@@ -716,9 +783,9 @@ impl Collector<'_> {
         Ok(true)
     }
 
-    fn builtins(&mut self, names: &Names) {
+    fn builtins(&mut self, names: &Names) -> Result<()> {
         if names.receiver {
-            return;
+            return Ok(());
         }
         let constants = if names.const_spec { &["iota"][..] } else { &[] };
         let values = if names.types_only {
@@ -727,6 +794,7 @@ impl Collector<'_> {
             BUILTIN_VALUES
         };
         for name in BUILTIN_TYPES.iter().chain(values).chain(constants) {
+            check_optional_cancelled(self.cancelled)?;
             if self.declared.contains(*name)
                 || self.imports.iter().any(|import| import.qualifier == *name)
             {
@@ -767,6 +835,7 @@ impl Collector<'_> {
         if names.types_only {
             self.items.extend(keywords(TYPE_KEYWORDS, self.prefix));
         }
+        Ok(())
     }
 
     fn expression_keywords(&mut self, expression: &Expression) {
@@ -825,30 +894,37 @@ fn is_type_binding(binding: &VisibleBinding<'_>) -> bool {
     )
 }
 
-fn local_candidate(
-    source: &Source,
-    binding: &VisibleBinding<'_>,
-    matched: Match,
-    caps: &CompletionClientCapabilities,
-) -> Candidate {
-    let kind = match binding.kind {
-        VisibleBindingKind::Type => Kind::CLASS,
-        VisibleBindingKind::TypeParameter => Kind::TYPE_PARAMETER,
-        VisibleBindingKind::Const => Kind::CONSTANT,
-        _ => Kind::VARIABLE,
-    };
-    let range = source.range(binding.binding.name);
-    let description = describe(source, range, &binding.name, kind, caps.deprecated_support);
-    let mut candidate = Candidate::new(&binding.name, kind, matched, SYMBOL);
-    candidate.detail = description.detail;
-    candidate.deprecated = description.deprecated;
-    candidate.target = Some(Target {
-        file: source.path.clone(),
-        range,
-    });
-    candidate.weight.same_package = true;
-    candidate.weight.depth = Some(binding.scope_depth);
-    candidate
+impl Collector<'_> {
+    fn local_candidate(&self, binding: &VisibleBinding<'_>, matched: Match) -> Candidate {
+        let kind = match binding.kind {
+            VisibleBindingKind::Type => Kind::CLASS,
+            VisibleBindingKind::TypeParameter => Kind::TYPE_PARAMETER,
+            VisibleBindingKind::Const => Kind::CONSTANT,
+            _ => Kind::VARIABLE,
+        };
+        let range = self.source.range(binding.binding.name);
+        let description = describe(
+            self.source,
+            range,
+            &binding.name,
+            kind,
+            self.caps.deprecated_support,
+        );
+        let mut candidate = Candidate::new(&binding.name, kind, matched, SYMBOL);
+        candidate.detail = description.detail;
+        candidate.deprecated = description.deprecated;
+        candidate.target = self
+            .probe
+            .original_range(self.document, binding.binding.name.byte_range())
+            .map(|range| Target {
+                file: self.document.path().to_owned(),
+                range,
+                revision: SourceRev::document(self.document),
+            });
+        candidate.weight.same_package = true;
+        candidate.weight.depth = Some(binding.scope_depth);
+        candidate
+    }
 }
 
 fn symbol_kind(symbol: &Symbol, member: bool) -> Kind {
@@ -862,12 +938,13 @@ fn symbol_kind(symbol: &Symbol, member: bool) -> Kind {
 }
 
 fn indexed_candidate(
-    source: &Source,
+    document: &DocumentSnapshot<'_>,
     name: &str,
     symbol: &Symbol,
     matched: Match,
     caps: &CompletionClientCapabilities,
 ) -> Candidate {
+    let source = document.indexed();
     let description = describe(
         source,
         symbol.range,
@@ -882,6 +959,7 @@ fn indexed_candidate(
     candidate.target = Some(Target {
         file: source.path.clone(),
         range: symbol.range,
+        revision: SourceRev::document(document),
     });
     if let SymbolKind::Function(signature) = &symbol.kind {
         candidate.insert = Insert::Call {
@@ -895,7 +973,7 @@ fn indexed_candidate(
 pub(super) fn resolved_candidate<'w>(
     resolver: &mut Resolver<'w, '_>,
     from: &'w Package,
-    source: &IndexedSource,
+    document: &DocumentSnapshot<'_>,
     name: &str,
     resolved: &ResolvedSymbol<'w>,
     matched: Match,
@@ -903,6 +981,8 @@ pub(super) fn resolved_candidate<'w>(
     literal: bool,
     caps: &CompletionClientCapabilities,
 ) -> Result<Candidate> {
+    resolver.check_cancelled()?;
+    let source = document.indexed();
     let symbol = &resolved.symbol;
     let member = resolved.receiver.is_some();
     let kind = symbol_kind(symbol, member);
@@ -913,12 +993,15 @@ pub(super) fn resolved_candidate<'w>(
         if kind == Kind::FIELD { FIELD } else { SYMBOL },
     );
     candidate.weight.same_package = from.import_path() == resolved.package.import_path();
+    let same_file = path_key(&source.path) == path_key(&resolved.file);
     candidate.target = Some(Target {
         file: resolved.file.clone(),
         range: symbol.range,
+        revision: resolved
+            .completion_revision
+            .clone()
+            .or_else(|| same_file.then(|| SourceRev::document(document)).flatten()),
     });
-    let same_file = path_key(&source.path) == path_key(&resolved.file);
-    let mut definition = None;
     let description = if same_file {
         Some(describe(
             source,
@@ -928,20 +1011,25 @@ pub(super) fn resolved_candidate<'w>(
             caps.deprecated_support,
         ))
     } else {
-        definition = resolver
+        let declaration = resolver
             .indexes
             .declaration_source(&resolved.file)
             .ok()
             .flatten();
-        definition.as_ref().map(|source| {
-            describe(
-                source.as_ref(),
-                symbol.range,
-                name,
-                kind,
-                caps.deprecated_support,
-            )
-        })
+        declaration
+            .as_ref()
+            .and_then(|source| source.presentation.get(&symbol.range))
+            .map(|presentation| presentation.description(kind, caps.deprecated_support))
+            .or_else(|| {
+                let syntax = resolver.indexes.declaration_syntax(&resolved.file).ok()??;
+                Some(describe(
+                    syntax.as_ref(),
+                    symbol.range,
+                    name,
+                    kind,
+                    caps.deprecated_support,
+                ))
+            })
     };
     let mut has_parameters = false;
     if let Some(description) = description {
@@ -987,10 +1075,7 @@ pub(super) fn resolved_candidate<'w>(
             .indexes
             .trace()
             .map(|trace| trace.phase("symbol_type"));
-        let declaration_source = definition
-            .as_ref()
-            .map_or(&**source, |source| source.as_ref());
-        resolver.symbol_type(declaration_source, resolved, name, 0)?
+        resolver.symbol_type(source, resolved, name, 0)?
     } else {
         None
     };
@@ -1007,16 +1092,18 @@ pub(super) fn resolved_candidate<'w>(
             ..
         } = &ty.kind
             && (!substitutions.is_empty() || method_receiver.is_some())
+            && let definition = if same_file {
+                None
+            } else {
+                resolver
+                    .indexes
+                    .declaration_syntax(&resolved.file)
+                    .ok()
+                    .flatten()
+            }
             && let Some(declaration_source) = if same_file {
                 Some(&**source)
             } else {
-                if definition.is_none() {
-                    definition = resolver
-                        .indexes
-                        .declaration_source(&resolved.file)
-                        .ok()
-                        .flatten();
-                }
                 definition.as_ref().map(|source| &**source.as_ref())
             }
             && let Some((detail, suffix)) = specialized_signature(
@@ -1213,7 +1300,13 @@ fn keywords<'a>(words: &'a [&'a str], prefix: &'a str) -> impl Iterator<Item = C
     })
 }
 
-fn labels(source: &Source, anchor: Node<'_>, kind: LabelKind, prefix: &str) -> Vec<Candidate> {
+fn labels(
+    source: &Source,
+    anchor: Node<'_>,
+    kind: LabelKind,
+    prefix: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     let mut add = |statement: Node<'_>| {
         if let Some(label) = statement.child_by_field_name("label") {
@@ -1226,6 +1319,7 @@ fn labels(source: &Source, anchor: Node<'_>, kind: LabelKind, prefix: &str) -> V
         }
     };
     for scope in ancestors(anchor) {
+        check_optional_cancelled(cancelled)?;
         if is_function(scope) {
             break;
         }
@@ -1239,11 +1333,13 @@ fn labels(source: &Source, anchor: Node<'_>, kind: LabelKind, prefix: &str) -> V
                 .named_children(&mut scope.walk())
                 .filter(|node| node.kind() == "statement_list")
             {
-                for mut label in list
-                    .named_children(&mut list.walk())
-                    .filter(|node| node.kind() == "labeled_statement")
-                {
+                for mut label in list.named_children(&mut list.walk()) {
+                    check_optional_cancelled(cancelled)?;
+                    if label.kind() != "labeled_statement" {
+                        continue;
+                    }
                     loop {
+                        check_optional_cancelled(cancelled)?;
                         add(label);
                         if let Some(next) =
                             labeled_body(label).filter(|node| node.kind() == "labeled_statement")
@@ -1270,7 +1366,7 @@ fn labels(source: &Source, anchor: Node<'_>, kind: LabelKind, prefix: &str) -> V
             add(scope);
         }
     }
-    candidates
+    Ok(candidates)
 }
 
 fn labeled_body(statement: Node<'_>) -> Option<Node<'_>> {
@@ -1283,9 +1379,11 @@ fn package_names(
     path: &Path,
     docs: &HashMap<PathBuf, IndexedSource>,
     prefix: &str,
-) -> Vec<Candidate> {
+    disk: &SharedDiskCache,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<Candidate>> {
     let Some(directory) = path.parent() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let directory_key = path_key(directory);
     let current = path_key(path);
@@ -1295,6 +1393,7 @@ fn package_names(
         sibling != current && is_symbol_source(sibling) && (test || !is_test_source(sibling))
     };
     for (sibling, source) in docs {
+        check_optional_cancelled(cancelled)?;
         if sibling.parent() == Some(&directory_key)
             && acceptable(sibling)
             && let Some(name) = package_name(source)
@@ -1304,12 +1403,13 @@ fn package_names(
     }
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
+            check_optional_cancelled(cancelled)?;
             let sibling = entry.path();
             let key = path_key(&sibling);
             if acceptable(&key)
                 && !docs.contains_key(&key)
-                && let Ok(text) = fs::read_to_string(sibling)
-                && let Some(name) = declared_package(&text)
+                && let Ok(text) = disk.read(&sibling, cancelled, None)
+                && let Some(name) = declared_package(&text.text)
             {
                 names.insert(name.to_owned());
             }
@@ -1336,20 +1436,23 @@ fn package_names(
         names.extend(tests);
     }
     names.insert("main".into());
-    names
-        .into_iter()
-        .filter_map(|name| {
-            let matched = match_name(prefix, &name)?;
-            let priority = if name == "main" {
-                37
-            } else if test && name.ends_with("_test") {
-                39
-            } else {
-                38
-            };
-            Some(Candidate::new(name, Kind::MODULE, matched, priority))
-        })
-        .collect()
+    let mut candidates = Vec::new();
+    for name in names {
+        check_optional_cancelled(cancelled)?;
+        let Some(matched) = match_name(prefix, &name) else {
+            continue;
+        };
+        let priority = if name == "main" {
+            37
+        } else if test && name.ends_with("_test") {
+            39
+        } else {
+            38
+        };
+        candidates.push(Candidate::new(name, Kind::MODULE, matched, priority));
+    }
+    check_optional_cancelled(cancelled)?;
+    Ok(candidates)
 }
 
 fn declared_package(mut text: &str) -> Option<&str> {

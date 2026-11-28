@@ -19,6 +19,12 @@ pub(crate) struct DiagnosticsCache {
 }
 
 impl DiagnosticsCache {
+    pub(in crate::semantic) fn has_reports_for(&self, path: &Path) -> bool {
+        self.reports.contains_key(path)
+            || self.replacements.contains_key(path)
+            || self.delivered.contains_key(path)
+    }
+
     pub(crate) fn get(&self, key: &DiagnosticSnapshotKey) -> Option<&DiagnosticReport> {
         self.get_shared(key).map(Arc::as_ref)
     }
@@ -26,6 +32,19 @@ impl DiagnosticsCache {
     pub(crate) fn get_complete(&self, key: &DiagnosticSnapshotKey) -> Option<&DiagnosticReport> {
         self.get(key)
             .filter(|report| report.diagnostic_stage == DiagnosticStage::Stage2)
+    }
+
+    pub(in crate::semantic) fn for_code_actions(
+        &self,
+        key: &DiagnosticSnapshotKey,
+    ) -> Option<&DiagnosticReport> {
+        let delivered = self
+            .delivered(&key.path_key)
+            .and_then(|delivered| delivered.report_for_key(key));
+        delivered
+            .into_iter()
+            .chain(self.get(key))
+            .max_by_key(|report| report.diagnostic_stage)
     }
 
     fn get_shared(&self, key: &DiagnosticSnapshotKey) -> Option<&Arc<DiagnosticReport>> {

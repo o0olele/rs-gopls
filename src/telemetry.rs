@@ -1,3 +1,5 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::io::{self, BufWriter, Write};
@@ -8,22 +10,257 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
+use lsp_server::RequestId;
 use serde_json::{Value, json};
 
 use crate::go_environment::{EnvironmentOverrides, GoEnvironment};
-use crate::semantic::diagnostics::{DiagnosticItem, DiagnosticReport};
+use crate::semantic::diagnostics::{DiagnosticItem, DiagnosticProvenance, DiagnosticReport};
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) const FILE_ENV: &str = "RS_GOPLS_LOG_FILE";
 pub(crate) const REDACT_ENV: &str = "RS_GOPLS_LOG_REDACT";
+const COMPLETION_PROFILE_ENV: &str = "RS_GOPLS_COMPLETION_PROFILE";
 const CAPACITY: usize = 4096;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 static SESSION_CLOCK: OnceLock<SessionClock> = OnceLock::new();
 static HASH_KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+static PATH_HASH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static CONTEXT: Cell<Option<Context>> = const { Cell::new(None) };
+    static SHARED_DISK_STATS: RefCell<Option<SharedDiskStats>> = const { RefCell::new(None) };
+    static PATH_HASHES: RefCell<PathHashes> = RefCell::default();
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DiskArtifact {
+    Text,
+    Declarations,
+    FullAst,
+}
+
+impl DiskArtifact {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Declarations => "declarations",
+            Self::FullAst => "full_ast",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DiskLookup {
+    Hit,
+    Produce,
+    Join,
+}
+
+impl DiskLookup {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Hit => "cache_hits",
+            Self::Produce => "producer_requested",
+            Self::Join => "joins",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(crate) struct SharedDiskStats {
+    lookups: [[u64; 3]; 3],
+    mutex_acquired: u64,
+    mutex_wait: Duration,
+    try_lock_busy: u64,
+}
+
+impl SharedDiskStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (counts, other) in self.lookups.iter_mut().zip(other.lookups) {
+            for (count, increment) in counts.iter_mut().zip(other) {
+                *count += increment;
+            }
+        }
+        self.mutex_acquired += other.mutex_acquired;
+        self.mutex_wait += other.mutex_wait;
+        self.try_lock_busy += other.try_lock_busy;
+    }
+
+    pub(crate) fn add_fields(self, fields: &mut Value) {
+        if self == Self::default() {
+            return;
+        }
+        let mut summary = json!({
+            "mutex_acquired": self.mutex_acquired,
+            "mutex_wait_ms": millis(self.mutex_wait),
+            "try_lock_busy": self.try_lock_busy,
+        });
+        for kind in [DiskLookup::Hit, DiskLookup::Produce, DiskLookup::Join] {
+            let mut total = 0;
+            for artifact in [
+                DiskArtifact::Text,
+                DiskArtifact::Declarations,
+                DiskArtifact::FullAst,
+            ] {
+                let count = self.lookups[artifact as usize][kind as usize];
+                if count > 0 {
+                    summary["artifacts"][artifact.name()][kind.name()] = json!(count);
+                    total += count;
+                }
+            }
+            summary[kind.name()] = json!(total);
+        }
+        fields["shared_disk"] = summary;
+    }
+}
+
+#[inline]
+fn update_shared_disk_stats(update: impl FnOnce(&mut SharedDiskStats)) {
+    SHARED_DISK_STATS.with_borrow_mut(|stats| {
+        if let Some(active) = stats {
+            update(active);
+        }
+    });
+}
+
+pub(crate) fn disk_lookup(artifact: DiskArtifact, outcome: DiskLookup) {
+    if enabled() {
+        update_shared_disk_stats(|stats| stats.lookups[artifact as usize][outcome as usize] += 1);
+    }
+}
+
+pub(crate) fn disk_mutex(wait: Option<Duration>) {
+    update_shared_disk_stats(|stats| match wait {
+        Some(wait) => {
+            stats.mutex_acquired += 1;
+            stats.mutex_wait += wait;
+        }
+        None => stats.try_lock_busy += 1,
+    });
+}
+
+pub(crate) fn take_shared_disk_stats() -> SharedDiskStats {
+    SHARED_DISK_STATS
+        .with_borrow_mut(|stats| stats.as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+pub(crate) fn merge_shared_disk_stats(stats: SharedDiskStats) {
+    update_shared_disk_stats(|active| active.merge(stats));
+}
+
+#[derive(Clone, Copy)]
+enum RedactedRequestId {
+    Number(i64),
+    Hash(u64),
+}
+
+impl RedactedRequestId {
+    fn new(id: &RequestId) -> Self {
+        match json!(id) {
+            Value::String(id) => Self::Hash(HASH_KEY.hash_one(("text", id.as_str()))),
+            id => Self::Number(id.as_i64().expect("numeric JSON-RPC request ID")),
+        }
+    }
+
+    fn field(self) -> Value {
+        match self {
+            Self::Number(id) => json!(id),
+            Self::Hash(id) => json!(format!("h:{id:016x}")),
+        }
+    }
+}
+
+pub(super) fn request_id(id: &RequestId) -> Value {
+    RedactedRequestId::new(id).field()
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Context {
+    request: Option<RedactedRequestId>,
+    job_seq: Option<u64>,
+    diagnostic: Option<DiagnosticProvenance>,
+}
+
+impl Context {
+    pub(crate) fn request(id: &RequestId) -> Self {
+        Self {
+            request: Some(RedactedRequestId::new(id)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn with_job_seq(mut self, job_seq: u64) -> Self {
+        self.job_seq = Some(job_seq);
+        self
+    }
+
+    pub(crate) fn diagnostic(attempt: DiagnosticProvenance) -> Self {
+        Self {
+            diagnostic: Some(attempt),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn req_id(self) -> Value {
+        self.request.map_or(Value::Null, RedactedRequestId::field)
+    }
+
+    fn add_fields(self, fields: &mut serde_json::Map<String, Value>) {
+        if let Some(request) = self.request {
+            fields.entry("req_id").or_insert_with(|| request.field());
+        }
+        if let Some(job_seq) = self.job_seq {
+            fields.entry("job_seq").or_insert_with(|| json!(job_seq));
+        }
+        if let Some(attempt) = self.diagnostic {
+            fields.entry("job").or_insert_with(|| json!(attempt.job));
+            fields.entry("run").or_insert_with(|| json!(attempt.run));
+            fields
+                .entry("stage")
+                .or_insert_with(|| json!(attempt.stage.as_str()));
+            fields.entry("lane").or_insert_with(|| json!(attempt.lane));
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn context() -> Option<Context> {
+    enabled().then(|| CONTEXT.get()).flatten()
+}
+
+pub(super) struct ContextGuard {
+    context: Option<Context>,
+    stats: Option<SharedDiskStats>,
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        let stats = SHARED_DISK_STATS.replace(self.stats).unwrap_or_default();
+        if stats != SharedDiskStats::default() {
+            let mut fields = json!({});
+            stats.add_fields(&mut fields);
+            emit("shared_disk_summary", fields);
+        }
+        CONTEXT.set(self.context);
+    }
+}
+
+pub(super) fn enter_context(context: Option<Context>) -> Option<ContextGuard> {
+    enabled().then(|| ContextGuard {
+        context: CONTEXT.replace(context),
+        stats: SHARED_DISK_STATS.replace(Some(SharedDiskStats::default())),
+    })
+}
+
+#[inline]
+pub(crate) fn with_context<T>(context: Option<Context>, run: impl FnOnce() -> T) -> T {
+    let _guard = enter_context(context);
+    run()
+}
 
 struct SessionClock {
     origin: Instant,
@@ -78,6 +315,10 @@ impl Session {
         SESSION_CLOCK.get_or_init(SessionClock::capture);
         if let Some(file) = std::env::var_os(FILE_ENV).filter(|path| !path.is_empty()) {
             start(file.into(), "process_env");
+        } else if let Some(file) =
+            std::env::var_os(COMPLETION_PROFILE_ENV).filter(|path| !path.is_empty())
+        {
+            start(file.into(), "completion_profile_env");
         }
         Self
     }
@@ -157,8 +398,13 @@ pub(super) fn session_config(roots: &[PathBuf], environment: &GoEnvironment) {
     );
 }
 
-pub(crate) fn emit(event: &'static str, fields: Value) {
-    if let Some(logger) = LOGGER.get() {
+pub(crate) fn emit(event: &'static str, mut fields: Value) {
+    if enabled()
+        && let Some(logger) = LOGGER.get()
+    {
+        if let (Some(context), Value::Object(fields)) = (CONTEXT.get(), &mut fields) {
+            context.add_fields(fields);
+        }
         logger.send(event, fields);
     }
 }
@@ -179,7 +425,39 @@ pub(super) fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+#[derive(Default)]
+struct PathHashes {
+    generation: u64,
+    entries: HashMap<PathBuf, String>,
+}
+
+pub(super) fn invalidate_path_hashes() {
+    if enabled() {
+        PATH_HASH_GENERATION.fetch_add(1, Relaxed);
+    }
+}
+
 pub(crate) fn path(path: &Path) -> String {
+    PATH_HASHES.with_borrow_mut(|cache| {
+        let generation = PATH_HASH_GENERATION.load(Relaxed);
+        if cache.generation != generation {
+            cache.generation = generation;
+            cache.entries.clear();
+        }
+        if let Some(hash) = cache.entries.get(path) {
+            return hash.clone();
+        }
+        const PATHS: usize = 256;
+        if cache.entries.len() == PATHS {
+            cache.entries.clear();
+        }
+        let hash = canonical_path_hash(path);
+        cache.entries.insert(path.to_owned(), hash.clone());
+        hash
+    })
+}
+
+fn canonical_path_hash(path: &Path) -> String {
     let canonical = path.canonicalize().unwrap_or_else(|_| {
         // A watcher deletion or unsaved document can have a canonical parent only.
         if let Some((parent, name)) = path.parent().zip(path.file_name())
@@ -189,7 +467,11 @@ pub(crate) fn path(path: &Path) -> String {
         }
         std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
     });
-    digest(("path", crate::workspace::path_key(&canonical)))
+    path_key(&crate::workspace::path_key(&canonical))
+}
+
+pub(crate) fn path_key(key: &Path) -> String {
+    digest(("path", key))
 }
 
 pub(super) fn hash(value: &str) -> String {

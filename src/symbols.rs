@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use lsp_types::Range;
 use tree_sitter::{Node, Tree};
 
-use crate::scope::{initializer_at, lexical_binding};
+use crate::scope::{initializer_at, lexical_binding_cancellable};
+
+mod cache_weight;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TypeRef {
@@ -192,7 +194,12 @@ impl FileSymbols {
             .map(|(name, member)| (name.as_str(), member))
     }
 
-    #[cfg(test)]
+    pub(crate) fn member_groups(&self) -> impl Iterator<Item = (&str, &HashMap<String, Symbol>)> {
+        self.members
+            .iter()
+            .map(|(owner, members)| (owner.as_str(), members))
+    }
+
     pub(crate) fn members(&self) -> impl Iterator<Item = (&str, &Symbol)> {
         self.members
             .values()
@@ -259,59 +266,79 @@ pub(crate) struct FileOutline {
 }
 
 pub(crate) fn collect_outline(tree: &Tree, text: &str) -> FileOutline {
-    collect_outline_with(tree, text, true, None, None, || {})
+    collect_outline_with(tree, text, true, None, || {})
 }
 
-pub(crate) type MethodNames = HashMap<String, HashSet<String>>;
+pub(crate) struct DiagnosticOutline {
+    pub(crate) package: Option<String>,
+    // Keep declaration order and duplicates. FileSymbols keeps one winner per name.
+    pub(crate) declarations: Box<[DiagnosticDeclaration]>,
+}
 
-pub(crate) fn diagnostic_method_names(
-    tree: &Tree,
-    text: &str,
-    cancelled: Option<&AtomicBool>,
-) -> anyhow::Result<MethodNames> {
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let collector = OutlineCollector {
-        text,
-        details: false,
-        methods: None,
-        cancelled,
-    };
-    let mut methods = MethodNames::new();
-    for node in root.named_children(&mut cursor) {
-        if is_cancelled(cancelled) {
-            break;
-        }
-        if node.kind() == "method_declaration"
-            && let Some(symbol) = collector.callable(node)
-            && let Some(receiver) = symbol.receiver
-        {
-            methods
-                .entry(receiver.base)
-                .or_default()
-                .insert(symbol.name);
-        }
+pub(crate) struct DiagnosticDeclaration {
+    pub(crate) name: String,
+    pub(crate) kind: OutlineKind,
+    pub(crate) receiver: Option<String>,
+    pub(crate) selection_range: ops::Range<usize>,
+    pub(crate) direct_fields: Box<[String]>,
+}
+
+impl DiagnosticOutline {
+    pub(crate) fn heap_weight(&self) -> usize {
+        self.package.as_ref().map_or(0, String::capacity)
+            + std::mem::size_of_val(&*self.declarations)
+            + self
+                .declarations
+                .iter()
+                .map(|declaration| {
+                    declaration.name.capacity()
+                        + declaration.receiver.as_ref().map_or(0, String::capacity)
+                        + std::mem::size_of_val(&*declaration.direct_fields)
+                        + declaration
+                            .direct_fields
+                            .iter()
+                            .map(String::capacity)
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
     }
-    anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
-    Ok(methods)
 }
 
 pub(crate) fn collect_diagnostic_outline(
     tree: &Tree,
     text: &str,
-    methods: &MethodNames,
     cancelled: Option<&AtomicBool>,
-) -> anyhow::Result<FileOutline> {
-    let outline = collect_outline_with(tree, text, false, Some(methods), cancelled, || {});
+) -> anyhow::Result<DiagnosticOutline> {
+    let outline = collect_outline_with(tree, text, false, cancelled, || {});
     anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
-    Ok(outline)
+    let mut declarations = Vec::with_capacity(outline.symbols.len());
+    for symbol in outline.symbols {
+        anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
+        let mut direct_fields = Vec::new();
+        for field in symbol.children() {
+            anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
+            if field.kind == OutlineKind::Field {
+                direct_fields.push(field.name.clone());
+            }
+        }
+        declarations.push(DiagnosticDeclaration {
+            name: symbol.name,
+            kind: symbol.kind,
+            receiver: symbol.receiver.map(|receiver| receiver.base),
+            selection_range: symbol.selection_range,
+            direct_fields: direct_fields.into_boxed_slice(),
+        });
+    }
+    Ok(DiagnosticOutline {
+        package: outline.package,
+        declarations: declarations.into_boxed_slice(),
+    })
 }
 
 fn collect_outline_with(
     tree: &Tree,
     text: &str,
     details: bool,
-    methods: Option<&MethodNames>,
     cancelled: Option<&AtomicBool>,
     mut before_declaration: impl FnMut(),
 ) -> FileOutline {
@@ -324,7 +351,6 @@ fn collect_outline_with(
     let collector = OutlineCollector {
         text,
         details,
-        methods,
         cancelled,
     };
     for node in root.named_children(&mut cursor) {
@@ -354,7 +380,7 @@ fn diagnostic_declaration_collection_honors_cancellation_before_the_next_declara
     let cancelled = AtomicBool::new(false);
     let mut steps = 0;
     let mut signalled = None;
-    let outline = collect_outline_with(&tree, &text, false, None, Some(&cancelled), || {
+    let outline = collect_outline_with(&tree, &text, false, Some(&cancelled), || {
         steps += 1;
         if steps == 5 {
             signalled = Some(Instant::now());
@@ -369,7 +395,6 @@ fn diagnostic_declaration_collection_honors_cancellation_before_the_next_declara
 struct OutlineCollector<'a> {
     text: &'a str,
     details: bool,
-    methods: Option<&'a MethodNames>,
     cancelled: Option<&'a AtomicBool>,
 }
 
@@ -516,34 +541,21 @@ impl<'a> OutlineCollector<'a> {
                 detail.to_owned()
             });
         }
-        if let Some(inline) = inline {
-            if self.details {
-                symbol.children = self.members(inline, None);
-            } else if kind == OutlineKind::Struct
-                && let Some(names) = self.methods.and_then(|methods| methods.get(&symbol.name))
-            {
-                symbol.children = self.members(inline, Some(names));
-            }
+        if let Some(inline) = inline
+            && (self.details || kind == OutlineKind::Struct)
+        {
+            symbol.children = self.members(inline);
         }
         Some(symbol)
     }
 
-    fn members(
-        &self,
-        inline: Node<'_>,
-        filter: Option<&HashSet<String>>,
-    ) -> Option<Rc<[OutlineSymbol]>> {
+    fn members(&self, inline: Node<'_>) -> Option<Rc<[OutlineSymbol]>> {
         let mut members = Vec::new();
-        self.collect_members(inline, filter, &mut members);
+        self.collect_members(inline, &mut members);
         (!members.is_empty()).then(|| members.into())
     }
 
-    fn collect_members(
-        &self,
-        list: Node<'_>,
-        filter: Option<&HashSet<String>>,
-        members: &mut Vec<OutlineSymbol>,
-    ) {
+    fn collect_members(&self, list: Node<'_>, members: &mut Vec<OutlineSymbol>) {
         let mut cursor = list.walk();
         let mut names = list.walk();
         for member in list.named_children(&mut cursor) {
@@ -551,8 +563,8 @@ impl<'a> OutlineCollector<'a> {
                 break;
             }
             match member.kind() {
-                "field_declaration_list" | "ERROR" => self.collect_members(member, filter, members),
-                "field_declaration" => self.fields(member, &mut names, filter, members),
+                "field_declaration_list" | "ERROR" => self.collect_members(member, members),
+                "field_declaration" => self.fields(member, &mut names, members),
                 "method_elem" => members.extend(self.callable(member)),
                 "type_elem" => members.extend(self.embedded_interface(member)),
                 _ => {}
@@ -564,17 +576,14 @@ impl<'a> OutlineCollector<'a> {
         &self,
         field: Node<'t>,
         cursor: &mut tree_sitter::TreeCursor<'t>,
-        filter: Option<&HashSet<String>>,
         members: &mut Vec<OutlineSymbol>,
     ) {
         let Some(ty) = field.child_by_field_name("type") else {
             return;
         };
-        let matches = |name: Node<'_>| filter.is_none_or(|names| names.contains(self.text(name)));
         let mut names = field.children_by_field_name("name", cursor).peekable();
         if names.peek().is_none() {
             if let Some(syntax) = named_type_syntax(ty)
-                && matches(syntax.name)
                 && let Some(mut symbol) = self.symbol(syntax.name, field, OutlineKind::Field)
             {
                 if self.details {
@@ -590,7 +599,6 @@ impl<'a> OutlineCollector<'a> {
             members.extend(
                 names
                     .take_while(|_| !is_cancelled(self.cancelled))
-                    .filter(|name| matches(*name))
                     .filter_map(|name| self.symbol(name, field, OutlineKind::Field)),
             );
             return;
@@ -605,7 +613,7 @@ impl<'a> OutlineCollector<'a> {
                 }
             })
             .and_then(outline_inline_type);
-        let children = inline.and_then(|inline| self.members(inline, None));
+        let children = inline.and_then(|inline| self.members(inline));
         let ty_detail = self.type_detail(ty, inline);
         let detail = match field.child_by_field_name("tag") {
             Some(tag) => format!("{ty_detail} {}", self.text(tag)),
@@ -832,7 +840,8 @@ impl Indexer<'_> {
             "type_spec" | "type_alias" => self.type_declaration(declaration),
             "function_declaration" => {
                 if let Some(name) = declaration.child_by_field_name("name") {
-                    let results = function_signature(declaration, self.text, self.range);
+                    let results =
+                        function_signature(declaration, self.text, self.range, self.cancelled);
                     self.insert_declaration(name, SymbolKind::Function(results), false);
                 }
             }
@@ -898,7 +907,7 @@ impl Indexer<'_> {
 
         let owner = node_text(name, self.text);
         let mut details = TypeDetails {
-            parameters: type_parameters(declaration, self.text, self.range),
+            parameters: type_parameters(declaration, self.text, self.range, self.cancelled),
             ..TypeDetails::default()
         };
         if declaration.kind() == "type_alias" {
@@ -963,7 +972,7 @@ impl Indexer<'_> {
         if named.qualifier.is_some() || owner.pointers > 1 {
             return;
         }
-        let results = function_signature(declaration, self.text, self.range);
+        let results = function_signature(declaration, self.text, self.range, self.cancelled);
         let mut symbol = Symbol::new((self.range)(name), SymbolKind::Function(results), false);
         symbol.pointer_receiver = owner.pointers == 1;
         symbol.receiver_parameters = named
@@ -1014,7 +1023,7 @@ fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
     cancelled.is_some_and(|flag| flag.load(Relaxed))
 }
 
-fn type_ref_inner(
+pub(crate) fn type_ref_inner(
     node: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
@@ -1067,13 +1076,18 @@ fn type_ref_inner(
         | "func_literal"
         | "function_declaration"
         | "method_declaration"
-        | "method_elem" => TypeRefKind::Function(function_signature(node, text, range)),
-        _ => TypeRefKind::Named(named_type(node, text, range)?),
+        | "method_elem" => TypeRefKind::Function(function_signature(node, text, range, cancelled)),
+        _ => TypeRefKind::Named(named_type(node, text, range, cancelled)?),
     };
     Some(TypeRef { pointers: 0, kind })
 }
 
-fn named_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) -> Option<NamedType> {
+fn named_type(
+    node: Node<'_>,
+    text: &str,
+    range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
+) -> Option<NamedType> {
     let syntax = named_type_syntax(node)?;
     let name = node_text(syntax.name, text);
     let qualifier = syntax.qualifier.map(|qualifier| node_text(qualifier, text));
@@ -1084,8 +1098,11 @@ fn named_type(node: Node<'_>, text: &str, range: &dyn Fn(Node<'_>) -> Range) -> 
         .arguments
         .map(|list| {
             list.named_children(&mut list.walk())
+                .take_while(|_| !is_cancelled(cancelled))
                 .filter(|node| node.kind() == "type_elem")
-                .map(|node| only_named_child(node).and_then(|ty| type_ref(ty, text, range)))
+                .map(|node| {
+                    only_named_child(node).and_then(|ty| type_ref_inner(ty, text, range, cancelled))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1117,7 +1134,7 @@ fn inline_type(
             match element.kind() {
                 "method_elem" => {
                     if let Some(name) = element.child_by_field_name("name") {
-                        let results = function_signature(element, text, range);
+                        let results = function_signature(element, text, range, cancelled);
                         let symbol = Symbol::new(range(name), SymbolKind::Function(results), false);
                         inline
                             .members
@@ -1226,6 +1243,10 @@ struct NamedTypeSyntax<'tree> {
     arguments: Option<Node<'tree>>,
 }
 
+pub(crate) fn named_type_name(node: Node<'_>) -> Option<Node<'_>> {
+    named_type_syntax(node).map(|syntax| syntax.name)
+}
+
 fn named_type_syntax(mut node: Node<'_>) -> Option<NamedTypeSyntax<'_>> {
     let mut arguments = None;
     loop {
@@ -1269,18 +1290,23 @@ fn type_parameters(
     declaration: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
 ) -> Vec<GenericParameter> {
     let mut parameters = Vec::new();
     if let Some(list) = declaration.child_by_field_name("type_parameters") {
         let mut cursor = list.walk();
         for parameter in list.named_children(&mut cursor) {
+            if is_cancelled(cancelled) {
+                break;
+            }
             let constraint = parameter
                 .child_by_field_name("type")
-                .map(|node| type_constraint(node, text, range))
+                .map(|node| type_constraint(node, text, range, cancelled))
                 .unwrap_or_default();
             let mut cursor = parameter.walk();
             let names = parameter
                 .children_by_field_name("name", &mut cursor)
+                .take_while(|_| !is_cancelled(cancelled))
                 .filter(|node| node.kind() == "identifier");
             parameters.extend(names.map(|name| GenericParameter {
                 name: node_text(name, text).to_owned(),
@@ -1296,17 +1322,20 @@ pub(crate) fn type_constraint(
     constraint: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
 ) -> TypeConstraint {
     let Some(ty) = only_named_child(constraint) else {
         return TypeConstraint {
-            terms: constraint_terms(constraint, text, range),
+            terms: constraint_terms(constraint, text, range, cancelled),
             ..TypeConstraint::default()
         };
     };
     let methods = match ty.kind() {
-        "interface_type" | "qualified_type" | "generic_type" => type_ref(ty, text, range),
+        "interface_type" | "qualified_type" | "generic_type" => {
+            type_ref_inner(ty, text, range, cancelled)
+        }
         "type_identifier" if !matches!(node_text(ty, text), "any" | "comparable") => {
-            type_ref(ty, text, range)
+            type_ref_inner(ty, text, range, cancelled)
         }
         _ => None,
     };
@@ -1314,19 +1343,25 @@ pub(crate) fn type_constraint(
         let mut cursor = ty.walk();
         let mut terms = ty
             .named_children(&mut cursor)
+            .take_while(|_| !is_cancelled(cancelled))
             .filter(|node| node.kind() == "type_elem");
         let single = terms.next().filter(|_| terms.next().is_none());
         (
             single.and_then(only_named_child),
-            single.map_or_else(Vec::new, |term| constraint_terms(term, text, range)),
+            single.map_or_else(Vec::new, |term| {
+                constraint_terms(term, text, range, cancelled)
+            }),
         )
     } else {
-        (Some(ty), constraint_terms(constraint, text, range))
+        (
+            Some(ty),
+            constraint_terms(constraint, text, range, cancelled),
+        )
     };
     let approximation = term
         .filter(|term| term.kind() == "negated_type")
         .and_then(only_named_child)
-        .and_then(|term| type_ref(term, text, range));
+        .and_then(|term| type_ref_inner(term, text, range, cancelled));
     TypeConstraint {
         methods,
         approximation,
@@ -1338,9 +1373,11 @@ fn constraint_terms(
     element: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
 ) -> Vec<ConstraintTerm> {
     element
         .named_children(&mut element.walk())
+        .take_while(|_| !is_cancelled(cancelled))
         .filter(|term| !term.is_extra())
         .map(|term| {
             let approximate = term.kind() == "negated_type";
@@ -1350,7 +1387,7 @@ fn constraint_terms(
                 term
             };
             Some(ConstraintTerm {
-                reference: type_ref(ty, text, range)?,
+                reference: type_ref_inner(ty, text, range, cancelled)?,
                 approximate,
             })
         })
@@ -1405,16 +1442,22 @@ fn function_signature(
     function: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
 ) -> Arc<FunctionSignature> {
-    let type_parameters = type_parameters(function, text, range);
+    let type_parameters = type_parameters(function, text, range, cancelled);
     let parameters = function.child_by_field_name("parameters");
     let parameters_known = parameters.is_some_and(|list| !list.has_error());
     let variadic = parameters.is_some_and(|list| {
         list.named_children(&mut list.walk())
+            .take_while(|_| !is_cancelled(cancelled))
             .any(|node| node.kind() == "variadic_parameter_declaration")
     });
     let parameters = parameters.map_or_else(Vec::new, |list| {
-        parameter_types(list, |node| type_ref(node, text, range))
+        parameter_types_inner(
+            list,
+            |node| type_ref_inner(node, text, range, cancelled),
+            cancelled,
+        )
     });
     let origin = if matches!(function.kind(), "function_type" | "func_literal") {
         FunctionOrigin::FuncKeyword(range(function.child(0).unwrap_or(function)))
@@ -1431,7 +1474,7 @@ fn function_signature(
     Arc::new(FunctionSignature {
         origin,
         result_tuple,
-        results: function_results(function, text, range),
+        results: function_results(function, text, range, cancelled),
         parameters,
         parameters_known,
         variadic,
@@ -1443,6 +1486,7 @@ fn function_results(
     function: Node<'_>,
     text: &str,
     range: &dyn Fn(Node<'_>) -> Range,
+    cancelled: Option<&AtomicBool>,
 ) -> Arc<[Option<TypeRef>]> {
     let Some(result) = function.child_by_field_name("result") else {
         return Arc::from([]);
@@ -1454,56 +1498,72 @@ fn function_results(
     ) && std::iter::successors(function.parent(), |node| node.parent())
         .any(|owner| owner.kind() == "block");
     let parse = |node| {
-        if local && has_shadowed_result_type(node, text) {
+        if local && has_shadowed_result_type(node, text, cancelled) {
             return None;
         }
-        type_ref(node, text, range)
+        type_ref_inner(node, text, range, cancelled)
     };
     if result.kind() != "parameter_list" {
         return Arc::from([parse(result)]);
     }
-    parameter_types(result, parse).into()
+    parameter_types_inner(result, parse, cancelled).into()
 }
 
 pub(crate) fn parameter_types<'tree>(
     list: Node<'tree>,
     parse: impl Fn(Node<'tree>) -> Option<TypeRef>,
 ) -> Vec<Option<TypeRef>> {
+    parameter_types_inner(list, parse, None)
+}
+
+fn parameter_types_inner<'tree>(
+    list: Node<'tree>,
+    parse: impl Fn(Node<'tree>) -> Option<TypeRef>,
+    cancelled: Option<&AtomicBool>,
+) -> Vec<Option<TypeRef>> {
     let mut result = Vec::new();
     let mut cursor = list.walk();
-    for parameter in list.named_children(&mut cursor).filter(|node| {
-        matches!(
-            node.kind(),
+    for parameter in list.named_children(&mut cursor) {
+        if is_cancelled(cancelled) {
+            break;
+        }
+        if !matches!(
+            parameter.kind(),
             "parameter_declaration" | "variadic_parameter_declaration"
-        )
-    }) {
+        ) {
+            continue;
+        }
         let ty = parameter.child_by_field_name("type").and_then(&parse);
         let mut name_cursor = parameter.walk();
         let count = parameter
             .children_by_field_name("name", &mut name_cursor)
+            .take_while(|_| !is_cancelled(cancelled))
             .filter(|node| node.kind() == "identifier")
             .count()
             .max(1);
-        result.extend(std::iter::repeat_n(ty, count));
+        result.extend(std::iter::repeat_n(ty, count).take_while(|_| !is_cancelled(cancelled)));
     }
     result
 }
 
 // Package-indexed result types cannot stand in for similarly named local declarations.
-fn has_shadowed_result_type(ty: Node<'_>, text: &str) -> bool {
+fn has_shadowed_result_type(ty: Node<'_>, text: &str, cancelled: Option<&AtomicBool>) -> bool {
+    if is_cancelled(cancelled) {
+        return false;
+    }
     match ty.kind() {
         "qualified_type" => false,
-        "type_identifier" => {
-            lexical_binding(ty, node_text(ty, text), text).is_some_and(|binding| {
+        "type_identifier" => lexical_binding_cancellable(ty, node_text(ty, text), text, cancelled)
+            .is_some_and(|binding| {
                 binding
                     .name
                     .parent()
                     .is_some_and(|owner| owner.kind() != "type_parameter_declaration")
-            })
-        }
+            }),
         _ => ty
             .named_children(&mut ty.walk())
-            .any(|child| has_shadowed_result_type(child, text)),
+            .take_while(|_| !is_cancelled(cancelled))
+            .any(|child| has_shadowed_result_type(child, text, cancelled)),
     }
 }
 
@@ -1799,11 +1859,12 @@ mod outline_tests {
         let mut functions = root
             .named_children(&mut cursor)
             .filter(|node| node.kind() == "function_declaration");
-        let getter = function_signature(functions.next().unwrap(), text, &|_| Range::default());
+        let getter =
+            function_signature(functions.next().unwrap(), text, &|_| Range::default(), None);
         assert!(getter.parameters_known && getter.parameters.is_empty());
         let broken = functions
             .next()
             .unwrap_or_else(|| panic!("{}", root.to_sexp()));
-        assert!(!function_signature(broken, text, &|_| Range::default()).parameters_known);
+        assert!(!function_signature(broken, text, &|_| Range::default(), None).parameters_known);
     }
 }

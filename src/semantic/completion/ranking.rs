@@ -1,6 +1,13 @@
-use std::{cmp::Ordering, collections::HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashSet},
+    sync::atomic::AtomicBool,
+};
 
+use anyhow::Result;
 use lsp_types::CompletionItemKind;
+
+use crate::semantic::source::check_optional_cancelled;
 
 use super::render::{PendingImport, Target};
 
@@ -220,34 +227,110 @@ impl Candidate {
     }
 }
 
-pub(super) fn rank(mut candidates: Vec<Candidate>) -> impl Iterator<Item = (String, Candidate)> {
-    candidates.sort_by(|left, right| {
-        left.score()
-            .cmp(&right.score())
-            .then_with(|| compare_labels(&left.label, &right.label))
-            .then_with(|| left.import_path.cmp(&right.import_path))
-            .then_with(|| {
-                left.target
-                    .as_ref()
-                    .map(Target::key)
-                    .cmp(&right.target.as_ref().map(Target::key))
-            })
-            .then_with(|| left.detail.cmp(&right.detail))
-    });
+pub(super) fn rank(
+    candidates: Vec<Candidate>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<impl Iterator<Item = Result<(String, Candidate)>> + '_> {
+    let candidates = sort_candidates(candidates, cancelled)?;
     let mut seen = HashSet::new();
-    candidates
-        .into_iter()
-        .filter(move |candidate| {
-            let path = if candidate.qualified {
-                candidate.import_path.clone()
-            } else {
-                None
-            };
-            seen.insert((candidate.label.clone(), path))
-        })
-        .enumerate()
-        .map(|(index, candidate)| (candidate.sort_text(index), candidate))
+    let mut index = 0;
+    Ok(candidates.into_iter().filter_map(move |candidate| {
+        if let Err(error) = check_optional_cancelled(cancelled) {
+            return Some(Err(error));
+        }
+        let path = candidate
+            .qualified
+            .then(|| candidate.import_path.clone())
+            .flatten();
+        if !seen.insert((candidate.label.clone(), path)) {
+            return None;
+        }
+        let sort = candidate.sort_text(index);
+        index += 1;
+        Some(Ok((sort, candidate)))
+    }))
 }
+
+fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
+    left.score()
+        .cmp(&right.score())
+        .then_with(|| compare_labels(&left.label, &right.label))
+        .then_with(|| left.import_path.cmp(&right.import_path))
+        .then_with(|| {
+            left.target
+                .as_ref()
+                .map(Target::key)
+                .cmp(&right.target.as_ref().map(Target::key))
+        })
+        .then_with(|| left.detail.cmp(&right.detail))
+}
+
+fn sort_candidates(
+    mut candidates: Vec<Candidate>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<Candidate>> {
+    const RUN_SIZE: usize = 256;
+    check_optional_cancelled(cancelled)?;
+    if cancelled.is_none() || candidates.len() <= RUN_SIZE {
+        candidates.sort_by(compare_candidates);
+        check_optional_cancelled(cancelled)?;
+        return Ok(candidates);
+    }
+
+    let len = candidates.len();
+    let mut candidates = candidates.into_iter();
+    let mut runs = Vec::with_capacity(len.div_ceil(RUN_SIZE));
+    let mut heads = BinaryHeap::new();
+    while !candidates.as_slice().is_empty() {
+        check_optional_cancelled(cancelled)?;
+        let mut run: Vec<_> = candidates.by_ref().take(RUN_SIZE).collect();
+        run.sort_by(compare_candidates);
+        let mut run = run.into_iter();
+        heads.push(RunHead {
+            candidate: run.next().expect("nonempty completion sort run"),
+            run: runs.len(),
+        });
+        runs.push(run);
+    }
+    drop(candidates);
+
+    let mut sorted = Vec::with_capacity(len);
+    while let Some(RunHead { candidate, run }) = heads.pop() {
+        check_optional_cancelled(cancelled)?;
+        sorted.push(candidate);
+        if let Some(candidate) = runs[run].next() {
+            heads.push(RunHead { candidate, run });
+        }
+    }
+    Ok(sorted)
+}
+
+struct RunHead {
+    candidate: Candidate,
+    run: usize,
+}
+
+impl Ord for RunHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The heap pops the smallest candidate first. Earlier input runs win
+        // ties, preserving the stable order of the original sort.
+        compare_candidates(&other.candidate, &self.candidate).then_with(|| other.run.cmp(&self.run))
+    }
+}
+
+impl PartialOrd for RunHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RunHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RunHead {}
 
 fn compare_labels(left: &str, right: &str) -> Ordering {
     let mut a = left.chars().flat_map(char::to_lowercase).peekable();
@@ -278,4 +361,62 @@ fn compare_labels(left: &str, right: &str) -> Ordering {
         }
     }
     a.peek().cmp(&b.peek()).then_with(|| left.cmp(right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellable_ranking_preserves_cross_run_ties_and_global_deduplication() {
+        let candidates = || {
+            (0..850)
+                .map(|index| {
+                    let mut candidate = Candidate::new(
+                        format!("candidate{}", index % 310),
+                        CompletionItemKind::VARIABLE,
+                        Match::Prefix,
+                        if index < 620 { SYMBOL } else { KEYWORD },
+                    );
+                    candidate.filter = Some(index.to_string());
+                    candidate.qualified = index % 3 == 0;
+                    candidate.import_path =
+                        candidate.qualified.then(|| format!("package{}", index % 2));
+                    candidate
+                })
+                .collect()
+        };
+        let collect = |cancelled| {
+            rank(candidates(), cancelled)
+                .unwrap()
+                .map(|item| {
+                    let (sort, candidate) = item.unwrap();
+                    (
+                        sort,
+                        candidate.label,
+                        candidate.filter,
+                        candidate.import_path,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let cancelled = AtomicBool::new(false);
+        let uncancelled = collect(None);
+        assert_eq!(collect(Some(&cancelled)), uncancelled);
+        assert!(
+            uncancelled
+                .iter()
+                .any(|(_, _, filter, _)| filter.as_deref() == Some("1"))
+        );
+        assert!(
+            !uncancelled
+                .iter()
+                .any(|(_, _, filter, _)| { matches!(filter.as_deref(), Some("311" | "620")) })
+        );
+        let mut ranked = rank(candidates(), Some(&cancelled)).unwrap();
+        assert!(ranked.next().unwrap().is_ok());
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(ranked.next().unwrap().is_err());
+        assert!(rank(candidates(), Some(&cancelled)).is_err());
+    }
 }

@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -596,6 +597,10 @@ func runPaused(cmd *exec.Cmd, control string) int {
     var stdout, stderr bytes.Buffer
     cmd.Stdout, cmd.Stderr = &stdout, &stderr
     code := run(cmd)
+    if err := os.WriteFile(filepath.Join(control, "pid"), []byte(fmt.Sprint(os.Getpid())), 0600); err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        return 1
+    }
     if err := os.WriteFile(filepath.Join(control, "ready"), nil, 0600); err != nil {
         fmt.Fprintln(os.Stderr, err)
         return 1
@@ -673,6 +678,7 @@ class PausedGoList:
         self.timeout = timeout
         self.environment = go_list_relay(self.control, timeout)
         self._armed = False
+        self._cancelled = False
 
     def arm(self):
         arm = self.control / "arm"
@@ -682,14 +688,50 @@ class PausedGoList:
             try:
                 arm.unlink()
             except FileNotFoundError:
-                _wait_for_file(self.control / "done", self.timeout, "previous go list relay did not finish")
-            for marker in ("ready", "release", "done"):
+                if not self._cancelled:
+                    _wait_for_file(self.control / "done", self.timeout, "previous go list relay did not finish")
+            for marker in ("pid", "ready", "release", "done"):
                 (self.control / marker).unlink(missing_ok=True)
         write(arm, "")
         self._armed = True
+        self._cancelled = False
 
     def wait_for_snapshot(self, timeout=None):
         wait_for_snapshot(self.control, self.timeout if timeout is None else timeout)
+
+    @contextmanager
+    def expect_cancellation(self, timeout=None):
+        """Check that the captured relay exits without the gate releasing its output."""
+        timeout = self.timeout if timeout is None else timeout
+        self.wait_for_snapshot(timeout)
+        pid = int((self.control / "pid").read_text(encoding="ascii"))
+        failure = "go list relay did not exit after cancellation"
+        if os.name == "nt":
+            import _winapi
+
+            process = _winapi.OpenProcess(_winapi.SYNCHRONIZE, False, pid)
+            try:
+                yield
+                wait = _winapi.WaitForSingleObject(process, math.ceil(timeout * 1000))
+                if wait != _winapi.WAIT_OBJECT_0:
+                    raise RuntimeError(failure)
+            finally:
+                _winapi.CloseHandle(process)
+        else:
+            yield
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(failure)
+                time.sleep(min(0.01, remaining))
+        if any((self.control / marker).exists() for marker in ("release", "done")):
+            raise RuntimeError("go list relay finished after releasing its output")
+        self._cancelled = True
 
     def release(self):
         write(self.control / "release", "")

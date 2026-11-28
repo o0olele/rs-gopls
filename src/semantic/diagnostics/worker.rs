@@ -200,6 +200,11 @@ impl DiagnosticInput {
                 Some(cancelled),
                 None,
             )?;
+            if let DiagnosticDocumentRevision::Disk { stamp, .. } = self.key.revision
+                && source.text.stamp != Some(stamp)
+            {
+                return Ok(None);
+            }
             engine
                 .state
                 .documents
@@ -248,12 +253,18 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use lsp_types::{CodeActionKind, Position, TextDocumentContentChangeEvent};
+    use lsp_types::{
+        CodeActionContext, CodeActionKind, CompletionResponse, Documentation, FileChangeType,
+        Position, Range, TextDocumentContentChangeEvent,
+    };
+    use serde_json::json;
 
     use super::*;
     use crate::protocol::path_uri;
+    use crate::semantic::completion::CompletionClientCapabilities;
     use crate::semantic::diagnostics::{ContextCompleteness, DiagnosticCode, DiagnosticFixData};
     use crate::semantic::shared_disk::CacheEvent;
+    use crate::semantic::{DefinitionKind, QueryProgress, SemanticTask};
     use crate::test_support::TestProject;
 
     fn run(engine: &mut Engine, path: &Path, stage: DiagnosticStage) -> Option<DiagnosticReport> {
@@ -287,6 +298,255 @@ mod tests {
         engine.install_diagnostic_report(report.clone());
         engine.mark_diagnostic_report_delivered(&report.snapshot);
         report
+    }
+
+    #[test]
+    fn diagnostics_definition_and_completion_share_a_tree_free_disk_revision() {
+        let project = TestProject::new();
+        let text = "package sample\nfunc use(){ Shared() }\n";
+        let sibling_text = "package sample\r\n// Disk documentation.\r\nfunc Shared() { var n int = \"🙂\"; _ = n }\r\n";
+        let path = project.write("main.go", text);
+        let sibling = project.write("sibling.go", sibling_text);
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["main.go", "sibling.go"], false)
+        ));
+        file(&mut engine, &path, text);
+        let position = Position::new(1, 14);
+        let definition = |engine: &mut Engine| {
+            let QueryProgress::Ready(target) = engine
+                .definition(&path, position, DefinitionKind::Declaration)
+                .unwrap()
+            else {
+                panic!("workspace should be ready for definition");
+            };
+            target
+        };
+        let completion = |engine: &mut Engine| {
+            let response = match engine
+                .complete(
+                    &path,
+                    position,
+                    None,
+                    &CompletionClientCapabilities::default(),
+                )
+                .unwrap()
+            {
+                QueryProgress::Ready(response) => response,
+                QueryProgress::Searching(mut task) => {
+                    while !task.advance(engine).unwrap() {}
+                    task.finish()
+                }
+                QueryProgress::Pending(_) => panic!("workspace should be ready for completion"),
+            };
+            let CompletionResponse::Array(items) = response else {
+                panic!("expected complete candidates");
+            };
+            items.into_iter().find(|item| item.label == "Shared")
+        };
+        let disk_target = (
+            sibling.clone(),
+            Range::new(Position::new(2, 5), Position::new(2, 11)),
+        );
+
+        engine.state.shared_disk.clear_full_cache();
+        let report = run(&mut engine, &path, DiagnosticStage::Stage2).unwrap();
+        assert!(report.items.is_empty(), "{:?}", report.items);
+        assert_eq!(definition(&mut engine), Some(disk_target.clone()));
+        let item = completion(&mut engine).unwrap();
+        assert_eq!(item.detail.as_deref(), Some("func Shared()"));
+        assert!(
+            matches!(item.documentation, Some(Documentation::MarkupContent(doc)) if doc.value == "Disk documentation.")
+        );
+        assert_eq!(engine.state.shared_disk.projection_counts(&sibling), (0, 1));
+
+        engine.state.shared_disk.clear_full_cache();
+        let warm = run(&mut engine, &path, DiagnosticStage::Stage1).unwrap();
+        assert_eq!(warm.context_completeness, ContextCompleteness::Complete);
+        assert!(warm.items.is_empty(), "{:?}", warm.items);
+
+        file(
+            &mut engine,
+            &sibling,
+            "package sample\nfunc OverlayOnly() {}\n",
+        );
+        assert!(definition(&mut engine).is_none());
+        assert!(completion(&mut engine).is_none());
+        assert!(
+            run(&mut engine, &path, DiagnosticStage::Stage2)
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.code == DiagnosticCode::NameUnresolved)
+        );
+        engine.close(&sibling);
+        assert_eq!(definition(&mut engine), Some(disk_target.clone()));
+        assert_eq!(engine.state.shared_disk.projection_counts(&sibling), (0, 1));
+
+        project.write(
+            "sibling.go",
+            &sibling_text.replace("Disk documentation.", "Revised disk documentation."),
+        );
+        engine.file_changed(&sibling, FileChangeType::CHANGED);
+        let item = completion(&mut engine).unwrap();
+        assert!(
+            matches!(item.documentation, Some(Documentation::MarkupContent(doc)) if doc.value == "Revised disk documentation.")
+        );
+        assert_eq!(engine.state.shared_disk.projection_counts(&sibling), (0, 2));
+
+        // Selecting the sibling as the diagnostic target requires its function body.
+        let sibling_report = run(&mut engine, &sibling, DiagnosticStage::Stage2).unwrap();
+        assert!(
+            sibling_report
+                .items
+                .iter()
+                .any(|item| item.code == DiagnosticCode::TypeMismatch)
+        );
+        assert_eq!(engine.state.shared_disk.projection_counts(&sibling), (1, 2));
+
+        engine.state.shared_disk.clear_full_cache();
+        assert_eq!(definition(&mut engine), Some(disk_target));
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["main.go"], false)
+        ));
+        assert!(definition(&mut engine).is_none());
+        assert!(completion(&mut engine).is_none());
+        assert!(
+            run(&mut engine, &path, DiagnosticStage::Stage2)
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.code == DiagnosticCode::NameUnresolved)
+        );
+        assert_eq!(engine.state.shared_disk.projection_counts(&sibling), (1, 2));
+    }
+
+    #[test]
+    fn diagnostic_worker_reads_an_imported_package_without_its_function_bodies() {
+        let project = TestProject::new();
+        let text = "package sample\nimport \"dep\"\nvar _ int = dep.Shared()\n";
+        let path = project.write("main.go", text);
+        let dependency = project.write(
+            "dep/source.go",
+            "package dep\nfunc Shared() int { value := 7; return value }\n",
+        );
+        let listing = format!(
+            "{}{}",
+            json!({"Dir":project.root,"ImportPath":"sample","Name":"sample","GoFiles":["main.go"],"Imports":["dep"]}),
+            json!({"Dir":dependency.parent().unwrap(),"ImportPath":"dep","Name":"dep","GoFiles":["source.go"]}),
+        );
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            Workspace::from_test_listing(std::slice::from_ref(&project.root), &listing, false),
+        ));
+        file(&mut engine, &path, text);
+        let report = run(&mut engine, &path, DiagnosticStage::Stage2).unwrap();
+        assert!(report.items.is_empty(), "{:?}", report.items);
+        assert_eq!(
+            engine.state.shared_disk.projection_counts(&dependency),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn stage2_reuses_overlay_outlines_and_reports_current_utf16_ranges() {
+        let project = TestProject::new();
+        let first_text = "package sample\r\nvar Duplicate int\r\ntype Owner struct { Move int }\r\nfunc use() { Moved() }\r\n";
+        let before = "package sample\r\nfunc body() {}\r\n/*🙂*/ var Duplicate int\r\nfunc (Owner) Move() {}\r\n/*🙂*/ func Moved() {}\r\n";
+        let after = before
+            .replace("func body() {}", "func body() {\r\n    _ = \"🙂\"\r\n}")
+            .replace("/*🙂*/", "/*🙂🙂*/");
+        let first = project.write("a.go", first_text);
+        let path = project.write("b.go", before);
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["a.go", "b.go"], false),
+        ));
+        file(&mut engine, &first, first_text);
+        file(&mut engine, &path, before);
+
+        let cached = |engine: &Engine, file: &Path| {
+            engine.state.documents[&path_key(file)]
+                .cached_overlay_declarations()
+                .cloned()
+        };
+        let redeclarations = |engine: &mut Engine| {
+            let report = run(engine, &path, DiagnosticStage::Stage2).unwrap();
+            assert_eq!(report.items.len(), 2, "{:?}", report.items);
+            report
+                .items
+                .into_iter()
+                .map(|item| {
+                    assert_eq!(item.code, DiagnosticCode::NameRedeclared);
+                    (item.message, item.range)
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let definition = |engine: &mut Engine| {
+            let QueryProgress::Ready(Some((target, range))) = engine
+                .definition(&first, Position::new(3, 14), DefinitionKind::Declaration)
+                .unwrap()
+            else {
+                panic!("expected the definition of Moved");
+            };
+            assert_eq!(target, path);
+            range
+        };
+        assert!(cached(&engine, &first).is_none());
+        assert!(cached(&engine, &path).is_none());
+        let declaration_revision = engine.state.documents[&path_key(&path)].declaration_revision;
+        let original = redeclarations(&mut engine);
+        let sibling = cached(&engine, &first).unwrap();
+        let target = cached(&engine, &path).unwrap();
+        assert_eq!(original, redeclarations(&mut engine));
+        assert!(Arc::ptr_eq(&sibling, &cached(&engine, &first).unwrap()));
+        assert!(Arc::ptr_eq(&target, &cached(&engine, &path).unwrap()));
+        assert_eq!(
+            original["Duplicate redeclared in this package"],
+            Range::new(Position::new(2, 11), Position::new(2, 20)),
+        );
+        assert_eq!(
+            definition(&mut engine),
+            Range::new(Position::new(4, 12), Position::new(4, 17)),
+        );
+
+        edit(&mut engine, &path, 2, &after);
+        assert!(cached(&engine, &path).is_none());
+        assert_eq!(
+            engine.state.documents[&path_key(&path)].declaration_revision,
+            declaration_revision,
+        );
+        let moved = redeclarations(&mut engine);
+        assert!(Arc::ptr_eq(&sibling, &cached(&engine, &first).unwrap()));
+        assert!(!Arc::ptr_eq(&target, &cached(&engine, &path).unwrap()));
+        assert_eq!(
+            moved["Duplicate redeclared in this package"],
+            Range::new(Position::new(4, 13), Position::new(4, 22)),
+        );
+        assert_eq!(
+            moved["Move redeclared in this package"],
+            Range::new(Position::new(5, 13), Position::new(5, 17)),
+        );
+        assert_eq!(
+            definition(&mut engine),
+            Range::new(Position::new(6, 14), Position::new(6, 19)),
+        );
+    }
+
+    #[test]
+    fn diagnostic_worker_discards_a_changed_disk_target_revision() {
+        let project = TestProject::new();
+        let path = project.write("main.go", "package sample\nvar old int\n");
+        let mut engine = Engine::new(project.root.clone());
+        let key = engine.diagnostic_key(&path).unwrap();
+        let input = engine.capture_diagnostics(&path, key);
+
+        project.write("main.go", "package sample\nvar successor string\n");
+        assert!(input.analyze(&AtomicBool::new(false)).unwrap().is_none());
     }
 
     #[test]
@@ -528,6 +788,57 @@ mod tests {
     }
 
     #[test]
+    fn delivered_code_action_data_survives_report_eviction_only_for_its_snapshot() {
+        let project = TestProject::new();
+        let before = "package sample\nfunc f(){ unused := 1 }\n";
+        let path = project.write("sample.go", before);
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["sample.go"], false)
+        ));
+        file(&mut engine, &path, before);
+        let report = deliver(&mut engine, &path);
+        let unused = report
+            .items
+            .iter()
+            .find(|item| item.code == DiagnosticCode::VarUnused)
+            .unwrap();
+        let uri = path_uri(&path).unwrap();
+        let context = CodeActionContext {
+            diagnostics: Vec::new(),
+            only: Some(vec![CodeActionKind::QUICKFIX]),
+            trigger_kind: None,
+        };
+        engine
+            .diagnostics_cache
+            .invalidate_reports(&report.snapshot.path_key);
+        assert!(engine.diagnostic_report_for_key(&report.snapshot).is_none());
+        let actions = engine
+            .local_code_actions(&path, &uri, unused.range, &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+
+        let after = "package sample\nfunc f(){ unused := 1; _ = unused }\n";
+        edit(&mut engine, &path, 2, after);
+        assert!(
+            engine
+                .local_code_actions(&path, &uri, unused.range, &context)
+                .unwrap()
+                .is_none()
+        );
+        engine.close(&path);
+        file(&mut engine, &path, before);
+        assert!(
+            engine
+                .local_code_actions(&path, &uri, unused.range, &context)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn workspace_fallback_is_a_partial_stage_one_report_and_reopen_changes_the_key() {
         let project = TestProject::new();
         let text = "package sample\nfunc f(){ _ = ) }\n";
@@ -566,10 +877,23 @@ mod tests {
         for (flight, waiting) in [
             (CacheEvent::Read, CacheEvent::WaitRead),
             (CacheEvent::Parse, CacheEvent::WaitParse),
+            (CacheEvent::Declarations, CacheEvent::WaitDeclarations),
         ] {
             let project = TestProject::new();
-            let path = project.write("sample.go", "package sample\nvar v int\n");
+            let text = "package sample\nvar v int\n";
+            let path = project.write("sample.go", text);
             let mut engine = Engine::new(project.root.clone());
+            let observed = if flight == CacheEvent::Declarations {
+                let sibling = project.write("sibling.go", "package sample\nfunc F() {}\n");
+                assert!(engine.install_workspace(
+                    engine.workspace_load(),
+                    project.workspace(&["sample.go", "sibling.go"], false),
+                ));
+                file(&mut engine, &path, text);
+                sibling
+            } else {
+                path.clone()
+            };
             let key = engine.diagnostic_key(&path).unwrap();
             let producer = engine.capture_diagnostics(&path, key.clone());
             let waiter = engine.capture_diagnostics(&path, key);
@@ -633,7 +957,7 @@ mod tests {
             } else {
                 (1, 1)
             };
-            assert_eq!(engine.state.shared_disk.counts(&path), expected);
+            assert_eq!(engine.state.shared_disk.counts(&observed), expected);
         }
     }
 }

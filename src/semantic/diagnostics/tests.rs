@@ -10,6 +10,8 @@ use crate::test_support::TestProject;
 use crate::workspace::path_key;
 use DiagnosticCode::*;
 
+mod caches;
+
 fn analyze_file(engine: &mut Engine, path: &Path) -> DiagnosticReport {
     let mut snapshot = engine.snapshot();
     let document = snapshot.document(path).unwrap().unwrap();

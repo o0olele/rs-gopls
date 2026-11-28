@@ -550,6 +550,7 @@ impl SemanticTask<Vec<Location>> for ImplementationSearch {
             return Ok(false);
         }
         let started = Instant::now();
+        resolver.indexes.use_captured_disk = true;
         resolver.indexes.implementation_parse_time = self.stats.as_ref().map(|_| Duration::ZERO);
         let mut match_time = Duration::ZERO;
         let index_interfaces = self.indexes_interfaces();

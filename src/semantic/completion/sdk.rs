@@ -14,9 +14,11 @@ use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::go_environment::GoEnvironment;
+use crate::semantic::shared_disk::FileObservation;
 use crate::semantic::source::is_test_source;
 use crate::workspace::{is_symbol_source, path_key};
 
+use super::disk_observation::DirectoryWatch;
 use super::imports::valid_package;
 use super::prefilter::FileNames;
 use super::sdk_names::{Token, Tokens, next_nonnewline};
@@ -33,13 +35,14 @@ struct InventoryState {
     refresh_requested: bool,
     root: Option<PathBuf>,
     ready: Option<Arc<Catalog>>,
-    inputs: Option<ProbeInputs>,
+    inputs: Option<Arc<ProbeInputs>>,
 }
 
 pub(super) struct Catalog {
     key: Option<BuildKey>,
     pub(super) packages: Vec<Package>,
     pub(super) names: HashMap<PathBuf, FileNames>,
+    pub(super) watch: Option<Arc<DirectoryWatch>>,
     pub(super) stats: InventoryStats,
 }
 
@@ -64,7 +67,7 @@ pub(super) struct InventoryStats {
     pub(super) discovery_ms: f64,
     pub(super) method: &'static str,
     pub(super) reused: bool,
-    pub(super) fallback: Option<String>,
+    pub(super) fallback: Option<&'static str>,
     pub(super) prewarmed_names: usize,
 }
 
@@ -80,6 +83,7 @@ pub(super) struct Package {
 struct NativeInventory {
     packages: Vec<Package>,
     names: HashMap<PathBuf, FileNames>,
+    has_redirected_directory: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -144,18 +148,7 @@ impl Inventory {
             state.refresh_requested |= refresh;
             return;
         }
-        if let Some(ready) = &state.ready
-            && (!refresh
-                || ready.stats.method != "unavailable"
-                    && state
-                        .root
-                        .as_ref()
-                        .zip(ready.key.as_ref())
-                        .is_some_and(|(root, key)| {
-                            state.inputs.as_ref()
-                                == Some(&ProbeInputs::capture(project, root, key, environment))
-                        }))
-        {
+        if state.ready.is_some() && !refresh {
             return;
         }
         state.loading = true;
@@ -168,7 +161,9 @@ impl Inventory {
             .name("go-completion-sdk".into())
             .spawn(move || {
                 loop {
-                    inventory.load(&project, &environment);
+                    if !inventory.inputs_current(&project, &environment) {
+                        inventory.load(&project, &environment);
+                    }
                     let mut state = inventory.state.lock().unwrap();
                     if !std::mem::take(&mut state.refresh_requested) {
                         state.loading = false;
@@ -194,6 +189,25 @@ impl Inventory {
     pub(super) fn ready(&self) -> Option<Arc<Catalog>> {
         let state = self.state.lock().unwrap();
         (!state.loading).then(|| state.ready.clone()).flatten()
+    }
+
+    fn inputs_current(&self, project: &Path, environment: &GoEnvironment) -> bool {
+        let (root, catalog, inputs) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.root.clone(),
+                state.ready.clone(),
+                state.inputs.clone(),
+            )
+        };
+        root.zip(catalog)
+            .zip(inputs)
+            .is_some_and(|((root, catalog), inputs)| {
+                catalog.stats.method != "unavailable"
+                    && catalog.key.as_ref().is_some_and(|key| {
+                        *inputs == ProbeInputs::capture(project, &root, key, environment)
+                    })
+            })
     }
 
     fn load(&self, project: &Path, environment: &GoEnvironment) {
@@ -224,12 +238,13 @@ impl Inventory {
         let mut key = None;
         let mut packages = Vec::new();
         let mut names = HashMap::new();
+        let mut watch = None;
         if let Some((root, context, env)) = probed {
             key = Some(BuildKey::new(&root, context, env, environment));
             let inputs = ProbeInputs::capture(project, &root, key.as_ref().unwrap(), environment);
             let mut state = self.state.lock().unwrap();
             state.root = Some(root.clone());
-            state.inputs = Some(inputs);
+            state.inputs = Some(Arc::new(inputs));
             if let Some(previous) = &state.ready
                 && previous.key == key
                 && previous.stats.method != "unavailable"
@@ -240,13 +255,28 @@ impl Inventory {
             let build = key.as_ref().unwrap();
             let src = root.join("src");
             if native_supported(build) {
+                // Arm the watcher before the catalog observes the first file.
+                if cfg!(windows)
+                    && [&root, &src].into_iter().all(|path| {
+                        fs::symlink_metadata(path)
+                            .is_ok_and(|metadata| !is_reparse_point(&metadata))
+                    })
+                {
+                    watch = DirectoryWatch::new(&src).map(Arc::new);
+                }
                 match native_inventory(&src, &build.context) {
                     Ok(native) => {
                         packages = native.packages;
                         names = native.names;
+                        if native.has_redirected_directory {
+                            watch = None;
+                        }
                         stats.method = "native";
                     }
-                    Err(error) => stats.fallback = Some(format!("{error:#}")),
+                    Err(_) => {
+                        stats.fallback = Some("native_failed");
+                        watch = None;
+                    }
                 }
             }
             if stats.method != "native"
@@ -265,12 +295,15 @@ impl Inventory {
             state.root = None;
             state.inputs = None;
         }
-        state.ready = Some(Arc::new(Catalog {
+        let previous = state.ready.replace(Arc::new(Catalog {
             key,
             packages,
             names,
+            watch,
             stats,
         }));
+        drop(state);
+        drop(previous);
     }
 }
 
@@ -496,9 +529,22 @@ fn command_inventory(
     Ok(packages)
 }
 
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_symlink()
+    }
+}
+
 fn native_inventory(src: &Path, build: &BuildContext) -> Result<NativeInventory> {
     let mut inputs = Vec::new();
     let mut dirs = vec![(String::new(), src.to_owned())];
+    let mut has_redirected_directory = false;
     while let Some((path, dir)) = dirs.pop() {
         let mut files = Vec::new();
         for entry in dir.read_dir()? {
@@ -523,6 +569,9 @@ fn native_inventory(src: &Path, build: &BuildContext) -> Result<NativeInventory>
                     format!("{path}/{file}")
                 };
                 if path != "runtime/cgo" || build.cgo {
+                    if cfg!(windows) {
+                        has_redirected_directory |= is_reparse_point(&entry.metadata()?);
+                    }
                     dirs.push((path, entry.path()));
                 }
             } else if !path.is_empty()
@@ -530,7 +579,11 @@ fn native_inventory(src: &Path, build: &BuildContext) -> Result<NativeInventory>
                 && !file.ends_with("_test.go")
                 && build.matches_filename(file)
             {
-                files.push(entry.path());
+                let directly_watched = cfg!(windows)
+                    && entry
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file() && !is_reparse_point(&metadata));
+                files.push((entry.path(), directly_watched));
             }
         }
         if !files.is_empty() {
@@ -572,22 +625,23 @@ fn native_inventory(src: &Path, build: &BuildContext) -> Result<NativeInventory>
     inventory
         .packages
         .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    inventory.has_redirected_directory = has_redirected_directory;
     Ok(inventory)
 }
 
 fn read_sdk_package(
     path: &str,
     dir: &Path,
-    files: &[PathBuf],
+    files: &[(PathBuf, bool)],
     build: &BuildContext,
     cached_names: &mut HashMap<PathBuf, FileNames>,
 ) -> Result<Option<Package>> {
     let mut go_files = Vec::new();
     let mut cgo_files = Vec::new();
     let mut name = String::new();
-    for file in files {
-        let Some((declared, cgo, names)) =
-            sdk_file(file, build).with_context(|| format!("checking {}", file.display()))?
+    for (file, directly_watched) in files {
+        let Some((declared, cgo, names)) = sdk_file(file, build, *directly_watched)
+            .with_context(|| format!("checking {}", file.display()))?
         else {
             continue;
         };
@@ -627,6 +681,7 @@ fn read_sdk_package(
 fn sdk_file(
     path: &Path,
     build: &BuildContext,
+    directly_watched: bool,
 ) -> Result<Option<(String, bool, Option<FileNames>)>> {
     let mut file = File::open(path)?;
     let mut bytes = [0; 8192];
@@ -670,7 +725,11 @@ fn sdk_file(
     {
         let mut contents = long_header.unwrap_or_default();
         if !truncated {
-            names = Some(FileNames::new(metadata.into(), text, true));
+            names = Some(FileNames::sdk(
+                FileObservation::from_metadata(metadata),
+                text,
+                directly_watched,
+            ));
         } else {
             if contents.is_empty() {
                 contents.reserve_exact(metadata.len() as usize);
@@ -678,7 +737,11 @@ fn sdk_file(
                 file.read_to_end(&mut contents)?;
             }
             if let Ok(text) = std::str::from_utf8(&contents) {
-                names = Some(FileNames::new(metadata.into(), text, true));
+                names = Some(FileNames::sdk(
+                    FileObservation::from_metadata(metadata),
+                    text,
+                    directly_watched,
+                ));
             }
         }
     }

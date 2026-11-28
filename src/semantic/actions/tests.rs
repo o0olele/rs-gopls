@@ -1,16 +1,18 @@
 use std::fs;
 use std::path::Path;
 
-use lsp_types::{CodeAction, CodeActionKind, CodeActionOrCommand, Position, Range, TextEdit, Uri};
+use lsp_types::{
+    CodeAction, CodeActionKind, CodeActionOrCommand, NumberOrString, Position, Range, TextEdit, Uri,
+};
 use serde_json::{Value, json};
 
-use super::{GofmtCache, code_actions, format_document, formatting::formatting_edits};
+use super::{GofmtCache, format_document, formatting::formatting_edits};
 use crate::go_environment::GoEnvironment;
 use crate::protocol::path_uri;
 use crate::semantic::Engine;
 use crate::semantic::diagnostics::{
     DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, DiagnosticSeverity,
-    snapshot_key,
+    analyze_document, snapshot_key,
 };
 use crate::semantic::snapshot::{DocumentSnapshot, EngineSnapshot};
 use crate::test_support::TestProject;
@@ -163,12 +165,17 @@ fn with_actions(
     })
     .to_string();
     for mut pkg in packages.iter().cloned() {
-        pkg["Dir"] = json!(
-            project
-                .root
-                .join("packages")
-                .join(pkg["ImportPath"].as_str().unwrap())
-        );
+        let directory = project
+            .root
+            .join("packages")
+            .join(pkg["ImportPath"].as_str().unwrap());
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("pkg.go"),
+            format!("package {}\n", pkg["Name"].as_str().unwrap()),
+        )
+        .unwrap();
+        pkg["Dir"] = json!(directory);
         listing.push_str(&pkg.to_string());
     }
     let graph = Workspace::from_test_listing(std::slice::from_ref(&project.root), &listing, false);
@@ -238,44 +245,66 @@ fn action_edits<'a>(action: &'a CodeAction, uri: &Uri) -> &'a [TextEdit] {
     &changes[uri]
 }
 
+fn code_actions(
+    snapshot: &mut EngineSnapshot<'_>,
+    document: &DocumentSnapshot<'_>,
+    uri: &Uri,
+    range: Range,
+    only: Option<&[CodeActionKind]>,
+    report: Option<&DiagnosticReport>,
+) -> anyhow::Result<Vec<CodeActionOrCommand>> {
+    super::code_actions(snapshot, document, uri, range, only, report, &[])
+}
+
 #[test]
 fn organize_imports_groups_the_messy_fixture_and_preserves_comments() {
     let before = fixture("imports_messy.go");
-    with_actions(&before, &[], |snapshot, document, uri| {
-        let report = report(snapshot, document, vec![unused_import(document, "os")]);
-        let organized = concat!(
-            "import (\n\t\"fmt\"\n\t\"strings\"\n\t_ \"time/tzdata\"\n\n",
-            "\t// The shared prefix keeps labels consistent across commands.\n\t\"example.test/dependency\"\n\n",
-            "\t\"example.test/actions/helper\" // Matches the labels used by built-in commands.\n)",
-        );
-        let expected = before.replace(
-            &before[before.find("import (").unwrap()..before.find("\n)").unwrap() + 2],
-            organized,
-        );
-        for kind in [
-            CodeActionKind::SOURCE,
-            CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
-        ] {
-            let actions = code_actions(
-                snapshot,
-                document,
-                uri,
-                Range::default(),
-                Some(&[kind]),
-                Some(&report),
-            )
-            .unwrap();
+    with_actions(
+        &before,
+        &[
+            package("os", "os"),
+            package("example.test/dependency", "dependency"),
+        ],
+        |snapshot, document, uri| {
+            let report = report(snapshot, document, vec![unused_import(document, "os")]);
+            let organized = concat!(
+                "import (\n\t\"fmt\"\n\t\"strings\"\n\t_ \"time/tzdata\"\n\n",
+                "\t// The shared prefix keeps labels consistent across commands.\n\t\"example.test/dependency\"\n\n",
+                "\t\"example.test/actions/helper\" // Matches the labels used by built-in commands.\n)",
+            );
+            let expected = before.replace(
+                &before[before.find("import (").unwrap()..before.find("\n)").unwrap() + 2],
+                organized,
+            );
+            for kind in [
+                CodeActionKind::SOURCE,
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ] {
+                let actions = code_actions(
+                    snapshot,
+                    document,
+                    uri,
+                    Range::default(),
+                    Some(&[kind]),
+                    Some(&report),
+                )
+                .unwrap();
+                assert_eq!(actions.len(), 1);
+                let action = action(&actions[0]);
+                assert_eq!(action.title, "Organize Imports");
+                assert_eq!(action.kind, Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS));
+                assert_eq!(action.diagnostics, None);
+                assert_eq!(apply(document, action_edits(action, uri)), expected);
+            }
+            let actions =
+                code_actions(snapshot, document, uri, Range::default(), None, None).unwrap();
             assert_eq!(actions.len(), 1);
-            let action = action(&actions[0]);
-            assert_eq!(action.title, "Organize Imports");
-            assert_eq!(action.kind, Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS));
-            assert_eq!(action.diagnostics, None);
-            assert_eq!(apply(document, action_edits(action, uri)), expected);
-        }
-        let actions = code_actions(snapshot, document, uri, Range::default(), None, None).unwrap();
-        assert_eq!(actions.len(), 1);
-        assert!(apply(document, action_edits(action(&actions[0]), uri)).contains("\"os\""));
-    });
+            assert_eq!(
+                apply(document, action_edits(action(&actions[0]), uri)),
+                expected
+            );
+        },
+    );
 }
 
 #[test]
@@ -646,5 +675,184 @@ fn an_unsafe_import_header_still_allows_an_independent_utf16_quickfix() {
         let edits = action_edits(action(&actions[0]), uri);
         assert_eq!(edits.len(), 2);
         assert_eq!(apply(document, edits), text.replace("unused :=", "_ ="));
+    });
+}
+
+#[test]
+fn organize_imports_matches_complete_diagnostics_and_keeps_live_aliases() {
+    let text = concat!(
+        "package actions\nimport (\n",
+        "  dead \"example.test/shared\"\n  live \"example.test/shared\"\n",
+        "  pathalias \"example.test/pathalias\"\n  \"example.test/types\"\n",
+        "  . \"example.test/dot\"\n  _ \"example.test/blank\"\n  \"fmt\"\n)\n",
+        "type T types.T\n",
+        "func f() { fmt := struct{ n int }{}; _, _, _ = fmt.n, live.X, pathalias.X }\n",
+    );
+    let packages = [
+        package("example.test/shared", "shared"),
+        package("example.test/pathalias", "actualname"),
+        package("example.test/types", "types"),
+        package("example.test/dot", "dot"),
+        package("example.test/blank", "blank"),
+        package("fmt", "fmt"),
+    ];
+    with_actions(text, &packages, |snapshot, document, uri| {
+        let kinds = [CodeActionKind::SOURCE_ORGANIZE_IMPORTS];
+        let local = code_actions(
+            snapshot,
+            document,
+            uri,
+            Range::default(),
+            Some(&kinds),
+            None,
+        )
+        .unwrap();
+        let report = analyze_document(snapshot, document).unwrap();
+        let complete = code_actions(
+            snapshot,
+            document,
+            uri,
+            Range::default(),
+            Some(&kinds),
+            Some(&report),
+        )
+        .unwrap();
+        assert_eq!(local, complete);
+        assert_eq!(local.len(), 1);
+        let edited = apply(document, action_edits(action(&local[0]), uri));
+        assert!(!edited.contains("dead") && !edited.contains("\"fmt\""));
+        for import in [
+            "live \"example.test/shared\"",
+            "pathalias \"example.test/pathalias\"",
+            "\"example.test/types\"",
+            ". \"example.test/dot\"",
+            "_ \"example.test/blank\"",
+        ] {
+            assert!(
+                edited.contains(import),
+                "{import} should be preserved in {edited}"
+            );
+        }
+    });
+}
+
+#[test]
+fn local_variable_actions_require_current_evidence_and_exact_utf16_ranges() {
+    let before =
+        "package actions\r\nfunc f() { x := \"😀\"; x, unused := x, 2; _ = x; x := x }\r\n";
+    with_actions(before, &[], |snapshot, document, uri| {
+        let report = analyze_document(snapshot, document).unwrap();
+        let variable = report
+            .items
+            .iter()
+            .find(|item| item.code == DiagnosticCode::VarUnused)
+            .unwrap();
+        let operator = report
+            .items
+            .iter()
+            .find(|item| item.code == DiagnosticCode::ShortVarNoNewVars)
+            .unwrap();
+        let only = [CodeActionKind::QUICKFIX];
+        let mut hint = variable.to_lsp();
+        hint.data = Some(json!({"edit": "untrusted", "version": 1}));
+        let cases = [
+            (hint.clone(), before.replace("x, unused :=", "x, _ =")),
+            (operator.to_lsp(), before.replace("x := x }", "x = x }")),
+        ];
+        for (hint, expected) in cases {
+            let actions = super::code_actions(
+                snapshot,
+                document,
+                uri,
+                hint.range,
+                Some(&only),
+                None,
+                &[hint.clone()],
+            )
+            .unwrap();
+            assert_eq!(actions.len(), 1, "{hint:?}");
+            let action = action(&actions[0]);
+            let mut original = hint;
+            original.data = None;
+            assert_eq!(action.diagnostics, Some(vec![original]));
+            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+            assert_eq!(apply(document, action_edits(action, uri)), expected);
+        }
+        let mut unavailable = variable.clone();
+        unavailable.fix_data = DiagnosticFixData::None;
+        let report = self::report(snapshot, document, vec![unavailable]);
+        let fixes = code_actions(
+            snapshot,
+            document,
+            uri,
+            variable.range,
+            Some(&only),
+            Some(&report),
+        )
+        .unwrap();
+        assert_eq!(fixes.len(), 1);
+
+        let mut unknown = hint.clone();
+        unknown.code = Some(NumberOrString::String("unknown".into()));
+        let mut wrong_source = hint.clone();
+        wrong_source.source = Some("other".into());
+        let mut wrong_message = hint.clone();
+        wrong_message.message = "forged".into();
+        let mut surrogate = hint.clone();
+        let emoji = before.find('😀').unwrap();
+        let position = document.byte_range(emoji..emoji + '😀'.len_utf8()).start;
+        surrogate.range.start = Position::new(position.line, position.character + 1);
+        let mut out_of_bounds = hint.clone();
+        out_of_bounds.range.end.character = u32::MAX;
+        for invalid in [
+            unknown,
+            wrong_source,
+            wrong_message,
+            surrogate,
+            out_of_bounds,
+        ] {
+            assert!(
+                super::code_actions(
+                    snapshot,
+                    document,
+                    uri,
+                    document.byte_range(0..before.len()),
+                    Some(&only),
+                    None,
+                    &[invalid]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    });
+}
+
+#[test]
+fn unused_var_fix_does_not_orphan_existing_assignments() {
+    let text = "package actions\nfunc f() { unused := 1; unused = 2 }\n";
+    with_actions(text, &[], |snapshot, document, uri| {
+        let report = analyze_document(snapshot, document).unwrap();
+        let item = report
+            .items
+            .iter()
+            .find(|item| item.code == DiagnosticCode::VarUnused)
+            .unwrap();
+        let only = [CodeActionKind::QUICKFIX];
+        for cached in [Some(&report), None] {
+            assert!(
+                super::code_actions(
+                    snapshot,
+                    document,
+                    uri,
+                    item.range,
+                    Some(&only),
+                    cached,
+                    &[item.to_lsp()]
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
     });
 }

@@ -197,14 +197,14 @@ def check_async_refresh(executable_path, root, timeout):
             client.change_document(editable, 2, "// shifted cursor\n" + editable_query.text)
             expect_error(wait_for_response(client, "source-changed", min(timeout, 5)), -32801)
 
-            write(go_mod, module_config("latest"))
-            for _ in range(3):
-                notify_changes(client, (go_mod, 2))
-            # This response orders the server's processing before the relay is released.
-            send_definition(client, "events-applied", lexical_query)
-            expect_target(wait_for_response(client, "events-applied", min(timeout, 5)), lexical_target)
+            with gate.expect_cancellation(min(timeout, 5)):
+                write(go_mod, module_config("latest"))
+                for _ in range(3):
+                    notify_changes(client, (go_mod, 2))
+                send_definition(client, "events-applied", lexical_query)
+                expect_target(client.wait_response("events-applied", min(timeout, 5)), lexical_target)
+            expect_target(wait_for_response(client, "load-obsolete-graph"), targets["latest"])
 
-        expect_target(wait_for_response(client, "load-obsolete-graph"), targets["latest"])
         calls = gate.calls()
         if len(calls) - len(initial_calls) != 2:
             raise RuntimeError(f"expected an obsolete load and one coalesced replacement; got {calls!r}")
@@ -226,6 +226,11 @@ def check_async_refresh(executable_path, root, timeout):
         send_definition(client, "failed-load", graph_query)
         expect_error(wait_for_response(client, "failed-load"), -32803)
         check_location(client, graph_query, targets["latest"])
+        try:
+            extra = client.get_next_response(timeout=0)
+        except TimeoutError:
+            return
+        raise RuntimeError(f"unexpected or duplicate graph response: {extra!r}")
 
 
 def check_gopath_configuration_refresh(executable_path, root, timeout):

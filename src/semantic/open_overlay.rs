@@ -21,18 +21,47 @@ pub(super) struct PendingOpen {
     pub(super) ready: OpenReadiness,
 }
 
-#[derive(Default)]
-pub(super) struct OpenReadiness(Arc<AtomicBool>);
+pub(super) struct OpenReadiness {
+    finished: Arc<AtomicBool>,
+    signal_on_drop: bool,
+}
+
+impl Default for OpenReadiness {
+    fn default() -> Self {
+        Self {
+            finished: Arc::default(),
+            signal_on_drop: true,
+        }
+    }
+}
+
+impl PendingOpen {
+    pub(super) fn read_snapshot(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            text: self.text.clone(),
+            version: self.version,
+            open_generation: self.open_generation,
+            content_revision: self.content_revision,
+            ready: OpenReadiness {
+                finished: self.ready.finished.clone(),
+                signal_on_drop: false,
+            },
+        }
+    }
+}
 
 impl OpenReadiness {
     pub(super) fn pending(&self) -> SharedLoadPending {
-        SharedLoadPending::new(self.0.clone())
+        SharedLoadPending::new(self.finished.clone())
     }
 }
 
 impl Drop for OpenReadiness {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        if self.signal_on_drop {
+            self.finished.store(true, Ordering::Release);
+        }
     }
 }
 

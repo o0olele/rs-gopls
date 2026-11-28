@@ -103,6 +103,7 @@ impl Running {
     }
 
     fn workspace_loaded(&mut self, connection: &Connection, update: WorkspaceResult) -> Result<()> {
+        telemetry::invalidate_path_hashes();
         if self
             .scheduler
             .workspace_loaded(&mut self.engine, connection, update)?
@@ -133,7 +134,10 @@ impl Running {
             return Ok(());
         };
         let before = self.engine.workspace_load();
+        self.scheduler.interrupt_completion();
         self.engine.watched_files_changed(&changes);
+        self.scheduler
+            .revalidate_completion(&self.engine, connection)?;
         for (path, _) in &changes {
             if !self.engine.is_open(path) {
                 self.scheduler.watched_document_modified(connection, path)?;
@@ -248,18 +252,36 @@ fn main() -> Result<()> {
 
     let _telemetry = telemetry::Session::start();
     let (connection, threads) = transport::stdio()?;
-    let result = serve(&connection);
+    let result = serve_state_with_times(
+        &connection,
+        State::starting(),
+        Some(&threads.notification_times),
+    );
     drop(connection);
     result?;
     threads.join().context("joining LSP transport threads")
 }
 
+#[cfg(test)]
 fn serve(connection: &Connection) -> Result<()> {
-    let mut state = State::starting();
+    serve_state(connection, State::starting())
+}
+
+#[cfg(test)]
+fn serve_state(connection: &Connection, state: State) -> Result<()> {
+    serve_state_with_times(connection, state, None)
+}
+
+fn serve_state_with_times(
+    connection: &Connection,
+    mut state: State,
+    notification_times: Option<&transport::NotificationTimes>,
+) -> Result<()> {
     let (load_sender, load_receiver) = unbounded();
     let load_idle = never();
     let (search_token, search_ready) = bounded(1);
     let search_idle = never();
+    let completion_idle = never();
     let diagnostic_idle = never();
     let highlight_idle = never();
     let open_parse_idle = never();
@@ -267,6 +289,7 @@ fn serve(connection: &Connection) -> Result<()> {
         .send(())
         .context("scheduling navigation searches")?;
     loop {
+        let _disk_scope = telemetry::enter_context(None);
         let watching =
             matches!(&state, State::Running(running) if running.scheduler.watching_files());
         let graph_updates = if watching { &load_idle } else { &load_receiver };
@@ -285,7 +308,7 @@ fn serve(connection: &Connection) -> Result<()> {
         };
         let (
             search_receiver,
-            completion_wake,
+            completion_receiver,
             reference_wake,
             implementation_wake,
             shared_disk_wake,
@@ -302,7 +325,14 @@ fn serve(connection: &Connection) -> Result<()> {
                 } else {
                     &search_idle
                 },
-                running.engine.completion_wake(),
+                if watching {
+                    &completion_idle
+                } else {
+                    running
+                        .scheduler
+                        .completion_results()
+                        .unwrap_or(&completion_idle)
+                },
                 running.engine.reference_wake(),
                 running.engine.implementation_wake(),
                 running.engine.shared_disk_wake(),
@@ -326,7 +356,7 @@ fn serve(connection: &Connection) -> Result<()> {
             ),
             _ => (
                 &search_idle,
-                &search_idle,
+                &completion_idle,
                 &search_idle,
                 &search_idle,
                 &search_idle,
@@ -356,11 +386,18 @@ fn serve(connection: &Connection) -> Result<()> {
                         break;
                     }
                     Message::Notification(notification) => {
+                        let received = notification_times
+                            .and_then(|times| times.selected(&notification.method));
+                        let dispatch_queue_ms = received
+                            .filter(|_| telemetry::enabled())
+                            .map(telemetry::elapsed);
                         if let State::Running(running) = &mut state {
                             let Notification { method, params } = notification;
                             if method == Initialized::METHOD && std::mem::take(&mut running.watch_files) {
                                 register_file_watches(connection)?;
-                            } else if let Err(error) = handle_notification(connection, running, &method, params) {
+                            } else if let Err(error) = handle_notification_with_delay(
+                                connection, running, &method, params, dispatch_queue_ms,
+                            ) {
                                 eprintln!("rs-gopls: {method}: {error:#}");
                             }
                         }
@@ -402,7 +439,14 @@ fn serve(connection: &Connection) -> Result<()> {
                     running.scheduler.complete_highlight(&mut running.engine, connection, completed)?;
                 }
             }
-            recv(completion_wake) -> _ => {}
+            recv(completion_receiver) -> completed => {
+                if let State::Running(running) = &mut state {
+                    match completed {
+                        Ok(completed) => running.scheduler.complete_completion(&mut running.engine, connection, completed)?,
+                        Err(_) => running.scheduler.completion_worker_stopped(connection)?,
+                    }
+                }
+            }
             recv(reference_wake) -> _ => {}
             recv(implementation_wake) -> _ => {}
             recv(shared_disk_wake) -> _ => {}
@@ -427,6 +471,9 @@ fn serve(connection: &Connection) -> Result<()> {
                 }
                 running.collect_diagnostic_refresh(now);
             }
+            running
+                .scheduler
+                .advance_completion(&running.engine, connection)?;
             running
                 .scheduler
                 .start_workspace_load(&mut running.engine, &load_sender)?;
@@ -643,12 +690,33 @@ fn register_file_watches(connection: &Connection) -> Result<()> {
         .context("registering Go file watches")
 }
 
+#[cfg(test)]
 fn handle_notification(
     connection: &Connection,
     running: &mut Running,
     method: &str,
     params: Value,
 ) -> Result<()> {
+    handle_notification_with_delay(connection, running, method, params, None)
+}
+
+fn handle_notification_with_delay(
+    connection: &Connection,
+    running: &mut Running,
+    method: &str,
+    params: Value,
+    dispatch_queue_ms: Option<f64>,
+) -> Result<()> {
+    if matches!(
+        method,
+        DidChangeWatchedFiles::METHOD
+            | DidChangeWorkspaceFolders::METHOD
+            | DidOpenTextDocument::METHOD
+            | DidCloseTextDocument::METHOD
+            | DidSaveTextDocument::METHOD
+    ) {
+        telemetry::invalidate_path_hashes();
+    }
     match method {
         DidChangeConfiguration::METHOD => {
             let overrides = params
@@ -714,7 +782,9 @@ fn handle_notification(
                 if let Ok(path) = file_path(&change.uri)
                     && workspace::is_watched_go_file(&path)
                 {
-                    running.scheduler.watch_file(path, change.typ, now);
+                    running
+                        .scheduler
+                        .watch_file(&mut running.engine, path, change.typ, now);
                 }
             }
             Ok(())
@@ -730,6 +800,9 @@ fn handle_notification(
             running
                 .engine
                 .open(path.clone(), document.text, document.version)?;
+            running
+                .scheduler
+                .revalidate_completion(&running.engine, connection)?;
             running.scheduler.document_modified(connection, &path)?;
             running
                 .scheduler
@@ -744,6 +817,7 @@ fn handle_notification(
                 "method": DidChangeTextDocument::METHOD, "document": telemetry::path(&path),
                 "version": params.text_document.version, "doc_version": params.text_document.version,
                 "change_count": params.content_changes.len(),
+                "dispatch_queue_ms": dispatch_queue_ms,
             });
             if params.content_changes.is_empty()
                 || running
@@ -755,11 +829,15 @@ fn handle_notification(
             }
             let received = Instant::now();
             running.scheduler.interrupt_document_diagnostics(&path);
+            running.scheduler.interrupt_completion();
             if let Err(error) =
                 running
                     .engine
                     .edit(&path, &params.content_changes, params.text_document.version)
             {
+                running
+                    .scheduler
+                    .revalidate_completion(&running.engine, connection)?;
                 running.scheduler.advance_diagnostics(
                     &mut running.engine,
                     connection,
@@ -767,6 +845,9 @@ fn handle_notification(
                 )?;
                 return Err(error);
             }
+            running
+                .scheduler
+                .revalidate_completion(&running.engine, connection)?;
             running.scheduler.note_diagnostic_edit(&path, received);
             running.scheduler.document_modified(connection, &path)?;
             running
@@ -786,8 +867,14 @@ fn handle_notification(
             });
             let was_open = running.engine.is_open(&path);
             running.scheduler.interrupt_document_diagnostics(&path);
+            if was_open {
+                running.scheduler.interrupt_completion();
+            }
             let before = running.engine.workspace_load();
             running.engine.close(&path);
+            running
+                .scheduler
+                .revalidate_completion(&running.engine, connection)?;
             running.scheduler.document_closed(connection, &path)?;
             let after = running.engine.workspace_load();
             if after != before {
@@ -824,20 +911,23 @@ fn handle_notification(
                 "method": DidSaveTextDocument::METHOD, "document": telemetry::path(&path),
                 "doc_version": running.engine.open_document_version(&path),
             });
-            if workspace::is_watched_go_file(&path) {
-                if running.scheduler.watching_files() {
-                    running.scheduler.watch_save(path.clone());
-                    return running.scheduler.document_modified(connection, &path);
-                }
-                running.scheduler.record_workspace_file_event();
+            if workspace::is_watched_go_file(&path) && running.scheduler.watching_files() {
+                running
+                    .scheduler
+                    .watch_save(&mut running.engine, path.clone());
+                return running.scheduler.document_modified(connection, &path);
             }
             let before = running.engine.workspace_load();
+            running.scheduler.interrupt_completion();
             running.engine.file_changed_from(
                 &path,
                 lsp_types::FileChangeType::CHANGED,
                 "didSave",
                 1,
             );
+            running
+                .scheduler
+                .revalidate_completion(&running.engine, connection)?;
             running.scheduler.document_modified(connection, &path)?;
             let after = running.engine.workspace_load();
             if after != before {

@@ -232,9 +232,6 @@ def check_completion_graph_refresh_auto_import(server, root, timeout):
 def check_completion_cancellation_and_stale_tasks(server, root, timeout):
     project = root / "project"
     path, text, point = widget_project(project)
-    for number in range(64):
-        write(project / "widgets" / f"extra_{number:02}.go",
-              f"package widgets\nconst Extra{number:02} = {number}\n")
     module = project / "go.mod"
     gate = PausedGoList(root / "control", timeout)
     params = completion_params(path, point)
@@ -249,25 +246,14 @@ def check_completion_cancellation_and_stale_tasks(server, root, timeout):
             client.notify("$/cancelRequest", id=request_id)
             client.notify("$/cancelRequest", id=request_id)
             expect_error(wait_for_response(client, request_id, min(timeout, 5)), -32800)
-        warm_package_graph(client)
 
-        # Queue both searches against the installed graph. The same stdio
-        # batch delivers the barrier, cancellation, and edit during scanning.
-        stale, cancelled, barrier = "stale-completion", "cancelled-completion", "completion-barrier"
-        client.send_batch(
-            {"id": stale, "method": COMPLETION, "params": params},
-            {"id": cancelled, "method": COMPLETION, "params": params},
-            {"id": barrier, "method": "rs-gopls/testUnknownMethod", "params": {}},
-            {"method": "$/cancelRequest", "params": {"id": cancelled}},
-            {"method": "$/cancelRequest", "params": {"id": cancelled}},
-            {"method": "textDocument/didChange", "params": {
-                "textDocument": {"uri": path.as_uri(), "version": 2},
-                "contentChanges": [{"text": "// edit during completion\n" + text}],
-            }},
-        )
-        expect_error(wait_for_response(client, barrier, min(timeout, 5)), -32601)
-        expect_error(wait_for_response(client, cancelled, min(timeout, 5)), -32800)
-        expect_error(wait_for_response(client, stale, min(timeout, 5)), -32801)
+            # Hold the graph so both requests stay pending until their respective invalidations.
+            older = client.start_request(COMPLETION, **params)
+            latest = client.start_request(COMPLETION, **params)
+            expect_error(wait_for_response(client, older, min(timeout, 5)), -32800)
+
+            client.change_document(path, 2, "// edit during completion\n" + text)
+            expect_error(wait_for_response(client, latest, min(timeout, 5)), -32801)
 
         retried = client.start_request(COMPLETION, **completion_params(path, (point[0] + 1, point[1])))
         retry = wait_for_response(client, retried)

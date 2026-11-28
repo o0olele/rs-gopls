@@ -60,7 +60,7 @@ pub(super) fn value_signature<'w>(
     Ok(Some(signature))
 }
 
-fn value_parts<'tree>(
+pub(super) fn value_parts<'tree>(
     owner: Node<'tree>,
     binding: Binding<'tree>,
 ) -> (Option<Node<'tree>>, Option<Node<'tree>>, usize) {
@@ -85,6 +85,13 @@ fn value_parts<'tree>(
         binding.initializer,
         binding.result_index,
     )
+}
+
+pub(super) fn literal_value_type(expression: Node<'_>, index: usize) -> Option<&'static str> {
+    (index == 0)
+        .then(|| untyped_default(expression))
+        .flatten()
+        .filter(|ty| *ty != "bool")
 }
 
 fn syntax_value_type(source: &Source, mut expression: Node<'_>, index: usize) -> Option<String> {
@@ -278,7 +285,16 @@ impl<'w> Resolver<'w, '_> {
                     None => Ok(None),
                 }
             };
-        if let Some(declaration) = Declaration::local(source, ReferenceQuery::Name(expression)) {
+        if let Some(declaration) =
+            Declaration::local(source, ReferenceQuery::Name(expression), |name| {
+                Ok(self
+                    .indexes
+                    .file_index(&source.path)?
+                    .symbols
+                    .declaration(name)
+                    .map(|symbol| symbol.range))
+            })?
+        {
             return resolve_type(self, source, from, declaration);
         }
         let location = if expression.kind() == "selector_expression" {

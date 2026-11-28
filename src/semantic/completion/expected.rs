@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use lsp_types::Range;
@@ -13,10 +16,10 @@ use crate::semantic::{
     index::ContentIdentity,
     resolver::{
         GenericCall, ResolvedSymbol, Resolver, Substitutions, TypeIdentity, TypeKind, TypeOrigin,
-        explicit_type_arguments, is_exported, is_predeclared_type, materialize_type,
+        explicit_type_arguments, is_exported, is_predeclared_type, materialize_type_cancellable,
         untyped_default,
     },
-    source::{Source, node_text},
+    source::{Source, check_optional_cancelled, node_text},
 };
 use crate::symbols::{Container, FunctionSignature, InlineType, SymbolKind, TypeRef, TypeRefKind};
 use crate::workspace::{Package, path_key};
@@ -177,7 +180,9 @@ impl Expected {
         source: &Source,
         anchor: Node<'_>,
     ) -> Result<Option<Self>> {
-        let Some((ty, assertion)) = syntax_type(resolver, package, source, anchor)? else {
+        let syntax = syntax_type(resolver, package, source, anchor)?;
+        resolver.check_cancelled()?;
+        let Some((ty, assertion)) = syntax else {
             return Ok(None);
         };
         let Some(exact) = type_key(resolver, &ty, 0)? else {
@@ -219,6 +224,7 @@ impl Expected {
         resolved: &ResolvedSymbol<'w>,
         name: &str,
     ) -> Result<i32> {
+        resolver.check_cancelled()?;
         let SymbolKind::InferredValue {
             initializer,
             result_index,
@@ -246,29 +252,34 @@ impl Expected {
             }
             return Ok(*weight);
         }
-        let declaration;
-        let source = if file == path_key(&source.path) {
+        let default = if *result_index != 0 {
+            None
+        } else if file == path_key(&source.path) {
             source
-        } else {
-            declaration = resolver
-                .indexes
-                .declaration_source(&resolved.file)
-                .ok()
-                .flatten();
-            declaration
-                .as_ref()
-                .map_or(source, |source| source.as_ref())
-        };
-        let weight = if let Some(ty) = resolver.symbol_type(source, resolved, name, 0)? {
-            self.weight(resolver, &ty)?
-        } else if *result_index == 0
-            && let Some(value) = source
                 .tree
                 .root_node()
                 .named_descendant_for_byte_range(initializer.start, initializer.end)
                 .filter(|node| node.byte_range() == *initializer)
                 .and_then(untyped_default)
-        {
+        } else {
+            resolver
+                .indexes
+                .declaration_source(&resolved.file)
+                .ok()
+                .flatten()
+                .and_then(|decls| decls.initializer(initializer)?.untyped_default)
+        };
+        resolver.check_cancelled()?;
+        // The resolver recognizes shadowing of true and false before the
+        // default type applies. Other literal types need no syntax lookup.
+        let inferred = if default.is_none_or(|ty| ty == "bool") {
+            resolver.symbol_type(source, resolved, name, 0)?
+        } else {
+            None
+        };
+        let weight = if let Some(ty) = inferred {
+            self.weight(resolver, &ty)?
+        } else if let Some(value) = default {
             let key = named_key("builtin", value);
             self.keys_weight(&key, Some(&key))
         } else {
@@ -289,6 +300,7 @@ impl Expected {
         resolver: &mut Resolver<'w, '_>,
         ty: &TypeIdentity<'w>,
     ) -> Result<i32> {
+        resolver.check_cancelled()?;
         // A function's parameter types cannot affect a score against a
         // non-callable expected type with no required methods. Its single
         // result, when present, is scored separately by the caller.
@@ -397,6 +409,7 @@ fn methods<'w>(
     }
     let mut methods = Vec::new();
     for member in resolver.visible_members(ty.package, ty)? {
+        resolver.check_cancelled()?;
         let crate::symbols::SymbolKind::Function(signature) = &member.resolved.symbol.kind else {
             continue;
         };
@@ -432,6 +445,7 @@ fn type_key<'w>(
     ty: &TypeIdentity<'w>,
     depth: usize,
 ) -> Result<Option<String>> {
+    resolver.check_cancelled()?;
     if depth >= 16 {
         return Ok(None);
     }
@@ -489,23 +503,37 @@ fn type_key<'w>(
             substitutions,
             method_receiver,
         } => {
+            let cancelled = resolver.indexes.cancelled;
             let imports = &resolver.indexes.file_index(&file)?.imports;
             let parse = |reference: &Option<TypeRef>| {
-                materialize_type(
+                materialize_type_cancellable(
                     resolver.workspace,
                     ty.package,
                     &file,
                     imports,
                     reference.clone()?,
                     &substitutions,
+                    cancelled,
                 )
             };
             let parameters: Vec<_> = method_receiver
                 .into_iter()
                 .map(|receiver| Some(*receiver))
-                .chain(signature.parameters.iter().map(parse))
+                .chain(
+                    signature
+                        .parameters
+                        .iter()
+                        .take_while(|_| !is_cancelled(cancelled))
+                        .map(parse),
+                )
                 .collect();
-            let results: Vec<_> = signature.results.iter().map(parse).collect();
+            let results: Vec<_> = signature
+                .results
+                .iter()
+                .take_while(|_| !is_cancelled(cancelled))
+                .map(parse)
+                .collect();
+            check_optional_cancelled(cancelled)?;
             let mut labels = |types: Vec<Option<TypeIdentity<'w>>>| -> Result<Option<String>> {
                 let mut labels = Vec::new();
                 for ty in types {
@@ -544,15 +572,19 @@ pub(super) fn argument_or_result<'w>(
     let Some(reference) = reference else {
         return Ok(None);
     };
+    let cancelled = resolver.indexes.cancelled;
     let imports = &resolver.indexes.file_index(file)?.imports;
-    Ok(materialize_type(
+    let ty = materialize_type_cancellable(
         resolver.workspace,
         package,
         file,
         imports,
         reference.clone(),
         substitutions,
-    ))
+        cancelled,
+    );
+    check_optional_cancelled(cancelled)?;
+    Ok(ty)
 }
 
 fn syntax_type<'w>(
@@ -561,7 +593,9 @@ fn syntax_type<'w>(
     source: &Source,
     anchor: Node<'_>,
 ) -> Result<Option<(TypeIdentity<'w>, bool)>> {
+    let cancelled = resolver.indexes.cancelled;
     for node in ancestors(anchor) {
+        check_optional_cancelled(cancelled)?;
         let Some(parent) = node.parent() else { break };
         let ty = match parent.kind() {
             "var_spec" | "const_spec" if parent.child_by_field_name("value") == Some(node) => {
@@ -572,17 +606,18 @@ fn syntax_type<'w>(
             "assignment_statement" | "short_var_declaration"
                 if parent.child_by_field_name("right") == Some(node) =>
             {
-                let index = index_of(node, anchor);
+                let index = index_of(node, anchor, cancelled);
                 match parent
                     .child_by_field_name("left")
-                    .and_then(|left| children(left).nth(index))
+                    .and_then(|left| children(left, cancelled).nth(index))
                 {
                     Some(lhs)
                         if parent.kind() == "assignment_statement"
-                            || crate::scope::lexical_binding(
+                            || crate::scope::lexical_binding_cancellable(
                                 lhs,
                                 node_text(lhs, &source.text),
                                 &source.text,
+                                cancelled,
                             )
                             .is_some() =>
                     {
@@ -594,7 +629,9 @@ fn syntax_type<'w>(
             "return_statement" => ancestors(parent)
                 .find(|node| is_function(*node))
                 .and_then(|function| function.child_by_field_name("result"))
-                .and_then(|result| return_type(result, index_of(node, anchor)))
+                .and_then(|result| {
+                    return_type(result, index_of(node, anchor, cancelled), cancelled)
+                })
                 .and_then(|ty| resolver.source_type(package, source, ty)),
             "argument_list" => call_arg_type(resolver, package, source, parent, node)?,
             "literal_value" => element_type(resolver, package, source, parent, node, anchor)?,
@@ -642,25 +679,38 @@ fn inferred<'w>(
         .or_else(|| untyped_default(node).map(|name| TypeIdentity::named(package, name))))
 }
 
-fn children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn children<'a, 'tree: 'a>(
+    node: Node<'tree>,
+    cancelled: Option<&'a AtomicBool>,
+) -> impl Iterator<Item = Node<'tree>> + 'a {
     (0..node.named_child_count())
+        .take_while(move |_| !is_cancelled(cancelled))
         .filter_map(move |index| node.named_child(index))
         .filter(|node| !node.is_extra())
 }
 
-fn index_of(list: Node<'_>, anchor: Node<'_>) -> usize {
-    children(list)
+fn index_of(list: Node<'_>, anchor: Node<'_>, cancelled: Option<&AtomicBool>) -> usize {
+    children(list, cancelled)
         .take_while(|child| child.end_byte() <= anchor.start_byte())
         .count()
 }
 
-fn return_type(result: Node<'_>, mut index: usize) -> Option<Node<'_>> {
+fn return_type<'tree>(
+    result: Node<'tree>,
+    mut index: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Option<Node<'tree>> {
     if result.kind() != "parameter_list" {
         return (index == 0).then_some(result);
     }
-    for parameter in children(result) {
+    for parameter in children(result, cancelled) {
         let count = parameter
             .children_by_field_name("name", &mut parameter.walk())
+            .take_while(|_| !is_cancelled(cancelled))
             .count()
             .max(1);
         if index < count {
@@ -717,14 +767,17 @@ fn call_arg_type<'w>(
     if ty.pointers != 0 {
         return Ok(None);
     }
-    let mut index = index_of(list, active);
+    let cancelled = resolver.indexes.cancelled;
+    let mut index = index_of(list, active, cancelled);
+    check_optional_cancelled(cancelled)?;
     if let Some(receiver) = method_receiver {
         if index == 0 {
             return Ok(Some(*receiver));
         }
         index -= 1;
     } else if !signature.type_parameters.is_empty() {
-        let arguments: Vec<_> = children(list).take(index).collect();
+        let arguments: Vec<_> = children(list, cancelled).take(index).collect();
+        check_optional_cancelled(cancelled)?;
         let query = GenericCall {
             caller: package,
             source,
@@ -763,6 +816,7 @@ pub(super) fn literal_type<'w>(
     source: &Source,
     body: Node<'_>,
 ) -> Result<Option<TypeIdentity<'w>>> {
+    resolver.check_cancelled()?;
     let Some(parent) = body.parent() else {
         return Ok(None);
     };
@@ -774,7 +828,7 @@ pub(super) fn literal_type<'w>(
     let Some(outer) = ancestors(parent).find(|node| node.kind() == "literal_value") else {
         return Ok(None);
     };
-    let Some(element) = children(outer)
+    let Some(element) = children(outer, resolver.indexes.cancelled)
         .find(|node| node.start_byte() <= body.start_byte() && body.end_byte() <= node.end_byte())
     else {
         return Ok(None);
@@ -790,6 +844,8 @@ fn element_type<'w>(
     element: Node<'_>,
     anchor: Node<'_>,
 ) -> Result<Option<TypeIdentity<'w>>> {
+    let cancelled = resolver.indexes.cancelled;
+    check_optional_cancelled(cancelled)?;
     let key = element.child_by_field_name("key");
     let in_key = key.is_some_and(|key| anchor.end_byte() <= key.end_byte());
     let Some(ty) = literal_type(resolver, package, source, body)? else {
@@ -824,7 +880,8 @@ fn element_type<'w>(
             let range = field.member.resolved.symbol.range;
             (range.start.line, range.start.character)
         });
-        fields.into_iter().nth(index_of(body, element))
+        fields.into_iter().nth(index_of(body, element, cancelled))
     };
+    check_optional_cancelled(cancelled)?;
     Ok(field.and_then(|field| field.ty))
 }

@@ -17,7 +17,7 @@ mod load_trace;
 mod process;
 use inputs::PackageInputs;
 pub(crate) use load_trace::{CommandTrace, LoadTrace};
-pub(crate) use process::{check_load_cancelled, command_output};
+pub(crate) use process::{CancelToken, check_load_cancelled, command_output};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceLoad {
@@ -83,6 +83,7 @@ pub struct Workspace {
     importers: HashMap<String, Vec<String>>,
     diagnostic_file_stamps: HashMap<PathBuf, DiagnosticFileStamp>,
     diagnostic_observed_at: Instant,
+    load_started_at: SystemTime,
     includes_tests: bool,
     sdk_root: OnceLock<PathBuf>,
     builtin_source: OnceLock<Result<PathBuf, String>>,
@@ -92,6 +93,12 @@ pub struct Workspace {
 pub(crate) struct DiagnosticFileStamp {
     modified: Option<SystemTime>,
     len: u64,
+}
+
+impl DiagnosticFileStamp {
+    pub(crate) fn revision_parts(&self) -> (Option<SystemTime>, u64) {
+        (self.modified, self.len)
+    }
 }
 
 #[derive(Clone)]
@@ -142,6 +149,7 @@ impl Workspace {
         Self::load_roots_in_environment(folders, include_tests, &GoEnvironment::capture())
     }
 
+    #[cfg(test)]
     pub(crate) fn load_roots_in_environment(
         folders: &[PathBuf],
         include_tests: bool,
@@ -150,6 +158,7 @@ impl Workspace {
         Self::load_graph(folders, include_tests, false, environment, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn load_roots_for_rename(
         folders: &[PathBuf],
         include_tests: bool,
@@ -158,13 +167,20 @@ impl Workspace {
         Self::load_graph(folders, include_tests, true, environment, None)
     }
 
-    pub(crate) fn prewarm_tests(
+    pub(crate) fn load_cancellable(
         folders: &[PathBuf],
-        environment: &GoEnvironment,
+        include_tests: bool,
         track_inputs: bool,
-        cancelled: &AtomicBool,
+        environment: &GoEnvironment,
+        cancel: &CancelToken,
     ) -> Result<Self> {
-        Self::load_graph(folders, true, track_inputs, environment, Some(cancelled))
+        Self::load_graph(
+            folders,
+            include_tests,
+            track_inputs,
+            environment,
+            Some(cancel.flag()),
+        )
     }
 
     fn load_graph(
@@ -175,8 +191,9 @@ impl Workspace {
         cancelled: Option<&AtomicBool>,
     ) -> Result<Self> {
         check_load_cancelled(cancelled)?;
+        let load_started_at = SystemTime::now();
         let configuration =
-            track_inputs.then(|| PackageInputs::configuration(folders, environment));
+            track_inputs.then(|| PackageInputs::configuration(folders, environment, cancelled));
         let groups = folder_groups(folders, environment, cancelled)?;
         load_trace::groups_discovered(groups.len());
         let inputs = configuration.map(|config| {
@@ -187,7 +204,7 @@ impl Workspace {
                 .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone())))
                 .collect();
             config
-                .and_then(|inputs| inputs.with_sources(&roots))
+                .and_then(|inputs| inputs.with_sources(&roots, cancelled))
                 .map_err(|err| err.to_string())
         });
         let mut roots = BTreeSet::new();
@@ -218,7 +235,7 @@ impl Workspace {
                 Ok(packages)
             });
             match packages {
-                Ok(packages) => listing.add_group(folder, packages),
+                Ok(packages) => listing.add_group(folder, packages, cancelled)?,
                 Err(error) => listing.add_failed_group(error),
             }
             scope.roots.sort_unstable();
@@ -232,7 +249,9 @@ impl Workspace {
             listing,
             include_tests,
             environment,
-        );
+            load_started_at,
+            cancelled,
+        )?;
         workspace.rename_inputs = inputs;
         check_load_cancelled(cancelled)?;
         load_trace::graph_built(&workspace);
@@ -245,7 +264,9 @@ impl Workspace {
         listing: PackageListing,
         includes_tests: bool,
         environment: &GoEnvironment,
-    ) -> Self {
+        load_started_at: SystemTime,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self> {
         let PackageListing {
             packages,
             mut importers,
@@ -271,6 +292,7 @@ impl Workspace {
             .iter()
             .filter(|(_, package)| !package.for_test.is_empty());
         for (id, package) in ordinary.chain(testing) {
+            check_load_cancelled(cancelled)?;
             for file in &package.files {
                 let key = path_key(file);
                 match file_packages.entry(key) {
@@ -292,15 +314,14 @@ impl Workspace {
             }
         }
         let diagnostic_observed_at = Instant::now();
-        let diagnostic_file_stamps = file_packages
-            .keys()
-            .filter_map(|path| {
-                fs::metadata(path)
-                    .ok()
-                    .map(|metadata| (path.clone(), metadata.into()))
-            })
-            .collect();
-        Self {
+        let mut diagnostic_file_stamps = HashMap::with_capacity(file_packages.len());
+        for path in file_packages.keys() {
+            check_load_cancelled(cancelled)?;
+            if let Ok(metadata) = fs::metadata(path) {
+                diagnostic_file_stamps.insert(path.clone(), metadata.into());
+            }
+        }
+        Ok(Self {
             environment: environment.clone(),
             rename_inputs: None,
             roots,
@@ -313,10 +334,11 @@ impl Workspace {
             importers,
             diagnostic_file_stamps,
             diagnostic_observed_at,
+            load_started_at,
             includes_tests,
             sdk_root: sdk_root.map_or_else(OnceLock::new, OnceLock::from),
             builtin_source: OnceLock::new(),
-        }
+        })
     }
 
     #[cfg(test)]
@@ -326,10 +348,13 @@ impl Workspace {
         includes_tests: bool,
     ) -> Self {
         let mut packages = PackageListing::default();
-        packages.add_group(
-            roots.first().map_or(Path::new("."), PathBuf::as_path),
-            read_packages(listing.as_bytes()).unwrap(),
-        );
+        packages
+            .add_group(
+                roots.first().map_or(Path::new("."), PathBuf::as_path),
+                read_packages(listing.as_bytes()).unwrap(),
+                None,
+            )
+            .unwrap();
         let keys: Vec<_> = roots.iter().map(|root| path_key(root)).collect();
         let mut folders = keys.clone();
         folders.sort_unstable();
@@ -338,11 +363,19 @@ impl Workspace {
             roots: Vec::new(),
         }];
         let environment = GoEnvironment::capture();
-        let mut workspace =
-            Self::from_listing(keys, scopes, packages, includes_tests, &environment);
+        let mut workspace = Self::from_listing(
+            keys,
+            scopes,
+            packages,
+            includes_tests,
+            &environment,
+            SystemTime::now(),
+            None,
+        )
+        .unwrap();
         workspace.rename_inputs = Some(
-            PackageInputs::configuration(roots, &environment)
-                .and_then(|inputs| inputs.with_sources(roots))
+            PackageInputs::configuration(roots, &environment, None)
+                .and_then(|inputs| inputs.with_sources(roots, None))
                 .map_err(|err| err.to_string()),
         );
         workspace
@@ -403,6 +436,13 @@ impl Workspace {
             Some(change) if change.observed_at >= self.diagnostic_observed_at => change.stamp,
             _ => self.diagnostic_file_stamps.get(key).copied(),
         }
+    }
+
+    pub(crate) fn selection_baseline_stamp(&self, key: &Path) -> Option<DiagnosticFileStamp> {
+        let stamp = self.diagnostic_file_stamps.get(key).copied()?;
+        // Package discovery may have read a previous revision before the
+        // post-listing metadata scan sampled this file.
+        (stamp.modified? <= self.load_started_at).then_some(stamp)
     }
 
     pub(crate) fn total_load_failure(&self) -> Option<&str> {
@@ -498,6 +538,22 @@ impl Workspace {
             .map_err(|error| anyhow!("{error}"))
     }
 
+    pub(crate) fn known_builtin_source(&self) -> Option<Result<PathBuf>> {
+        if let Some(source) = self.builtin_source.get() {
+            return Some(source.clone().map_err(|error| anyhow!("{error}")));
+        }
+        self.sdk_root()
+            .map(|sdk| Ok(sdk.join("src").join("builtin").join("builtin.go")))
+    }
+
+    pub(crate) fn remember_builtin_source(&self, path: PathBuf) {
+        let _ = self.builtin_source.set(Ok(path));
+    }
+
+    pub(crate) fn environment(&self) -> &GoEnvironment {
+        &self.environment
+    }
+
     pub(crate) fn sdk_root(&self) -> Option<&Path> {
         self.sdk_root.get().map(PathBuf::as_path)
     }
@@ -508,6 +564,10 @@ impl Workspace {
 
     pub fn includes_tests(&self) -> bool {
         self.includes_tests
+    }
+
+    pub(crate) fn build_environment(&self) -> &GoEnvironment {
+        &self.environment
     }
 
     pub(crate) fn selected_file_stamp(&self, key: &Path) -> Option<Option<DiagnosticFileStamp>> {
@@ -768,10 +828,6 @@ impl Package {
         self.standard
     }
 
-    pub(crate) fn is_external(&self) -> bool {
-        self.external
-    }
-
     pub(crate) fn module_path(&self) -> Option<&str> {
         self.module_path.as_deref()
     }
@@ -781,7 +837,7 @@ impl Package {
     }
 }
 
-fn find_builtin_source(root: &Path, environment: &GoEnvironment) -> Result<PathBuf> {
+pub(crate) fn find_builtin_source(root: &Path, environment: &GoEnvironment) -> Result<PathBuf> {
     let starting_go = || format!("starting go env GOROOT in {}", root.display());
     let mut trace = CommandTrace::new("go env", root);
     let mut command = environment.command("go").with_context(starting_go)?;
@@ -1052,7 +1108,12 @@ impl PackageListing {
         self.group_imports.push(HashMap::new());
     }
 
-    fn add_group(&mut self, root: &Path, packages: Vec<ListedPackage>) {
+    fn add_group(
+        &mut self,
+        root: &Path,
+        packages: Vec<ListedPackage>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
         let group = self.group_imports.len();
         let mut aliases: HashMap<_, _> = packages
             .iter()
@@ -1074,6 +1135,7 @@ impl PackageListing {
         // go list -deps normally emits dependencies first. Provisional aliases keep
         // forward edges (such as import cycles) inside the group during insertion.
         for mut package in packages {
+            check_load_cancelled(cancelled)?;
             if package.goroot && self.sdk_root.is_none() {
                 let import = package.import_path.split(" [").next().unwrap_or_default();
                 let relative = Path::new(import);
@@ -1169,6 +1231,7 @@ impl PackageListing {
             }
         }
         for (id, imports) in added {
+            check_load_cancelled(cancelled)?;
             let owner = self.packages.get_mut(&id).expect("newly inserted package");
             owner.remap_imports(&reused);
             for import in &imports {
@@ -1187,6 +1250,7 @@ impl PackageListing {
             error.package_id = aliases.get(&error.import_path).cloned();
         }
         self.group_imports.push(aliases);
+        Ok(())
     }
 
     fn reuse_package(&mut self, raw: &str, owner: &Package, group: usize) -> Option<String> {
@@ -1658,7 +1722,9 @@ mod tests {
             });
             let missing = json!({"ImportPath": "example.test/missing", "Error": error});
             let records = format!("{owner}\n{missing}");
-            listing.add_group(root, read_packages(records.as_bytes()).unwrap());
+            listing
+                .add_group(root, read_packages(records.as_bytes()).unwrap(), None)
+                .unwrap();
         }
         let scopes = roots
             .iter()
@@ -1673,7 +1739,10 @@ mod tests {
             listing,
             false,
             &GoEnvironment::capture(),
-        );
+            SystemTime::now(),
+            None,
+        )
+        .unwrap();
         assert_eq!(workspace.package_errors().len(), 4);
         for (group, root) in roots.iter().enumerate() {
             let package = workspace.package_of_file(&root.join("app.go")).unwrap();

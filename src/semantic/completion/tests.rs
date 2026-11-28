@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use lsp_types::{
     CompletionItem, CompletionItemKind as Kind, CompletionResponse, CompletionTextEdit, Position,
@@ -284,11 +285,11 @@ fn classifies_incomplete_imports_types_struct_literals_and_qualified_types() {
         let (_, position) = open(&mut engine, &path, text, 1);
         let mut snapshot = engine.snapshot();
         let document = snapshot.document(&path).unwrap().unwrap();
-        let probe = Probe::new(&document, snapshot.parser(), position, None)
+        let probe = Probe::new(&document, snapshot.parser(), position, None, None)
             .unwrap()
             .unwrap();
         let source = probe.source(&document);
-        let actual = match probe.site(source, document.text()) {
+        let actual = match probe.site(source, document.text(), None).unwrap() {
             Site::ImportPath { .. } => "import",
             Site::TypePosition { .. } => "type",
             Site::Selector {
@@ -1014,14 +1015,16 @@ fn rank_matches_exact_prefix_folded_and_camel_humps_before_other_weights() {
         "package sample\nvar HS int\nvar HSTail int\nvar hsTail int\nvar HTTPServer int\n",
         "var _ = HS¦",
     );
-    let values = complete(&mut engine, &path, text);
+    let (_, position) = open(&mut engine, &path, text, 1);
+    let caps = CompletionClientCapabilities::default();
+    let values = items(&mut engine, &path, position, &caps);
     assert_eq!(labels(&values), ["HS", "HSTail", "hsTail", "HTTPServer"]);
     assert!(
         values
             .windows(2)
             .all(|items| items[0].sort_text < items[1].sort_text)
     );
-    let again = complete(&mut engine, &path, text);
+    let again = items(&mut engine, &path, position, &caps);
     assert_eq!(values, again);
     assert!(ranking::match_start("rece", "RequestClientCert").is_some());
     assert!(ranking::match_start("para", "ParseRawPrivateKey").is_some());
@@ -1401,6 +1404,85 @@ fn auto_imports_prioritize_existing_aliases_and_apply_nonoverlapping_crlf_edits(
 }
 
 #[test]
+fn completion_worker_preserves_order_and_edits_for_current_snapshots() {
+    use crate::workspace::CancelToken;
+
+    let (project, mut engine, path) = engine();
+    let dep = project.write(
+        "codec/lib.go",
+        "package codec\n// Marshal encodes the value.\nfunc Marshal(value int) int { return value }\n",
+    );
+    install(
+        &mut engine,
+        listing(
+            &project,
+            &[
+                pkg(
+                    &project.root,
+                    "example.test/sample",
+                    "sample",
+                    &["sample.go"],
+                ),
+                pkg(
+                    dep.parent().unwrap(),
+                    "example.test/codec",
+                    "codec",
+                    &["lib.go"],
+                ),
+            ],
+            false,
+        ),
+        false,
+    );
+    let caps = CompletionClientCapabilities {
+        resolve_documentation: true,
+        resolve_detail: true,
+        resolve_additional_text_edits: true,
+        ..CompletionClientCapabilities::default()
+    };
+    let mut worker = CompletionWorker::default();
+    for (version, input) in [
+        (1, "package sample\r\nfunc f() { _ = \"😀\"; Ma¦rshal }\r\n"),
+        (2, "package sample\r\nvar Sample int\r\nvar _ = Sa¦\r\n"),
+    ] {
+        let (text, position) = open(&mut engine, &path, input, version);
+        let expected = items(&mut engine, &path, position, &caps);
+        let input =
+            engine.capture_completion(&path, position, caps, None, CancelToken::default(), false);
+        let CompletionOutcome::Ready(value) = worker.run(input) else {
+            panic!("expected completion from the current snapshot");
+        };
+        assert_eq!(value, serde_json::to_value(&expected).unwrap());
+        let produced: Vec<CompletionItem> = serde_json::from_value(value).unwrap();
+        if version == 1 {
+            let resolve = |engine: &mut Engine, item: &CompletionItem| {
+                let request = CompletionResolve::new(item.clone()).unwrap();
+                let memo = QueryReadMemo::default();
+                loop {
+                    match engine.resolve_completion_item(&request, &caps, &memo) {
+                        Ok(ResolveCompletionResult::Item(item)) => return item,
+                        Err(error) if error.is::<super::super::SharedLoadPending>() => {
+                            let _ = engine
+                                .shared_disk_wake()
+                                .recv_timeout(Duration::from_secs(1));
+                        }
+                        _ => panic!("expected resolved item"),
+                    }
+                }
+            };
+            let expected = resolve(&mut engine, item(&expected, "Marshal"));
+            let produced = resolve(&mut engine, item(&produced, "Marshal"));
+            assert_eq!(produced, expected);
+            let accepted = apply(&text, &produced);
+            assert!(accepted.contains("import \"example.test/codec\""));
+            assert!(accepted.contains("codec.Marshal()"));
+        } else {
+            assert_labels(&produced, &["Sample"], &[]);
+        }
+    }
+}
+
+#[test]
 fn auto_imports_rewrite_unresolved_qualifiers_and_preserve_type_position_rules() {
     let (project, mut engine, path) = engine();
     let lib = project.write("codec/lib.go", concat!(
@@ -1492,6 +1574,11 @@ fn sdk_inventory_loads_only_the_qualified_packages_and_reuses_exported_symbols()
         &CompletionClientCapabilities::default(),
     );
     let marshal = item(&values, "Marshal");
+    let data = serde_json::from_value::<ItemData>(marshal.data.clone().unwrap()).unwrap();
+    assert!(matches!(
+        data.target.unwrap().revision,
+        Some(SourceRev::Disk(_))
+    ));
     let applied = apply(&source, marshal);
     assert!(applied.contains("import \"encoding/json\""));
     assert!(applied.ends_with("var _, _ = json.Marshal()"));
@@ -1870,7 +1957,7 @@ fn a_completion_task_releases_request_sources_on_finish_cancel_or_stale() {
         };
         let sources = loop {
             assert!(!task.advance(&mut engine).unwrap());
-            let sources = task.request.retained_sources();
+            let sources = task.request.retained_declarations();
             if !sources.is_empty() {
                 break sources;
             }
@@ -1908,16 +1995,26 @@ fn a_completion_task_releases_request_sources_on_finish_cancel_or_stale() {
 #[test]
 fn a_closed_query_keeps_its_disk_snapshot_and_rejects_an_external_change() {
     let (project, mut engine, caller) = engine();
-    let (text, position) = marked("package sample\nvar _ = Export¦\n");
+    let (text, position) = marked(concat!(
+        "package sample\n",
+        "// Export sends the value.\n",
+        "func Export() {}\n",
+        "var _ = Exp¦\n",
+    ));
     project.write("sample.go", &text);
-    let QueryProgress::Searching(mut task) = engine
-        .complete(
-            &caller,
-            position,
-            None,
-            &CompletionClientCapabilities::default(),
-        )
-        .unwrap()
+    let caps = CompletionClientCapabilities::default();
+    let values = items(&mut engine, &caller, position, &caps);
+    let proposal = item(&values, "Export");
+    assert!(matches!(proposal.documentation.as_ref(),
+        Some(Documentation::MarkupContent(docs)) if docs.value == "Export sends the value."));
+    let data = serde_json::from_value::<ItemData>(proposal.data.clone().unwrap()).unwrap();
+    assert!(matches!(data.document_revision, Some(SourceRev::Disk(_))));
+    assert!(matches!(
+        data.target.unwrap().revision,
+        Some(SourceRev::Disk(_))
+    ));
+    let QueryProgress::Searching(mut task) =
+        engine.complete(&caller, position, None, &caps).unwrap()
     else {
         panic!("expected an import search");
     };
@@ -1933,7 +2030,7 @@ fn a_closed_query_keeps_its_disk_snapshot_and_rejects_an_external_change() {
 }
 
 #[test]
-fn lsp_save_invalidates_a_closed_dependency_name_prefilter() {
+fn completion_prefilter_observes_disk_edits_with_and_without_save() {
     let project = TestProject::new();
     let (text, position) = marked("package sample\nvar _ = NewlySaved¦\n");
     let path = project.write("sample.go", &text);
@@ -1963,13 +2060,12 @@ fn lsp_save_invalidates_a_closed_dependency_name_prefilter() {
     install(&mut lsp.running().engine, graph(), false);
     lsp.complete(1, position);
     assert_labels(&lsp.complete_results(1), &[], &["NewlySaved"]);
-    let key = path_key(&lib);
-    assert!(
-        lsp.running()
-            .engine
-            .state
-            .completion_names
-            .contains_key(&key)
+    std::fs::write(&lib, "package dep\nfunc NewlySavedOnDisk() {}\n").unwrap();
+    lsp.complete(2, position);
+    assert_labels(
+        &lsp.complete_results(2),
+        &["NewlySavedOnDisk"],
+        &["NewlySaved"],
     );
     std::fs::write(&lib, "package dep\nfunc NewlySaved() {}\n").unwrap();
     lsp.notify(
@@ -1978,16 +2074,13 @@ fn lsp_save_invalidates_a_closed_dependency_name_prefilter() {
             "textDocument": {"uri": crate::protocol::path_uri(&lib).unwrap()},
         }),
     );
-    assert!(
-        !lsp.running()
-            .engine
-            .state
-            .completion_names
-            .contains_key(&key)
-    );
     install(&mut lsp.running().engine, graph(), false);
-    lsp.complete(2, position);
-    assert_labels(&lsp.complete_results(2), &["NewlySaved"], &[]);
+    lsp.complete(3, position);
+    assert_labels(
+        &lsp.complete_results(3),
+        &["NewlySaved"],
+        &["NewlySavedOnDisk"],
+    );
 }
 
 #[test]
@@ -2281,9 +2374,37 @@ impl LspSession {
         running.advance_search(self.session.server()).unwrap();
     }
 
+    fn start_completion_step(&mut self) {
+        let crate::State::Running(running) = &mut self.state else {
+            panic!("not initialized")
+        };
+        running
+            .scheduler
+            .advance_completion(&running.engine, self.session.server())
+            .unwrap();
+    }
+
+    fn step_completion(&mut self) {
+        self.start_completion_step();
+        let crate::State::Running(running) = &mut self.state else {
+            panic!("not initialized")
+        };
+        let completed = running
+            .scheduler
+            .completion_results()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .expect("completion worker did not finish");
+        running
+            .scheduler
+            .complete_completion(&mut running.engine, self.session.server(), completed)
+            .unwrap();
+    }
+
     fn complete_results(&mut self, id: i32) -> Vec<CompletionItem> {
-        while !self.running().searches.is_empty() {
-            self.advance();
+        while self.running().scheduler.has_completion() {
+            assert!(!self.running().scheduler.completion_waiting_for_workspace());
+            self.step_completion();
         }
         serde_json::from_value(self.session.response(id).result.unwrap()).unwrap()
     }
@@ -2294,6 +2415,21 @@ impl LspSession {
             "completionItem/resolve",
             serde_json::to_value(item).unwrap(),
         );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.running().searches.is_empty() {
+            let running = self.running();
+            if running.scheduler.ready_search(&running.engine).is_none() {
+                let _ = running
+                    .engine
+                    .shared_disk_wake()
+                    .recv_timeout(Duration::from_millis(10));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completion resolve did not finish"
+            );
+            self.advance();
+        }
         self.session.response(id)
     }
 
@@ -2366,8 +2502,35 @@ fn lsp_completion_negotiates_capabilities_and_resolves_docs_detail_and_import_ed
     let details = proposal.label_details.as_ref().unwrap();
     assert_eq!(details.description.as_deref(), Some("example.test/dep"));
     assert_eq!(details.detail.as_deref(), Some("(x int)"));
+    let data = serde_json::from_value::<ItemData>(proposal.data.clone().unwrap()).unwrap();
+    let target = data.target.unwrap();
+    assert_eq!(target.file, dep);
+    assert!(matches!(target.revision, Some(SourceRev::Disk(_))));
+    let engine = &mut rich.running().engine;
+    let dependency_text = std::fs::read_to_string(&dep).unwrap();
+    let baseline = Source::parse(
+        engine.snapshot().parser(),
+        dep.clone(),
+        dependency_text.clone(),
+        None,
+    )
+    .unwrap();
+    let baseline_docs = markup(
+        &baseline,
+        target.range,
+        &CompletionClientCapabilities {
+            markdown_docs: true,
+            ..Default::default()
+        },
+    );
+    let cache = engine.state.shared_disk.clone();
+    cache.clear_full_cache();
+    cache.clear_declaration_cache();
+    let (full, light) = cache.projection_counts(&dep);
     let resolved: CompletionItem =
         serde_json::from_value(rich.resolve(2, proposal).result.unwrap()).unwrap();
+    assert_eq!(cache.projection_counts(&dep), (full, light + 1));
+    assert_eq!(resolved.documentation, baseline_docs);
     assert_eq!(resolved.text_edit, proposal.text_edit);
     assert_eq!(resolved.filter_text, proposal.filter_text);
     assert_eq!(resolved.sort_text, proposal.sort_text);
@@ -2384,6 +2547,31 @@ fn lsp_completion_negotiates_capabilities_and_resolves_docs_detail_and_import_ed
     assert!(applied.contains("import \"example.test/dep\""));
     assert!(applied.ends_with("var _ = dep.Marshal(1)"));
     assert_go_syntax(&mut rich.running().engine, applied);
+
+    let mut legacy_proposal = proposal.clone();
+    let legacy_data = legacy_proposal.data.as_mut().unwrap();
+    legacy_data
+        .as_object_mut()
+        .unwrap()
+        .remove("document_revision");
+    legacy_data["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("revision");
+    let legacy: CompletionItem =
+        serde_json::from_value(rich.resolve(4, &legacy_proposal).result.unwrap()).unwrap();
+    assert!(legacy.documentation.is_none());
+    assert_eq!(legacy.detail, resolved.detail);
+    assert_eq!(legacy.additional_text_edits, resolved.additional_text_edits);
+
+    std::fs::write(
+        &dep,
+        dependency_text.replace("writes", "encodes and writes"),
+    )
+    .unwrap();
+    assert_eq!(rich.resolve(5, proposal).error.unwrap().code, -32801);
+    std::fs::write(&dep, &dependency_text).unwrap();
+
     rich.replace(&text, 2);
     let stale = rich.resolve(3, proposal);
     assert_eq!(stale.error.unwrap().code, -32801);
@@ -2423,6 +2611,96 @@ fn lsp_completion_negotiates_capabilities_and_resolves_docs_detail_and_import_ed
     );
     assert!(matches!(resolved.documentation,
         Some(Documentation::MarkupContent(docs)) if docs.kind == MarkupKind::PlainText));
+}
+
+#[test]
+fn lsp_resolve_uses_inline_member_docs_and_rejects_a_changed_overlay() {
+    let project = TestProject::new();
+    let path = project.write("sample.go", "package sample\n");
+    let dependency = concat!(
+        "package dep\n",
+        "var Record struct {\n",
+        "  /* 😀 */ Field int // Field is stored data.\n",
+        "}\n",
+    );
+    let dep = project.write("dep/lib.go", dependency);
+    let (text, position) = marked(concat!(
+        "package sample\n",
+        "import \"example.test/dep\"\n",
+        "var _ = dep.Record.Fi¦\n",
+    ));
+    let mut lsp = LspSession::new(&path, feature_caps(&["documentation"], true));
+    lsp.open(&text);
+    install(
+        &mut lsp.running().engine,
+        listing(
+            &project,
+            &[
+                pkg(
+                    &project.root,
+                    "example.test/sample",
+                    "sample",
+                    &["sample.go"],
+                ),
+                pkg(
+                    dep.parent().unwrap(),
+                    "example.test/dep",
+                    "dep",
+                    &["lib.go"],
+                ),
+            ],
+            false,
+        ),
+        false,
+    );
+    lsp.complete(1, position);
+    let proposals = lsp.complete_results(1);
+    let proposal = item(&proposals, "Field");
+    let data = serde_json::from_value::<ItemData>(proposal.data.clone().unwrap()).unwrap();
+    let target = data.target.unwrap();
+    assert_eq!(target.range.start, Position::new(2, 11));
+    assert!(matches!(target.revision, Some(SourceRev::Disk(_))));
+    let engine = &mut lsp.running().engine;
+    let baseline = Source::parse(
+        engine.snapshot().parser(),
+        dep.clone(),
+        dependency.into(),
+        None,
+    )
+    .unwrap();
+    let expected = markup(
+        &baseline,
+        target.range,
+        &CompletionClientCapabilities {
+            markdown_docs: true,
+            ..Default::default()
+        },
+    );
+    assert!(expected.is_some());
+    let cache = engine.state.shared_disk.clone();
+    cache.clear_full_cache();
+    cache.clear_declaration_cache();
+    let (full, light) = cache.projection_counts(&dep);
+    let resolved: CompletionItem =
+        serde_json::from_value(lsp.resolve(2, proposal).result.unwrap()).unwrap();
+    assert_eq!(resolved.documentation, expected);
+    assert_eq!(cache.projection_counts(&dep), (full, light + 1));
+
+    lsp.running()
+        .engine
+        .open(dep.clone(), dependency.into(), 1)
+        .unwrap();
+    assert_eq!(lsp.resolve(3, proposal).error.unwrap().code, -32801);
+    lsp.complete(4, position);
+    let proposals = lsp.complete_results(4);
+    let proposal = item(&proposals, "Field");
+    let data = serde_json::from_value::<ItemData>(proposal.data.clone().unwrap()).unwrap();
+    assert!(matches!(
+        data.target.unwrap().revision,
+        Some(SourceRev::Overlay { .. })
+    ));
+    lsp.running().engine.close(&dep);
+    assert_eq!(lsp.resolve(5, proposal).error.unwrap().code, -32801);
 }
 
 #[test]
@@ -2500,13 +2778,15 @@ fn lsp_cancels_pending_and_batched_requests_and_rejects_outdated_batches() {
     let mut lsp = LspSession::new(&path, json!({}));
     lsp.open(&text);
     lsp.complete(1, position);
-    assert_eq!(lsp.running().pending.len(), 1);
+    lsp.step_completion();
+    assert!(lsp.running().scheduler.completion_waiting_for_workspace());
     lsp.session.assert_no_messages();
     lsp.notify("$/cancelRequest", json!({"id": 1}));
     lsp.error(1, -32800);
-    assert!(lsp.running().pending.is_empty());
+    assert!(!lsp.running().scheduler.has_completion());
 
     lsp.complete(2, position);
+    lsp.step_completion();
     let crate::State::Running(running) = &mut lsp.state else {
         panic!()
     };
@@ -2521,25 +2801,25 @@ fn lsp_cancels_pending_and_batched_requests_and_rejects_outdated_batches() {
         running.engine.state.completion_graph_generation,
         running.engine.state.workspace.as_ref().unwrap(),
     );
-    lsp.advance();
-    assert_eq!(lsp.running().searches.len(), 1);
+    lsp.start_completion_step();
+    assert!(lsp.running().scheduler.has_completion());
     lsp.notify("$/cancelRequest", json!({"id": 2}));
     lsp.error(2, -32800);
-    assert!(lsp.running().searches.is_empty());
+    assert!(!lsp.running().scheduler.has_completion());
     lsp.notify("$/cancelRequest", json!({"id": 2}));
     lsp.session.assert_no_messages();
+    lsp.step_completion();
 
     lsp.complete(3, position);
-    lsp.advance();
     lsp.replace(&text, 2);
     lsp.error(3, -32801);
+    lsp.step_completion();
 
     lsp.complete(4, position);
-    lsp.advance();
     // A test-aware graph can replace the installed graph at the same load
     // generation. Its own completion revision still invalidates the task.
     install(&mut lsp.running().engine, workspace(), false);
-    lsp.advance();
+    lsp.step_completion();
     lsp.error(4, -32801);
 
     lsp.complete(5, position);
@@ -2587,7 +2867,8 @@ fn lsp_completion_uses_unsaved_edits_close_restores_disk_and_graph_refresh_adds_
     );
     lsp.flush_watches();
     lsp.complete(5, position);
-    assert_eq!(lsp.running().pending.len(), 1);
+    lsp.step_completion();
+    assert!(lsp.running().scheduler.completion_waiting_for_workspace());
     let crate::State::Running(running) = &mut lsp.state else {
         panic!()
     };

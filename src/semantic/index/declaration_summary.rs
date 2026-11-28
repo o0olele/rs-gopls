@@ -1,3 +1,5 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use tree_sitter::Node;
 
 use super::Source;
@@ -9,9 +11,22 @@ const BYTE_LIMIT: usize = 256 * 1024;
 const DEPTH_LIMIT: usize = 128;
 
 #[derive(Debug, Eq, PartialEq)]
-pub(in crate::semantic) struct DeclarationSummary(Box<[u8]>);
+pub(in crate::semantic) struct DeclarationSummary {
+    fingerprint: u64,
+    records: Box<[u8]>,
+}
+
+impl Hash for DeclarationSummary {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fingerprint.hash(state);
+    }
+}
 
 impl DeclarationSummary {
+    pub(in crate::semantic) fn heap_weight(&self) -> usize {
+        self.records.len()
+    }
+
     pub(super) fn collect(source: &Source) -> Option<Self> {
         // The cgo preamble is a comment and can declare entities used by Go.
         if source
@@ -87,7 +102,15 @@ impl DeclarationSummary {
 
             records.node(node, &source.text, body, 0)?;
         }
-        (seen_package && !root.is_error()).then(|| Self(records.0.into_boxed_slice()))
+        (seen_package && !root.is_error()).then(|| {
+            let records = records.0.into_boxed_slice();
+            let mut hasher = DefaultHasher::new();
+            records.hash(&mut hasher);
+            Self {
+                fingerprint: hasher.finish(),
+                records,
+            }
+        })
     }
 }
 

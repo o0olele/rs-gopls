@@ -2,19 +2,23 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use lsp_types::{CompletionItemKind as Kind, Range};
 
 use crate::go_environment::GoEnvironment;
 use crate::semantic::{
-    index::{CompletionRead, FileIndex, IndexReader, IndexedSource},
+    SharedLoadPending,
+    index::{CachedNavigationText, CompletionRead, FileIndex, IndexReader},
     resolver::{ResolvedSymbol, Resolver, is_exported},
     snapshot::{DocumentSnapshot, EngineSnapshot},
-    source::is_test_source,
+    source::{check_optional_cancelled, is_test_source},
 };
-use crate::symbols::{Container, SymbolKind, TypeRef, TypeRefKind};
+use crate::symbols::{Container, Symbol, SymbolKind, TypeRef, TypeRefKind};
 use crate::workspace::{Package, Workspace, path_key};
 
 use super::candidates::resolved_candidate;
@@ -26,7 +30,7 @@ use super::ranking::{
     AUTO_IMPORT, Candidate, Insert, Match, SYMBOL, Weight, match_member_hump, match_name,
     match_start, package_priority,
 };
-use super::render::{Description, PendingImport, Target, describe, package_name};
+use super::render::{Description, PendingImport, SourceRev, Target, describe, package_name};
 use super::sdk::{Catalog, Inventory};
 use super::{CompletionClientCapabilities, Trace};
 
@@ -61,17 +65,23 @@ pub(super) enum SearchKind {
 
 pub(in crate::semantic) struct ImportCache {
     generation: Option<u64>,
-    graph: Rc<[Importable]>,
-    inventory: Inventory,
-    sdk: Option<(Arc<Catalog>, Rc<[Importable]>)>,
-    sdk_exports: HashMap<PathBuf, Rc<[Export]>>,
+    graph: Rc<[Rc<Importable>]>,
+    prewarm: ImportPrewarm,
+    sdk: Option<(Arc<Catalog>, Rc<[Rc<Importable>]>)>,
+    sdk_exports: HashMap<PathBuf, CachedSdkExports>,
+    sdk_matches: HashMap<String, SdkMatches>,
     scanner: Scanner,
+}
+
+#[derive(Clone)]
+pub(super) struct ImportPrewarm {
+    inventory: Inventory,
+    signal: crossbeam_channel::Sender<()>,
     wake: crossbeam_channel::Receiver<()>,
     #[cfg(test)]
     empty_sdk: Option<u64>,
 }
 
-#[derive(Clone)]
 struct Importable {
     path: String,
     name: String,
@@ -79,7 +89,6 @@ struct Importable {
     vendor_parent: Option<PathBuf>,
     prefilter_disk: bool,
     project: bool,
-    elide_bodies: bool,
     package_id: Option<String>,
     files: Rc<[ImportFile]>,
 }
@@ -88,6 +97,20 @@ struct Importable {
 struct ImportFile {
     path: PathBuf,
     key: PathBuf,
+}
+
+struct SdkMatches {
+    matcher: SymbolMatcher<'static>,
+    generation: u64,
+    source_files: Rc<[ImportFile]>,
+    files: Rc<[ImportFile]>,
+    names_validated: bool,
+}
+
+struct CachedSdkExports {
+    text: CachedNavigationText,
+    exports: Rc<[Export]>,
+    sdk_generation: Option<u64>,
 }
 
 impl ImportFile {
@@ -102,48 +125,106 @@ impl ImportFile {
 impl Default for ImportCache {
     fn default() -> Self {
         let (signal, wake) = crossbeam_channel::bounded(1);
-        Self {
-            generation: None,
-            graph: Rc::from([]),
+        ImportPrewarm {
             inventory: Inventory::new(signal.clone()),
-            sdk: None,
-            sdk_exports: HashMap::new(),
-            scanner: Scanner::new(signal),
+            signal,
             wake,
             #[cfg(test)]
             empty_sdk: None,
+        }
+        .cache()
+    }
+}
+
+impl ImportPrewarm {
+    pub(super) fn cache(self) -> ImportCache {
+        ImportCache {
+            generation: None,
+            graph: Rc::from([]),
+            scanner: Scanner::new(self.signal.clone()),
+            prewarm: self,
+            sdk: None,
+            sdk_exports: HashMap::new(),
+            sdk_matches: HashMap::new(),
         }
     }
 }
 
 impl ImportCache {
+    pub(super) fn prewarm_snapshot(&self) -> ImportPrewarm {
+        self.prewarm.clone()
+    }
+
+    pub(super) fn update_prewarm(&mut self, prewarm: ImportPrewarm) -> bool {
+        if !self.prewarm.signal.same_channel(&prewarm.signal) {
+            *self = prewarm.cache();
+            true
+        } else {
+            self.prewarm = prewarm;
+            false
+        }
+    }
+
+    pub(super) fn clear_sdk_sources(&mut self) {
+        self.sdk = None;
+        self.sdk_exports.clear();
+        self.sdk_matches.clear();
+    }
+
     pub(in crate::semantic) fn prewarm(
         &self,
         root: &Path,
         environment: &GoEnvironment,
         refresh: bool,
     ) {
-        self.inventory.start(root, environment, refresh);
+        self.prewarm.inventory.start(root, environment, refresh);
     }
 
     pub(in crate::semantic) fn sdk_root(&self) -> Option<PathBuf> {
-        self.inventory.root()
+        self.prewarm.inventory.root()
+    }
+
+    pub(super) fn has_sdk_catalog(&self, root: Option<&Path>) -> bool {
+        self.sdk
+            .as_ref()
+            .is_some_and(|(catalog, _)| catalog.watch.is_some() && catalog.root_key() == root)
     }
 
     pub(in crate::semantic) fn wake(&self) -> &crossbeam_channel::Receiver<()> {
-        &self.wake
+        &self.prewarm.wake
     }
 
-    fn prepare(&mut self, generation: u64, workspace: &Workspace) {
+    fn prepare(
+        &mut self,
+        generation: u64,
+        workspace: &Workspace,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
         if self.generation == Some(generation) {
-            return;
+            return Ok(());
         }
-        self.generation = Some(generation);
-        self.graph = workspace
+        let previous: HashMap<_, _> = self
+            .graph
+            .iter()
+            .filter_map(|entry| Some((entry.package_id.as_deref()?, entry)))
+            .collect();
+        let mut graph = Vec::new();
+        for package in workspace
             .navigation_packages()
             .filter(|package| package.is_production())
-            .filter_map(|package| Importable::from_graph(workspace, package))
-            .collect();
+        {
+            check_optional_cancelled(cancelled)?;
+            if let Some(entry) = previous.get(package.id.as_str())
+                && entry.matches_selected_files(workspace, package)
+            {
+                graph.push(Rc::clone(entry));
+            } else if let Some(entry) = Importable::from_graph(workspace, package, cancelled)? {
+                graph.push(Rc::new(entry));
+            }
+        }
+        self.graph = graph.into();
+        self.generation = Some(generation);
+        Ok(())
     }
 
     fn sdk(
@@ -153,22 +234,24 @@ impl ImportCache {
         environment: &GoEnvironment,
         trace: Option<&Trace>,
         indexes: &mut IndexReader<'_>,
-    ) -> Option<Rc<[Importable]>> {
+    ) -> Result<Option<Rc<[Rc<Importable>]>>> {
+        let cancelled = indexes.cancelled;
+        check_optional_cancelled(cancelled)?;
         #[cfg(test)]
-        if self.empty_sdk.is_some() && self.empty_sdk == self.generation {
-            return Some(Rc::from([]));
+        if self.prewarm.empty_sdk.is_some() && self.prewarm.empty_sdk == self.generation {
+            return Ok(Some(Rc::from([])));
         }
-        self.inventory.start(root, environment, false);
-        let Some(catalog) = self.inventory.ready() else {
-            if self.inventory.is_loading() {
+        self.prewarm.inventory.start(root, environment, false);
+        let Some(catalog) = self.prewarm.inventory.ready() else {
+            if self.prewarm.inventory.is_loading() {
                 if let Some(trace) = trace {
                     trace.sdk("loading", None);
                 }
-                return None;
+                return Ok(None);
             }
-            return Some(Rc::from([]));
+            return Ok(Some(Rc::from([])));
         };
-        if let Some(root) = self.inventory.root() {
+        if let Some(root) = self.prewarm.inventory.root() {
             workspace.share_sdk_root(&root);
             if let Some(graph_root) = workspace.sdk_root()
                 && path_key(&root) != path_key(graph_root)
@@ -178,13 +261,16 @@ impl ImportCache {
                 if let Some(trace) = trace {
                     trace.sdk("different graph SDK", Some(catalog.stats.clone()));
                 }
-                return Some(Rc::from([]));
+                return Ok(Some(Rc::from([])));
             }
         }
         let cached = self
             .sdk
             .as_ref()
             .filter(|(old, _)| Arc::ptr_eq(old, &catalog));
+        if let Some(request) = &mut indexes.completion {
+            request.observe_completion_sdk(catalog.watch.as_ref());
+        }
         if let Some(trace) = trace {
             let mut stats = catalog.stats.clone();
             stats.reused = cached.is_some();
@@ -198,7 +284,7 @@ impl ImportCache {
             );
         }
         if let Some((_, entries)) = cached {
-            return Some(Rc::clone(entries));
+            return Ok(Some(Rc::clone(entries)));
         }
         if let Some((previous, _)) = &self.sdk
             && let Some(root) = previous.root_key()
@@ -208,34 +294,34 @@ impl ImportCache {
                 indexes.disk_index.retain(|path, _| !path.starts_with(root));
             }
         }
-        indexes.disk_names.extend(
-            catalog
-                .names
-                .iter()
-                .map(|(path, names)| (path.clone(), names.clone())),
-        );
+        for (path, names) in catalog.names.iter() {
+            check_optional_cancelled(cancelled)?;
+            indexes.disk_names.insert(path.clone(), names.clone());
+        }
         self.sdk_exports.clear();
-        let entries: Rc<[Importable]> = catalog
-            .packages
-            .iter()
-            .map(|package| Importable {
+        self.sdk_matches.clear();
+        let mut entries = Vec::with_capacity(catalog.packages.len());
+        for package in catalog.packages.iter() {
+            check_optional_cancelled(cancelled)?;
+            let mut files = Vec::with_capacity(package.files.len());
+            for file in package.files.iter() {
+                check_optional_cancelled(cancelled)?;
+                files.push(ImportFile::new(file));
+            }
+            entries.push(Rc::new(Importable {
                 path: package.path.clone(),
                 name: package.name.clone(),
                 directory: path_key(&package.dir),
                 vendor_parent: None,
                 prefilter_disk: true,
                 project: false,
-                elide_bodies: true,
                 package_id: None,
-                files: package
-                    .files
-                    .iter()
-                    .map(|file| ImportFile::new(file))
-                    .collect(),
-            })
-            .collect();
+                files: files.into(),
+            }));
+        }
+        let entries: Rc<[_]> = entries.into();
         self.sdk = Some((catalog, Rc::clone(&entries)));
-        Some(entries)
+        Ok(Some(entries))
     }
 
     fn exports(
@@ -244,29 +330,130 @@ impl ImportCache {
         file: &Path,
         key: &Path,
         entry: &Importable,
-    ) -> Rc<[Export]> {
+        sdk_generation: Option<u64>,
+    ) -> Result<(Option<SourceRev>, Rc<[Export]>)> {
+        let cancelled = indexes.cancelled;
+        check_optional_cancelled(cancelled)?;
         if let Some(overlay) = indexes.documents.get(key) {
-            return sdk_exports(overlay, entry);
+            return Ok((
+                SourceRev::overlay(overlay),
+                sdk_exports(
+                    overlay.declarations(),
+                    entry,
+                    cancelled,
+                    |name, symbol, kind| describe(overlay, symbol.range, name, kind, true),
+                )?,
+            ));
         }
-        if let Some(exports) = self.sdk_exports.get(key) {
-            return Rc::clone(exports);
+        if !indexes.has_overlay(key)
+            && let Some(cached) = self.sdk_exports.get_mut(key)
+        {
+            let observed = watched_sdk_export(indexes, key, &cached.text, sdk_generation);
+            // A verified catalogue-origin export can reuse the same watched
+            // contents as the name prefilter. The request polls the watch
+            // again before handing any candidate back.
+            let trusted = observed.is_some() && observed == cached.sdk_generation;
+            if trusted || cached.text.is_current(file, indexes.shared_disk) {
+                cached.sdk_generation = observed;
+                let revision = cached
+                    .text
+                    .read_ticket()
+                    .map(|ticket| SourceRev::Disk(ticket.source_revision()));
+                return Ok((revision, Rc::clone(&cached.exports)));
+            }
         }
-        let Ok(Some(source)) = indexes.declaration_source(file) else {
-            return Rc::from([]);
+        let source = match indexes.declaration_source(file) {
+            Ok(Some(source)) => source,
+            Err(error) if error.is::<SharedLoadPending>() => return Err(error),
+            _ => {
+                check_optional_cancelled(cancelled)?;
+                return Ok((None, Rc::from([])));
+            }
         };
-        let exports = sdk_exports(source.as_ref(), entry);
-        self.sdk_exports.insert(key.to_owned(), Rc::clone(&exports));
-        exports
+        let exports = sdk_exports(&source.index, entry, cancelled, |_, symbol, kind| {
+            source.presentation[&symbol.range].description(kind, true)
+        })?;
+        if let Some(text) = indexes.verified_declaration_text(key) {
+            let sdk_generation = watched_sdk_export(indexes, key, &text, sdk_generation);
+            self.sdk_exports.insert(
+                key.to_owned(),
+                CachedSdkExports {
+                    text,
+                    exports: Rc::clone(&exports),
+                    sdk_generation,
+                },
+            );
+        }
+        Ok((indexes.completion_revision(file), exports))
     }
 
     pub(in crate::semantic) fn source_changed(&mut self, key: &Path) {
         self.sdk_exports.remove(key);
+        if self
+            .sdk
+            .as_ref()
+            .and_then(|(catalog, _)| catalog.root_key())
+            .is_some_and(|root| key.starts_with(root))
+        {
+            self.sdk_matches.clear();
+        }
+    }
+
+    fn matching_sdk_files(
+        &mut self,
+        entry: &Importable,
+        indexes: &IndexReader<'_>,
+        matcher: &SymbolMatcher<'_>,
+        generation: u64,
+    ) -> Result<(Rc<[ImportFile]>, bool)> {
+        if let Some(cached) = self.sdk_matches.get(&entry.path)
+            && cached.generation == generation
+            && Rc::ptr_eq(&cached.source_files, &entry.files)
+            && &cached.matcher == matcher
+        {
+            return Ok((Rc::clone(&cached.files), cached.names_validated));
+        }
+        let mut matching = Vec::new();
+        let mut names_validated = true;
+        for file in entry.files.iter() {
+            check_optional_cancelled(indexes.cancelled)?;
+            match indexes
+                .disk_names
+                .get(&file.key)
+                .filter(|names| names.sdk_generation == Some(generation))
+            {
+                Some(names) if names.matches(matcher, indexes.cancelled) => {
+                    matching.push(file.clone())
+                }
+                Some(_) => {}
+                None => {
+                    names_validated = false;
+                    matching.push(file.clone());
+                }
+            }
+        }
+        let files = if matching.len() == entry.files.len() {
+            Rc::clone(&entry.files)
+        } else {
+            Rc::from(matching)
+        };
+        self.sdk_matches.insert(
+            entry.path.clone(),
+            SdkMatches {
+                matcher: matcher.owned(),
+                generation,
+                source_files: Rc::clone(&entry.files),
+                files: Rc::clone(&files),
+                names_validated,
+            },
+        );
+        Ok((files, names_validated))
     }
 
     #[cfg(test)]
     pub(super) fn use_empty_sdk(&mut self, generation: u64, workspace: &Workspace) {
-        self.prepare(generation, workspace);
-        self.empty_sdk = Some(generation);
+        self.prepare(generation, workspace, None).unwrap();
+        self.prewarm.empty_sdk = Some(generation);
     }
 
     #[cfg(test)]
@@ -275,8 +462,41 @@ impl ImportCache {
     }
 }
 
+fn watched_sdk_export(
+    indexes: &IndexReader<'_>,
+    key: &Path,
+    text: &CachedNavigationText,
+    sdk_generation: Option<u64>,
+) -> Option<u64> {
+    let generation = sdk_generation?;
+    let names = indexes.disk_names.get(key)?;
+    let ticket = text.read_ticket()?;
+    (names.sdk_generation == Some(generation)
+        && names.fingerprint == ticket.fingerprint()
+        && names.matches_observation(Some(ticket.observation())))
+    .then_some(generation)
+}
+
 impl Importable {
-    fn from_graph(workspace: &Workspace, package: &Package) -> Option<Self> {
+    fn matches_selected_files(&self, workspace: &Workspace, package: &Package) -> bool {
+        let (directory, name) = package.directory_and_name();
+        self.name == name
+            && self.directory == directory
+            && self.prefilter_disk == !package.load_error
+            && self.project
+                == (workspace.is_project_package(package) || self.vendor_parent.is_some())
+            && self
+                .files
+                .iter()
+                .map(|file| &file.path)
+                .eq(package.files.iter().filter(|file| !is_test_source(file)))
+    }
+
+    fn from_graph(
+        workspace: &Workspace,
+        package: &Package,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<Self>> {
         let (directory, name) = package.directory_and_name();
         let vendor = directory
             .ancestors()
@@ -287,24 +507,25 @@ impl Importable {
             .map_or(path, |(_, suffix)| suffix);
         let path = path.strip_prefix("vendor/").unwrap_or(path);
         if !valid_package(path, name) {
-            return None;
+            return Ok(None);
         }
-        Some(Self {
+        let mut files = Vec::new();
+        for file in &package.files {
+            check_optional_cancelled(cancelled)?;
+            if !is_test_source(file) {
+                files.push(ImportFile::new(file));
+            }
+        }
+        Ok(Some(Self {
             path: path.into(),
             name: name.into(),
             directory: directory.to_owned(),
             vendor_parent: vendor.and_then(Path::parent).map(Path::to_owned),
             prefilter_disk: !package.load_error,
             project: workspace.is_project_package(package) || vendor.is_some(),
-            elide_bodies: package.is_external() && vendor.is_none(),
             package_id: Some(package.id.clone()),
-            files: package
-                .files
-                .iter()
-                .filter(|file| !is_test_source(file))
-                .map(|file| ImportFile::new(file))
-                .collect(),
-        })
+            files: files.into(),
+        }))
     }
 
     fn weight(&self, workspace: &Workspace, caller: Option<&Package>, weight: &mut Weight) {
@@ -437,8 +658,9 @@ pub(super) struct Search {
     caller: Option<String>,
     graph_prepared: bool,
     sdk_prepared: bool,
+    sdk_match_generation: Option<u64>,
     seen_paths: HashSet<String>,
-    queue: VecDeque<Importable>,
+    queue: VecDeque<Rc<Importable>>,
     jobs: Vec<Job>,
     files: VecDeque<FileWork>,
     scans: Vec<Input>,
@@ -456,14 +678,16 @@ struct FileWork {
 }
 
 struct Job {
-    entry: Importable,
+    entry: Rc<Importable>,
     files: Rc<[ImportFile]>,
     next_file: usize,
+    names_validated: bool,
     names: HashSet<String>,
     binding: Binding,
     weight: Weight,
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) struct SymbolMatcher<'a> {
     prefix: Cow<'a, str>,
     qualified_prefix: Option<Cow<'a, str>>,
@@ -473,6 +697,17 @@ pub(super) struct SymbolMatcher<'a> {
 }
 
 impl SymbolMatcher<'_> {
+    #[cfg(test)]
+    pub(super) fn for_test(prefix: &'static str) -> SymbolMatcher<'static> {
+        SymbolMatcher {
+            prefix: Cow::Borrowed(prefix),
+            qualified_prefix: None,
+            allow_substring: false,
+            qualified_member: false,
+            types_only: false,
+        }
+    }
+
     pub(super) fn match_symbol(&self, name: &str) -> Option<Match> {
         let prefix = self.prefix.as_ref();
         if self.allow_substring {
@@ -485,6 +720,17 @@ impl SymbolMatcher<'_> {
         let qualified = self.qualified_prefix.as_deref().and_then(|qualifier| {
             if qualifier.starts_with(prefix) {
                 Some(Match::Prefix)
+            } else if prefix
+                .as_bytes()
+                .first()
+                .zip(qualifier.as_bytes().first())
+                .is_some_and(|(left, right)| {
+                    left.is_ascii() && right.is_ascii() && !left.eq_ignore_ascii_case(right)
+                })
+            {
+                // Prefix and anchored camel-hump matching both require the
+                // same initial character. Most qualifiers can skip allocation.
+                None
             } else {
                 match_start(prefix, &format!("{qualifier}.{name}"))
             }
@@ -534,6 +780,7 @@ impl Search {
             caller: caller.map(|package| package.id.clone()),
             graph_prepared: false,
             sdk_prepared: false,
+            sdk_match_generation: None,
             seen_paths: HashSet::new(),
             queue: VecDeque::new(),
             jobs: Vec::new(),
@@ -549,7 +796,7 @@ impl Search {
 
     pub(super) fn is_ready(&self, cache: &ImportCache) -> bool {
         self.pending.as_ref().is_none_or(Batch::is_ready)
-            && (!self.waiting_sdk || !cache.inventory.is_loading())
+            && (!self.waiting_sdk || !cache.prewarm.inventory.is_loading())
             && (!self.waiting_scanner || !cache.scanner.busy())
     }
 
@@ -564,6 +811,8 @@ impl Search {
         caps: &CompletionClientCapabilities,
         request: &mut CompletionRead,
     ) -> Result<bool> {
+        let cancelled = snapshot.completion_cancelled();
+        check_optional_cancelled(cancelled)?;
         let workspace = snapshot
             .workspace()
             .expect("import search requires an active graph");
@@ -574,9 +823,9 @@ impl Search {
         {
             let trace = resolver.indexes.trace().cloned();
             let _phase = trace.as_ref().map(|trace| trace.phase("import_catalog"));
-            cache.prepare(generation, workspace);
+            cache.prepare(generation, workspace, cancelled)?;
             if !self.graph_prepared {
-                self.enqueue(&cache.graph, workspace, caller, document);
+                self.enqueue(&cache.graph, workspace, caller, document, cancelled)?;
                 self.graph_prepared = true;
             }
             if !self.sdk_prepared
@@ -586,14 +835,39 @@ impl Search {
                     environment,
                     trace.as_ref(),
                     &mut resolver.indexes,
-                )
+                )?
             {
-                self.enqueue(&sdk, workspace, caller, document);
+                self.enqueue(&sdk, workspace, caller, document, cancelled)?;
+                if matches!(self.kind, SearchKind::Symbols(_))
+                    && let Some(root) = cache
+                        .sdk
+                        .as_ref()
+                        .and_then(|(catalog, _)| catalog.root_key())
+                    && !resolver
+                        .indexes
+                        .documents
+                        .keys()
+                        .chain(
+                            resolver
+                                .indexes
+                                .pending_documents
+                                .into_iter()
+                                .flat_map(|docs| docs.keys()),
+                        )
+                        .any(|key| key.starts_with(root))
+                {
+                    self.sdk_match_generation = resolver
+                        .indexes
+                        .completion
+                        .as_mut()
+                        .and_then(|request| request.trust_completion_sdk_names());
+                }
                 self.sdk_prepared = true;
             }
         }
         if let SearchKind::Path { close } = self.kind {
             for _ in 0..BATCH_SIZE {
+                check_optional_cancelled(cancelled)?;
                 let Some(entry) = self.queue.pop_front() else {
                     break;
                 };
@@ -632,14 +906,19 @@ impl Search {
                 .indexes
                 .trace()
                 .map(|trace| trace.phase("prefilter_batch"));
-            self.pending = cache.scanner.submit(std::mem::take(&mut self.scans));
+            self.pending = cache.scanner.submit(
+                std::mem::take(&mut self.scans),
+                Arc::clone(resolver.indexes.shared_disk),
+            );
         }
         if let Some(batch) = &self.pending {
             if !batch.is_ready() {
                 return Ok(false);
             }
+            let batch = self.pending.take().unwrap();
             self.prefilter_time.take();
             for result in batch.results() {
+                check_optional_cancelled(cancelled)?;
                 if let Some(trace) = resolver.indexes.trace()
                     && result.read
                 {
@@ -671,6 +950,7 @@ impl Search {
             }
         }
         while let Some(file) = self.files.pop_front() {
+            check_optional_cancelled(cancelled)?;
             if !file.skip {
                 self.consume_file(
                     cache,
@@ -682,8 +962,6 @@ impl Search {
                     caps,
                     &file,
                 )?;
-                // The LSP loop can handle a cancellation before the next file.
-                break;
             }
         }
         if self.files.is_empty() {
@@ -701,7 +979,7 @@ impl Search {
 
     fn plan_batch<'w>(
         &mut self,
-        cache: &ImportCache,
+        cache: &mut ImportCache,
         resolver: &mut Resolver<'w, '_>,
         caller: Option<&'w Package>,
         include_tests: bool,
@@ -710,8 +988,10 @@ impl Search {
         let SearchKind::Symbols(query) = &self.kind else {
             unreachable!();
         };
+        let cancelled = resolver.indexes.cancelled;
         let mut scanning = HashSet::new();
         while self.files.len() < BATCH_SIZE {
+            resolver.check_cancelled()?;
             let Some(job) = self
                 .jobs
                 .last_mut()
@@ -721,6 +1001,7 @@ impl Search {
                     break;
                 };
                 let binding = query.binding(&entry, |name| {
+                    resolver.check_cancelled()?;
                     if query.declared.contains(name) {
                         return Ok(true);
                     }
@@ -746,27 +1027,47 @@ impl Search {
                 if entry.package_id.is_some() && caller.is_none() {
                     continue;
                 }
-                let files = entry
+                let drafts = entry
                     .package_id
                     .as_deref()
                     .and_then(|id| resolver.workspace.package(id))
-                    .and_then(|package| resolver.indexes.drafts.get(&package.directory_and_name()))
-                    .map_or_else(
-                        || Rc::clone(&entry.files),
-                        |drafts| {
-                            entry
-                                .files
-                                .iter()
-                                .cloned()
-                                .chain(
-                                    drafts
-                                        .iter()
-                                        .filter(|file| !is_test_source(file))
-                                        .map(|file| ImportFile::new(file)),
-                                )
-                                .collect()
-                        },
-                    );
+                    .and_then(|package| resolver.indexes.drafts.get(&package.directory_and_name()));
+                let (files, names_validated) = if let Some(generation) = self.sdk_match_generation
+                    && entry.prefilter_disk
+                    && drafts.is_none()
+                    && (entry.package_id.is_none()
+                        || cache
+                            .sdk
+                            .as_ref()
+                            .and_then(|(catalog, _)| catalog.root_key())
+                            .is_some_and(|root| entry.directory.starts_with(root)))
+                {
+                    let matcher = query.matcher(&binding, prefix);
+                    cache.matching_sdk_files(&entry, &resolver.indexes, &matcher, generation)?
+                } else {
+                    (
+                        drafts.map_or_else(
+                            || Rc::clone(&entry.files),
+                            |drafts| {
+                                entry
+                                    .files
+                                    .iter()
+                                    .cloned()
+                                    .chain(
+                                        drafts
+                                            .iter()
+                                            .filter(|file| !is_test_source(file))
+                                            .map(|file| ImportFile::new(file)),
+                                    )
+                                    .collect()
+                            },
+                        ),
+                        false,
+                    )
+                };
+                if files.is_empty() {
+                    continue;
+                }
                 let mut weight = Weight::default();
                 entry.weight(resolver.workspace, caller, &mut weight);
                 self.jobs.push(Job {
@@ -775,6 +1076,7 @@ impl Search {
                     weight,
                     files,
                     next_file: 0,
+                    names_validated,
                     names: HashSet::new(),
                 });
                 continue;
@@ -782,12 +1084,21 @@ impl Search {
             let index = job.next_file;
             job.next_file += 1;
             let ImportFile { path, key } = &job.files[index];
-            let mut skip = false;
-            if job.entry.prefilter_disk && !resolver.indexes.documents.contains_key(key) {
-                let matcher = query.matcher(&job.binding, prefix);
-                if let Some(names) = resolver.indexes.disk_names.get(key) {
-                    skip = !names.matches(&matcher);
-                } else if !resolver.indexes.disk_index.contains_key(key)
+            if job.entry.prefilter_disk && !resolver.indexes.has_overlay(key) {
+                let matcher = if job.names_validated {
+                    None
+                } else {
+                    let matcher = query.matcher(&job.binding, prefix);
+                    if let Some(names) = resolver.indexes.cached_completion_names(path, key) {
+                        if !names.matches(&matcher, cancelled) {
+                            continue;
+                        }
+                        None
+                    } else {
+                        Some(matcher)
+                    }
+                };
+                if !resolver.indexes.disk_index.contains_key(key)
                     && !cache.sdk_exports.contains_key(key)
                     && scanning.insert(key.clone())
                 {
@@ -795,15 +1106,14 @@ impl Search {
                         key: key.clone(),
                         path: path.clone(),
                         project: job.entry.project,
-                        elide_bodies: job.entry.elide_bodies,
-                        matcher: matcher.owned(),
+                        matcher: matcher.map(|matcher| matcher.owned()),
                     });
                 }
             }
             self.files.push_back(FileWork {
                 job: self.jobs.len() - 1,
                 index,
-                skip,
+                skip: false,
             });
         }
         Ok(())
@@ -820,6 +1130,16 @@ impl Search {
         caps: &CompletionClientCapabilities,
         file: &FileWork,
     ) -> Result<()> {
+        let cancelled = resolver.indexes.cancelled;
+        let _phase = resolver
+            .indexes
+            .trace()
+            .map(|trace| trace.phase("candidate_expansion"));
+        #[cfg(test)]
+        if let Some(trace) = resolver.indexes.trace() {
+            trace.checkpoint("expand_file", cancelled);
+        }
+        check_optional_cancelled(cancelled)?;
         let SearchKind::Symbols(query) = &self.kind else {
             unreachable!();
         };
@@ -831,24 +1151,27 @@ impl Search {
                 let Some((caller, target)) = caller.zip(resolver.workspace.package(id)) else {
                     return Ok(());
                 };
-                let symbols = resolver
-                    .indexes
-                    .file_index(&file.path)
-                    .ok()
-                    .into_iter()
-                    .flat_map(|index| index.symbols.declarations())
-                    .filter(|(name, symbol)| {
-                        is_exported(name) && allows_symbol(query, &symbol.kind)
-                    })
-                    .filter_map(|(name, symbol)| {
-                        Some((name.to_owned(), symbol.clone(), matcher.match_symbol(name)?))
-                    })
-                    .collect::<Vec<_>>();
-                let _phase = resolver
-                    .indexes
-                    .trace()
-                    .map(|trace| trace.phase("candidate_expansion"));
+                let mut symbols = Vec::new();
+                let index = match resolver.indexes.file_index(&file.path) {
+                    Ok(index) => Some(index),
+                    Err(error) if error.is::<SharedLoadPending>() => return Err(error),
+                    Err(_) => None,
+                };
+                if let Some(index) = index {
+                    for (name, symbol) in index.symbols.declarations() {
+                        check_optional_cancelled(cancelled)?;
+                        if is_exported(name)
+                            && allows_symbol(query, &symbol.kind)
+                            && let Some(matched) = matcher.match_symbol(name)
+                        {
+                            symbols.push((name.to_owned(), symbol.clone(), matched));
+                        }
+                    }
+                }
+                check_optional_cancelled(cancelled)?;
+                let completion_revision = resolver.indexes.completion_revision(&file.path);
                 for (name, symbol, matched) in symbols {
+                    check_optional_cancelled(cancelled)?;
                     if !job.names.insert(name.clone())
                         || matches!(job.binding, Binding::Dot) && query.shadows_dot_name(&name)
                     {
@@ -860,11 +1183,12 @@ impl Search {
                         symbol,
                         receiver: None,
                         method_receiver: None,
+                        completion_revision: completion_revision.clone(),
                     };
                     let candidate = resolved_candidate(
                         resolver,
                         caller,
-                        document.indexed(),
+                        document,
                         &name,
                         &resolved,
                         matched,
@@ -876,9 +1200,15 @@ impl Search {
                 }
             }
             None => {
-                let exports =
-                    cache.exports(&mut resolver.indexes, &file.path, &file.key, &job.entry);
+                let (revision, exports) = cache.exports(
+                    &mut resolver.indexes,
+                    &file.path,
+                    &file.key,
+                    &job.entry,
+                    self.sdk_match_generation,
+                )?;
                 for export in exports.iter() {
+                    check_optional_cancelled(cancelled)?;
                     if !export.allowed(query)
                         || matches!(job.binding, Binding::Dot)
                             && query.shadows_dot_name(&export.name)
@@ -892,7 +1222,7 @@ impl Search {
                         candidates.push(job.decorate(
                             query,
                             prefix,
-                            export.candidate(&file.path, query, matched),
+                            export.candidate(&file.path, revision.clone(), query, matched),
                         ));
                     }
                 }
@@ -903,20 +1233,22 @@ impl Search {
 
     fn enqueue(
         &mut self,
-        entries: &[Importable],
+        entries: &[Rc<Importable>],
         workspace: &Workspace,
         caller: Option<&Package>,
         document: &DocumentSnapshot<'_>,
-    ) {
-        let mut visible = BTreeMap::<&str, &Importable>::new();
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
+        let mut visible = BTreeMap::<&str, &Rc<Importable>>::new();
         let directory = path_key(document.path().parent().unwrap_or_else(|| Path::new("")));
         let test = is_test_source(document.path())
             .then(|| package_name(document.indexed()))
             .flatten();
-        for entry in entries
-            .iter()
-            .filter(|entry| can_import(entry, caller, &directory, test))
-        {
+        for entry in entries {
+            check_optional_cancelled(cancelled)?;
+            if !can_import(entry, caller, &directory, test) {
+                continue;
+            }
             if let (Some(caller), Some(id)) = (caller, &entry.package_id)
                 && !workspace.matches_import_variant(caller, &entry.path, id)
             {
@@ -942,12 +1274,13 @@ impl Search {
                 }
             }
         }
-        self.queue.extend(
-            visible
-                .into_values()
-                .filter(|entry| self.seen_paths.insert(entry.path.clone()))
-                .cloned(),
-        );
+        for entry in visible.into_values() {
+            check_optional_cancelled(cancelled)?;
+            if self.seen_paths.insert(entry.path.clone()) {
+                self.queue.push_back(entry.clone());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1146,7 +1479,13 @@ impl Export {
         !(query.types_only || query.address_of) || self.is_type
     }
 
-    fn candidate(&self, file: &Path, query: &SymbolSearch, matched: Match) -> Candidate {
+    fn candidate(
+        &self,
+        file: &Path,
+        revision: Option<SourceRev>,
+        query: &SymbolSearch,
+        matched: Match,
+    ) -> Candidate {
         let mut candidate = Candidate::new(&self.name, self.description.kind, matched, SYMBOL);
         candidate.detail = self.description.detail.clone();
         candidate.label_suffix = self.description.label_suffix.clone();
@@ -1154,6 +1493,7 @@ impl Export {
         candidate.target = Some(Target {
             file: file.to_owned(),
             range: self.range,
+            revision,
         });
         if let Some(has_parameters) = self.parameters {
             candidate.insert = Insert::Call { has_parameters };
@@ -1167,13 +1507,22 @@ impl Export {
     }
 }
 
-fn sdk_exports(source: &IndexedSource, entry: &Importable) -> Rc<[Export]> {
-    let index = source.declarations();
+fn sdk_exports(
+    index: &FileIndex,
+    entry: &Importable,
+    cancelled: Option<&AtomicBool>,
+    mut describe: impl FnMut(&str, &Symbol, Kind) -> Description,
+) -> Result<Rc<[Export]>> {
     if index.package_name.as_deref() != Some(entry.name.as_str()) {
-        return Rc::from([]);
+        return Ok(Rc::from([]));
     }
     let declarations = &index.symbols;
-    declarations.declarations().filter(|(name, _)| is_exported(name)).map(|(name, symbol)| {
+    let mut exports = Vec::new();
+    for (name, symbol) in declarations.declarations() {
+        check_optional_cancelled(cancelled)?;
+        if !is_exported(name) {
+            continue;
+        }
         let mut braces = false;
         let mut value = None;
         let kind = match &symbol.kind {
@@ -1185,32 +1534,57 @@ fn sdk_exports(source: &IndexedSource, entry: &Importable) -> Rc<[Export]> {
                         && base.is_none_or(|ty| ty.pointers == 0 && matches!(&ty.kind,
                             TypeRefKind::Container(container, _) if !matches!(container.as_ref(), Container::Channel { .. })
                         ));
-                    if details.interface { Kind::INTERFACE } else if base.is_none() { Kind::STRUCT } else { Kind::CLASS }
-                } else { Kind::CLASS }
+                    if details.interface {
+                        Kind::INTERFACE
+                    } else if base.is_none() {
+                        Kind::STRUCT
+                    } else {
+                        Kind::CLASS
+                    }
+                } else {
+                    Kind::CLASS
+                }
             }
             SymbolKind::Function(signature) => {
                 if let [Some(ty)] = signature.results.as_ref() {
-                    value = sdk_type_key(index, &entry.path, ty);
+                    value = sdk_type_key(index, &entry.path, ty, cancelled);
                 }
                 Kind::FUNCTION
             }
             SymbolKind::Value(Some(ty)) => {
-                value = sdk_type_key(index, &entry.path, ty);
+                value = sdk_type_key(index, &entry.path, ty, cancelled);
                 Kind::VARIABLE
             }
             _ => Kind::VARIABLE,
         };
-        let description = describe(source, symbol.range, name, kind, true);
-        let parameters = matches!(symbol.kind, SymbolKind::Function(_)).then_some(description.has_parameters);
-        Export {
-            name: name.to_owned(), range: symbol.range, is_type: matches!(symbol.kind, SymbolKind::Type),
-            description, parameters, braces, value,
-        }
-    }).collect()
+        check_optional_cancelled(cancelled)?;
+        let description = describe(name, symbol, kind);
+        let parameters =
+            matches!(symbol.kind, SymbolKind::Function(_)).then_some(description.has_parameters);
+        exports.push(Export {
+            name: name.to_owned(),
+            range: symbol.range,
+            is_type: matches!(symbol.kind, SymbolKind::Type),
+            description,
+            parameters,
+            braces,
+            value,
+        });
+    }
+    check_optional_cancelled(cancelled)?;
+    Ok(exports.into())
 }
 
-fn sdk_type_key(index: &FileIndex, package: &str, ty: &TypeRef) -> Option<String> {
-    let child = |ty| sdk_type_key(index, package, ty);
+fn sdk_type_key(
+    index: &FileIndex,
+    package: &str,
+    ty: &TypeRef,
+    cancelled: Option<&AtomicBool>,
+) -> Option<String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return None;
+    }
+    let child = |ty| sdk_type_key(index, package, ty, cancelled);
     let key = match &ty.kind {
         TypeRefKind::Named(named) => {
             let owner = if let Some(qualifier) = &named.qualifier {

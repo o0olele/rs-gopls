@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -28,7 +29,9 @@ use crate::{rpc_telemetry, telemetry};
 
 const EDIT_DELAY: Duration = Duration::from_millis(25);
 const MAX_EDIT_WAIT: Duration = Duration::from_millis(100);
+const STAGE2_EDIT_DELAY: Duration = Duration::from_millis(200);
 const STAGE2_BUDGET: Duration = Duration::from_millis(25);
+const STAGE2_INTERACTIVE_BURST: usize = 3;
 const EDIT_ACTIVITY: Duration = Duration::from_secs(2);
 const PULL_BURST: Duration = Duration::from_millis(75);
 const LARGE_DOCUMENT_BYTES: usize = 512 * 1024;
@@ -145,7 +148,7 @@ impl Consumer {
         connection: &Connection,
         error: (ErrorCode, String),
         key: &DiagnosticSnapshotKey,
-        attempt: Option<Attempt>,
+        attempt: Option<DiagnosticProvenance>,
     ) -> Result<()> {
         if telemetry::enabled()
             && let Some(id) = self.id()
@@ -184,7 +187,7 @@ pub(crate) enum Mode {
 struct Pending {
     path: PathBuf,
     waiting_for: PendingInput,
-    consumer: Consumer,
+    subscriber: Subscriber,
 }
 
 enum PendingInput {
@@ -192,9 +195,14 @@ enum PendingInput {
     OpenParse(Option<(u64, i32)>),
 }
 
+struct Subscriber {
+    consumer: Consumer,
+    priority: Option<Priority>,
+}
+
 struct Job {
     path: PathBuf,
-    consumers: Vec<Consumer>,
+    subscribers: Vec<Subscriber>,
     running: Option<Running>,
     stage: DiagnosticStage,
     attempted_preview: bool,
@@ -202,11 +210,10 @@ struct Job {
     continue_pull: bool,
     waiting_for_graph: bool,
     large: bool,
-    foreground: Option<Priority>,
     order: u64,
     run: u64,
     queue: Option<QueueTimes>,
-    last_attempt: Option<Attempt>,
+    last_attempt: Option<DiagnosticProvenance>,
 }
 
 impl Job {
@@ -215,7 +222,27 @@ impl Job {
     }
 
     fn needs_work(&self) -> bool {
-        self.continue_pull || !self.consumers.is_empty()
+        self.continue_pull || !self.subscribers.is_empty()
+    }
+
+    fn foreground(&self) -> Option<Priority> {
+        self.subscribers.iter().filter_map(|sub| sub.priority).max()
+    }
+
+    fn last_interaction(&self) -> Option<u64> {
+        self.subscribers
+            .iter()
+            .filter(|sub| sub.consumer.id().is_some())
+            .filter_map(|sub| sub.priority.map(|priority| priority.request_order))
+            .max()
+    }
+
+    fn subscribe(&mut self, subscriber: Subscriber) {
+        if !subscriber.consumer.is_push()
+            || !self.subscribers.iter().any(|sub| sub.consumer.is_push())
+        {
+            self.subscribers.push(subscriber);
+        }
     }
 
     fn preview_at(&self) -> Option<Instant> {
@@ -277,8 +304,16 @@ impl QueueTimes {
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct Priority {
-    edited: bool,
-    at: Instant,
+    edited_at: Option<Instant>,
+    request_order: u64,
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum QueueRank {
+    Background(Reverse<u64>),
+    Interaction(u64, Reverse<u64>),
+    BackgroundTurn(Reverse<u64>),
+    Preview(Option<Priority>, Reverse<u64>),
 }
 
 struct EditWindow {
@@ -288,8 +323,13 @@ struct EditWindow {
 }
 
 impl EditWindow {
-    fn ready_at(&self) -> Instant {
-        (self.last + EDIT_DELAY).min(self.first + MAX_EDIT_WAIT)
+    fn ready_at(&self, stage: DiagnosticStage) -> Option<Instant> {
+        match stage {
+            DiagnosticStage::Stage1 => {
+                (!self.started).then(|| (self.last + EDIT_DELAY).min(self.first + MAX_EDIT_WAIT))
+            }
+            DiagnosticStage::Stage2 => Some(self.last + STAGE2_EDIT_DELAY),
+        }
     }
 }
 
@@ -316,11 +356,21 @@ enum Lane {
     Fast,
     Reserve,
     Background,
+    Background2,
+    LargePreview,
     Large,
 }
 
 impl Lane {
-    const ALL: [Self; 4] = [Self::Fast, Self::Reserve, Self::Background, Self::Large];
+    const ALL: [Self; 6] = [
+        Self::Fast,
+        Self::Reserve,
+        Self::Background,
+        Self::Background2,
+        Self::LargePreview,
+        Self::Large,
+    ];
+    const STAGE2: [Self; 2] = [Self::Background, Self::Background2];
 
     fn index(self) -> usize {
         self as usize
@@ -331,36 +381,32 @@ impl Lane {
             Self::Fast => "foreground",
             Self::Reserve => "reserve",
             Self::Background => "background",
+            Self::Background2 => "background_2",
+            Self::LargePreview => "large_preview",
             Self::Large => "large",
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct Attempt {
-    provenance: DiagnosticProvenance,
-    stage: DiagnosticStage,
-}
-
-impl Attempt {
+impl DiagnosticProvenance {
     fn fields(self, key: &DiagnosticSnapshotKey) -> Value {
         let document = telemetry::path(&key.path_key);
         json!({
-            "job": self.provenance.job,
-            "run": self.provenance.run,
+            "job": self.job,
+            "run": self.run,
             "path": document,
             "document": document,
             "doc_version": key.version,
             "stage": self.stage.as_str(),
             "context_completeness": if key.partial { "partial" } else { "full" },
             "partial": key.partial,
-            "lane": self.provenance.lane,
+            "lane": self.lane,
         })
     }
 }
 
 struct WorkTrace {
-    attempt: Attempt,
+    attempt: DiagnosticProvenance,
     queue: QueueTimes,
     eligible_at: Instant,
     cancel_requested_at: Arc<Mutex<Option<Instant>>>,
@@ -409,7 +455,10 @@ pub(crate) struct Completed {
     lane: Lane,
     report: Result<Option<DiagnosticReport>>,
     ready_at: Instant,
-    attempt: Option<Attempt>,
+    attempt: Option<DiagnosticProvenance>,
+    published_at: Option<Instant>,
+    #[cfg(test)]
+    stage: DiagnosticStage,
 }
 
 impl Completed {
@@ -430,6 +479,10 @@ impl Completed {
     pub(crate) fn set_ready_at(&mut self, at: Instant) {
         self.ready_at = at;
     }
+
+    pub(crate) fn stage(&self) -> DiagnosticStage {
+        self.stage
+    }
 }
 
 struct Pool {
@@ -439,18 +492,10 @@ struct Pool {
 
 impl Pool {
     fn new() -> Result<Self> {
-        let [
-            (fast, fast_work),
-            (reserve, reserve_work),
-            (normal, normal_work),
-            (large, large_work),
-        ] = std::array::from_fn(|_| bounded::<Work>(1));
+        let channels: [_; Lane::ALL.len()] = std::array::from_fn(|_| bounded::<Work>(1));
+        let send = channels.each_ref().map(|(send, _)| send.clone());
         let (done, receive) = bounded(Lane::ALL.len());
-        for (lane, queue) in
-            Lane::ALL
-                .into_iter()
-                .zip([fast_work, reserve_work, normal_work, large_work])
-        {
+        for (lane, (_, queue)) in Lane::ALL.into_iter().zip(channels) {
             let done = done.clone();
             thread::Builder::new()
                 .name(format!("go-diagnostics-{lane:?}"))
@@ -466,15 +511,26 @@ impl Pool {
                             .as_ref()
                             .map(|_| DiagnosticIo::start(&work.key.path_key));
                         let mut stages = timing.as_ref().map(|_| Stages::default());
+                        let mut shared_disk = telemetry::SharedDiskStats::default();
                         let mut report = if work.cancelled.load(Ordering::Relaxed) {
                             Ok(None)
                         } else {
-                            run_analysis(|| {
-                                work.input.analyze_with_stages(
-                                    work.stage,
-                                    &work.cancelled,
-                                    &mut stages,
-                                )
+                            let context = work
+                                .trace
+                                .as_ref()
+                                .map(|trace| telemetry::Context::diagnostic(trace.attempt));
+                            telemetry::with_context(context, || {
+                                let report = run_analysis(|| {
+                                    work.input.analyze_with_stages(
+                                        work.stage,
+                                        &work.cancelled,
+                                        &mut stages,
+                                    )
+                                });
+                                if context.is_some() {
+                                    shared_disk = telemetry::take_shared_disk_stats();
+                                }
+                                report
                             })
                         };
                         let ready_at = Instant::now();
@@ -494,7 +550,7 @@ impl Pool {
                             fields["cold_dep_reads"] = json!(cold.reads);
                             fields["cold_dep_parses"] = json!(cold.parses);
                             if let Ok(Some(report)) = &mut report {
-                                report.provenance = Some(trace.attempt.provenance);
+                                report.provenance = Some(trace.attempt);
                                 fields["context_completeness"] =
                                     json!(report.context_completeness.as_str());
                                 fields["report_stage"] = json!(report.diagnostic_stage.as_str());
@@ -510,6 +566,7 @@ impl Pool {
                                     json!(stage_fields["context_completeness"] == "partial");
                                 stages.log(stage_fields);
                             }
+                            shared_disk.add_fields(&mut fields);
                             telemetry::emit("diagnostic_worker_done", fields);
                         }
                         if done
@@ -520,6 +577,9 @@ impl Pool {
                                 report,
                                 ready_at,
                                 attempt,
+                                published_at: attempt.and_then(|_| telemetry::now()),
+                                #[cfg(test)]
+                                stage: work.stage,
                             })
                             .is_err()
                         {
@@ -529,10 +589,7 @@ impl Pool {
                 })
                 .context("starting Go diagnostic worker")?;
         }
-        Ok(Self {
-            send: [fast, reserve, normal, large],
-            receive,
-        })
+        Ok(Self { send, receive })
     }
 }
 
@@ -575,6 +632,7 @@ pub(super) struct Diagnostics {
     pool: Option<Pool>,
     slots: [Option<Slot>; Lane::ALL.len()],
     sequence: u64,
+    stage2_interactive_streak: usize,
     edits: HashMap<PathBuf, EditWindow>,
     last_pull: Option<Instant>,
     focus: Option<PathBuf>,
@@ -619,15 +677,12 @@ impl Diagnostics {
 
     pub(super) fn next_deadline(&self) -> Option<Instant> {
         let now = Instant::now();
+        let stage2_available = self.has_stage2_capacity();
         self.jobs
             .iter()
             .filter_map(|(key, job)| {
-                let runnable = (job.runnable() && self.free_lane(job).is_some()).then(|| {
-                    self.edits
-                        .get(&key.path_key)
-                        .filter(|window| !window.started)
-                        .map_or(now, EditWindow::ready_at)
-                });
+                let runnable = (job.runnable() && self.free_lane(job, stage2_available).is_some())
+                    .then(|| self.edit_deadline(key, job.stage).unwrap_or(now));
                 runnable.into_iter().chain(job.preview_at()).min()
             })
             .min()
@@ -674,20 +729,35 @@ impl Diagnostics {
         fallback: bool,
         now: Instant,
     ) -> Result<Option<WorkspaceLoad>> {
+        let subscriber = self.subscriber(&path, consumer, now);
+        let requested = self.submit_subscriber(engine, connection, path, subscriber, fallback)?;
+        self.start_ready(engine, connection, now)?;
+        Ok(requested)
+    }
+
+    fn submit_subscriber(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        path: PathBuf,
+        subscriber: Subscriber,
+        fallback: bool,
+    ) -> Result<Option<WorkspaceLoad>> {
+        let consumer = &subscriber.consumer;
         if consumer.is_push() && (!matches!(self.mode, Mode::Push { .. }) || !engine.is_open(&path))
         {
             return Ok(None);
         }
         let enqueue_push = !consumer.is_push()
             || !self.pending.iter().any(|pending| {
-                pending.consumer.is_push() && path_key(&pending.path) == path_key(&path)
+                pending.subscriber.consumer.is_push() && path_key(&pending.path) == path_key(&path)
             });
         if engine.pending_document_affects(&path) {
             if enqueue_push {
                 self.pending.push(Pending {
                     waiting_for: PendingInput::OpenParse(engine.open_document_identity(&path)),
                     path,
-                    consumer,
+                    subscriber,
                 });
             }
             return Ok(None);
@@ -696,22 +766,24 @@ impl Diagnostics {
         let preparation = engine.prepare_diagnostics(&path, allow_partial || fallback);
         match preparation {
             Ok(DiagnosticsPreparation::Pending(load)) => {
-                let _ = rpc_telemetry::wait(|| engine.workspace_wait_reason(load));
+                let _ = rpc_telemetry::wait_workspace(|| engine.workspace_wait_reason(load));
                 if enqueue_push {
                     match engine.diagnostic_key(&path) {
                         Ok(key) => self.pending.push(Pending {
                             path,
                             waiting_for: PendingInput::Workspace(key),
-                            consumer,
+                            subscriber,
                         }),
-                        Err(error) => consumer.error(connection, internal_error(error))?,
+                        Err(error) => subscriber
+                            .consumer
+                            .error(connection, internal_error(error))?,
                     }
                 }
                 Ok(Some(load))
             }
             Ok(DiagnosticsPreparation::Ready(report)) => {
                 let key = report.snapshot.clone();
-                self.deliver(engine, connection, &path, &key, consumer, true)?;
+                self.deliver_current(engine, connection, &path, &key, subscriber.consumer, true)?;
                 Ok((!fallback && key.partial).then(|| engine.workspace_load()))
             }
             Ok(DiagnosticsPreparation::Cold(key)) => {
@@ -722,10 +794,16 @@ impl Diagnostics {
                     && matches!(consumer, Consumer::Pull { .. })
                     && engine.diagnostic_report_for_key(&key).is_some()
                 {
-                    self.deliver(engine, connection, &path, &key, consumer, true)?;
+                    self.deliver_current(
+                        engine,
+                        connection,
+                        &path,
+                        &key,
+                        subscriber.consumer,
+                        true,
+                    )?;
                     return Ok(key.partial.then(|| engine.workspace_load()));
                 }
-                let foreground = self.priority(&key.path_key, &consumer, now);
                 let waiting_for_graph = key.partial && !fallback;
                 let stage = if preview {
                     DiagnosticStage::Stage1
@@ -733,19 +811,14 @@ impl Diagnostics {
                     DiagnosticStage::Stage2
                 };
                 if let Some(job) = self.jobs.get_mut(&key) {
-                    if !consumer.is_push() || !job.consumers.iter().any(Consumer::is_push) {
-                        job.consumers.push(consumer);
-                    }
+                    job.subscribe(subscriber);
                     if preview && !job.attempted_preview {
                         // A QuickFix can arrive first. Keep its consumer attached
-                        // and put the newly requested preview on a fast slot.
+                        // while running the newly requested preview independently.
                         job.running = None;
                         job.stage = DiagnosticStage::Stage1;
                         job.attempted_preview = true;
                         job.queue = QueueTimes::new(false);
-                    }
-                    if !job.attempted_preview || job.stage == DiagnosticStage::Stage1 {
-                        job.foreground = job.foreground.max(foreground);
                     }
                     job.waiting_for_graph &= waiting_for_graph;
                     if job.runnable() {
@@ -758,7 +831,7 @@ impl Diagnostics {
                         key,
                         Job {
                             path,
-                            consumers: vec![consumer],
+                            subscribers: vec![subscriber],
                             running: None,
                             stage,
                             attempted_preview: preview,
@@ -766,7 +839,6 @@ impl Diagnostics {
                             continue_pull: false,
                             waiting_for_graph,
                             large,
-                            foreground,
                             order: self.sequence,
                             run: self.sequence,
                             queue: QueueTimes::new(
@@ -776,14 +848,20 @@ impl Diagnostics {
                         },
                     );
                 }
-                self.start_ready(engine, connection, now)?;
                 Ok(waiting_for_graph.then(|| engine.workspace_load()))
             }
             Err(error) => {
-                consumer.error(connection, internal_error(error))?;
+                subscriber
+                    .consumer
+                    .error(connection, internal_error(error))?;
                 Ok(None)
             }
         }
+    }
+
+    fn subscriber(&mut self, path: &Path, consumer: Consumer, now: Instant) -> Subscriber {
+        let priority = self.priority(&path_key(path), &consumer, now);
+        Subscriber { consumer, priority }
     }
 
     fn priority(&mut self, path: &Path, consumer: &Consumer, now: Instant) -> Option<Priority> {
@@ -803,37 +881,54 @@ impl Diagnostics {
             Consumer::Actions { .. } => true,
             Consumer::Push(_) => false,
         };
-        recent_edit.map_or_else(
-            || {
-                interactive.then_some(Priority {
-                    edited: false,
-                    at: now,
-                })
-            },
-            |edit| {
-                Some(Priority {
-                    edited: true,
-                    at: edit.last,
-                })
-            },
-        )
+        (interactive || recent_edit.is_some()).then(|| {
+            self.sequence += 1;
+            Priority {
+                edited_at: recent_edit.map(|edit| edit.last),
+                request_order: self.sequence,
+            }
+        })
     }
 
-    fn free_lane(&self, job: &Job) -> Option<Lane> {
+    fn edit_deadline(
+        &self,
+        key: &DiagnosticSnapshotKey,
+        stage: DiagnosticStage,
+    ) -> Option<Instant> {
+        self.edits.get(&key.path_key)?.ready_at(stage)
+    }
+
+    fn has_stage2_capacity(&self) -> bool {
+        Lane::STAGE2
+            .into_iter()
+            .chain([Lane::Large])
+            .filter(|lane| self.slots[lane.index()].is_some())
+            .count()
+            < Lane::STAGE2.len()
+    }
+
+    fn free_lane(&self, job: &Job, stage2_available: bool) -> Option<Lane> {
         let free = |lane: Lane| self.slots[lane.index()].is_none();
-        if job.large {
-            free(Lane::Large).then_some(Lane::Large)
-        } else if job.foreground.is_none() {
-            free(Lane::Background).then_some(Lane::Background)
-        } else if free(Lane::Fast) {
-            Some(Lane::Fast)
-        } else {
-            // Only a cancelled fast ticket opens the reserve. Cancellable
-            // subscribers release old slots even while their loads continue.
-            let abandoned = self.slots[Lane::Fast.index()]
-                .as_ref()
-                .is_some_and(|slot| slot.cancelled.load(Ordering::Relaxed));
-            (abandoned && free(Lane::Reserve)).then_some(Lane::Reserve)
+        match (job.stage, job.large) {
+            (DiagnosticStage::Stage1, true) => {
+                free(Lane::LargePreview).then_some(Lane::LargePreview)
+            }
+            (DiagnosticStage::Stage1, false) if free(Lane::Fast) => Some(Lane::Fast),
+            (DiagnosticStage::Stage1, false) => {
+                // Only cancellation on the fast worker opens the Stage 1 reserve.
+                let abandoned = self.slots[Lane::Fast.index()]
+                    .as_ref()
+                    .is_some_and(|slot| slot.cancelled.load(Ordering::Relaxed));
+                (abandoned && free(Lane::Reserve)).then_some(Lane::Reserve)
+            }
+            // Large jobs keep their isolated worker while sharing the Stage 2 cap.
+            (DiagnosticStage::Stage2, true) => {
+                (stage2_available && free(Lane::Large)).then_some(Lane::Large)
+            }
+            (DiagnosticStage::Stage2, false) if stage2_available => {
+                Lane::STAGE2.into_iter().find(|&lane| free(lane))
+            }
+            (DiagnosticStage::Stage2, false) => None,
         }
     }
 
@@ -861,7 +956,7 @@ impl Diagnostics {
                 job.discard_preview("superseded", "content_modified");
                 fail_attempt(
                     connection,
-                    job.consumers,
+                    job.subscribers,
                     ErrorCode::ContentModified,
                     DIAGNOSTICS_CHANGED,
                     &key,
@@ -873,19 +968,31 @@ impl Diagnostics {
     }
 
     fn next_job(&self, now: Instant) -> Option<(DiagnosticSnapshotKey, Lane)> {
+        let stage2_available = self.has_stage2_capacity();
         self.jobs
             .iter()
             .filter(|(key, job)| {
                 job.runnable()
                     && self
-                        .edits
-                        .get(&key.path_key)
-                        .is_none_or(|edit| edit.started || now >= edit.ready_at())
+                        .edit_deadline(key, job.stage)
+                        .is_none_or(|ready_at| now >= ready_at)
             })
-            .filter_map(|(key, job)| self.free_lane(job).map(|lane| (key, job, lane)))
-            .max_by_key(|(_, job, lane)| match lane {
-                Lane::Fast | Lane::Reserve => (job.foreground, job.order),
-                Lane::Background | Lane::Large => (None, u64::MAX - job.order),
+            .filter_map(|(key, job)| {
+                self.free_lane(job, stage2_available)
+                    .map(|lane| (key, job, lane))
+            })
+            .max_by_key(|(_, job, _)| {
+                let order = Reverse(job.order);
+                if job.stage == DiagnosticStage::Stage1 {
+                    QueueRank::Preview(job.foreground(), order)
+                } else if let Some(last) = job.last_interaction() {
+                    QueueRank::Interaction(last, order)
+                } else if self.stage2_interactive_streak >= STAGE2_INTERACTIVE_BURST {
+                    // Give the oldest eligible background job a turn after a burst.
+                    QueueRank::BackgroundTurn(order)
+                } else {
+                    QueueRank::Background(order)
+                }
             })
             .map(|(key, _, lane)| (key.clone(), lane))
     }
@@ -904,17 +1011,13 @@ impl Diagnostics {
         let trace = job.queue.map(|queue| {
             let queue_ready = queue.context_ready_at.unwrap_or_else(Instant::now);
             let eligible_at = self
-                .edits
-                .get(&key.path_key)
-                .filter(|edit| !edit.started)
-                .map_or(queue_ready, |edit| queue_ready.max(edit.ready_at()));
+                .edit_deadline(&key, job.stage)
+                .map_or(queue_ready, |ready_at| queue_ready.max(ready_at));
             WorkTrace {
-                attempt: Attempt {
-                    provenance: DiagnosticProvenance {
-                        job: ticket,
-                        run: job.run,
-                        lane: lane.as_str(),
-                    },
+                attempt: DiagnosticProvenance {
+                    job: ticket,
+                    run: job.run,
+                    lane: lane.as_str(),
                     stage: job.stage,
                 },
                 queue,
@@ -947,14 +1050,21 @@ impl Diagnostics {
         })();
         match send {
             Ok(()) => {
-                if let Some(edit) = self.edits.get_mut(&key.path_key) {
-                    edit.started = true;
+                let job = self.jobs.get_mut(&key).unwrap();
+                if job.stage == DiagnosticStage::Stage1 {
+                    if let Some(edit) = self.edits.get_mut(&key.path_key) {
+                        edit.started = true;
+                    }
+                } else if job.last_interaction().is_some() {
+                    self.stage2_interactive_streak =
+                        (self.stage2_interactive_streak + 1).min(STAGE2_INTERACTIVE_BURST);
+                } else {
+                    self.stage2_interactive_streak = 0;
                 }
                 self.slots[lane.index()] = Some(Slot {
                     ticket,
                     cancelled: cancelled.clone(),
                 });
-                let job = self.jobs.get_mut(&key).unwrap();
                 job.last_attempt = attempt;
                 job.running = Some(Running {
                     ticket,
@@ -966,7 +1076,7 @@ impl Diagnostics {
                 let mut job = self.jobs.remove(&key).unwrap();
                 job.discard_preview("discarded", "worker_unavailable");
                 let (code, message) = internal_error(error);
-                fail(connection, job.consumers, code, &message)?;
+                fail(connection, job.subscribers, code, &message)?;
             }
         }
         Ok(())
@@ -978,6 +1088,14 @@ impl Diagnostics {
         connection: &Connection,
         completed: Completed,
     ) -> Result<()> {
+        if let (Some(attempt), Some(published_at)) = (completed.attempt, completed.published_at) {
+            let wait = published_at.elapsed();
+            telemetry::with_context(Some(telemetry::Context::diagnostic(attempt)), || {
+                telemetry::event!("diagnostic_worker_result", {
+                    "result_queue_ms": telemetry::millis(wait),
+                });
+            });
+        }
         self.apply_completion(engine, connection, completed)?;
         self.start_ready(engine, connection, Instant::now())
     }
@@ -1028,7 +1146,7 @@ impl Diagnostics {
             completed.log_disposition("superseded", "content_modified");
             return fail_attempt(
                 connection,
-                job.consumers,
+                job.subscribers,
                 ErrorCode::ContentModified,
                 DIAGNOSTICS_CHANGED,
                 key,
@@ -1044,7 +1162,6 @@ impl Diagnostics {
             ..
         } = completed;
         if job.stage == DiagnosticStage::Stage1 {
-            let mut verified = false;
             match report {
                 Ok(Some(report))
                     if report.snapshot == key
@@ -1053,11 +1170,10 @@ impl Diagnostics {
                             || report.context_completeness == ContextCompleteness::Complete
                             || !report.items.is_empty()) =>
                 {
-                    verified = report.context_completeness == ContextCompleteness::Complete;
                     if job
-                        .consumers
+                        .subscribers
                         .iter()
-                        .any(|consumer| consumer.takes_preview(self.mode, key.partial))
+                        .any(|sub| sub.consumer.takes_preview(self.mode, key.partial))
                     {
                         let budget = if key.partial && matches!(self.mode, Mode::Push { .. }) {
                             Duration::ZERO
@@ -1076,9 +1192,6 @@ impl Diagnostics {
                 _ => log_attempt_disposition(&key, attempt, "discarded", "preview_unavailable"),
             }
             job.stage = DiagnosticStage::Stage2;
-            if verified && job.preview.is_some() {
-                job.foreground = None;
-            }
             self.sequence += 1;
             job.order = self.sequence;
             job.queue = QueueTimes::new(job.waiting_for_graph);
@@ -1091,13 +1204,13 @@ impl Diagnostics {
                 job.discard_preview("superseded", "stage2_ready");
                 engine.install_diagnostic_report(report);
                 let mut attempted_delivery = false;
-                for consumer in job.consumers {
+                for Subscriber { consumer, .. } in job.subscribers {
                     if complete
                         || matches!(consumer, Consumer::Actions { .. })
                         || (key.version.is_some() && consumer.takes_preview(self.mode, key.partial))
                     {
                         attempted_delivery = true;
-                        self.deliver(engine, connection, &job.path, &key, consumer, false)?;
+                        self.deliver_current(engine, connection, &job.path, &key, consumer, false)?;
                     } else {
                         consumer.error_for(
                             connection,
@@ -1127,7 +1240,7 @@ impl Diagnostics {
                 log_attempt_disposition(&key, attempt, "discarded", "report_unavailable");
                 fail_attempt(
                     connection,
-                    job.consumers,
+                    job.subscribers,
                     ErrorCode::RequestCanceled,
                     CANCELLED,
                     &key,
@@ -1138,7 +1251,7 @@ impl Diagnostics {
                 job.discard_preview("discarded", "analysis_failed");
                 log_attempt_disposition(&key, attempt, "discarded", "analysis_failed");
                 let (code, message) = internal_error(error);
-                fail_attempt(connection, job.consumers, code, &message, &key, attempt)
+                fail_attempt(connection, job.subscribers, code, &message, &key, attempt)
             }
         }
     }
@@ -1172,7 +1285,7 @@ impl Diagnostics {
             job.discard_preview("superseded", "content_modified");
             return fail_attempt(
                 connection,
-                job.consumers,
+                job.subscribers,
                 ErrorCode::ContentModified,
                 DIAGNOSTICS_CHANGED,
                 key,
@@ -1185,20 +1298,21 @@ impl Diagnostics {
             .is_some_and(|report| report.diagnostic_stage == DiagnosticStage::Stage1)
         {
             let mode = self.mode;
-            for consumer in job.consumers.extract_if(.., |consumer| {
-                !consumer.is_push() && consumer.takes_preview(mode, key.partial)
+            for Subscriber { consumer, .. } in job.subscribers.extract_if(.., |sub| {
+                !sub.consumer.is_push() && sub.consumer.takes_preview(mode, key.partial)
             }) {
                 attempted = true;
                 job.continue_pull |=
-                    self.deliver(engine, connection, &job.path, key, consumer, false)?;
+                    self.deliver_current(engine, connection, &job.path, key, consumer, false)?;
             }
             if let Some(Consumer::Push(uri)) = job
-                .consumers
+                .subscribers
                 .iter()
+                .map(|sub| &sub.consumer)
                 .find(|consumer| consumer.is_push() && consumer.takes_preview(mode, key.partial))
             {
                 attempted = true;
-                self.deliver(
+                self.deliver_current(
                     engine,
                     connection,
                     &job.path,
@@ -1219,7 +1333,9 @@ impl Diagnostics {
         Ok(())
     }
 
-    fn deliver(
+    // The caller checked this snapshot during the current main-loop turn.
+    // Disk documents can still change externally between two deliveries.
+    fn deliver_current(
         &mut self,
         engine: &mut Engine,
         connection: &Connection,
@@ -1229,7 +1345,7 @@ impl Diagnostics {
         cache_hit: bool,
     ) -> Result<bool> {
         let _trace = consumer.id().and_then(|id| rpc_telemetry::step(id, false));
-        if !is_current(engine, path, key) {
+        if key.version.is_none() && !is_current(engine, path, key) {
             consumer.error_for(
                 connection,
                 (ErrorCode::ContentModified, DIAGNOSTICS_CHANGED.into()),
@@ -1345,15 +1461,19 @@ impl Diagnostics {
                 matches!(pending.waiting_for, PendingInput::Workspace(_))
             })
             .collect();
-        for Pending { path, consumer, .. } in ready {
-            let _trace = consumer
+        for Pending {
+            path, subscriber, ..
+        } in ready
+        {
+            let _trace = subscriber
+                .consumer
                 .id()
                 .and_then(|id| rpc_telemetry::step(id, !fallback));
             if fallback {
                 let _ = rpc_telemetry::wait(|| "graph_load_failed");
             }
             requested = self
-                .submit(engine, connection, path, consumer, fallback)?
+                .submit_subscriber(engine, connection, path, subscriber, fallback)?
                 .or(requested);
         }
         self.start_ready(engine, connection, Instant::now())?;
@@ -1368,7 +1488,26 @@ impl Diagnostics {
         self.revalidate_at(engine, connection, Instant::now())
     }
 
+    pub(super) fn revalidate_before_replay(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+    ) -> Result<Option<WorkspaceLoad>> {
+        self.revalidate_jobs(engine, connection, Instant::now())
+    }
+
     fn revalidate_at(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        now: Instant,
+    ) -> Result<Option<WorkspaceLoad>> {
+        let requested = self.revalidate_jobs(engine, connection, now)?;
+        self.start_ready(engine, connection, now)?;
+        Ok(requested)
+    }
+
+    fn revalidate_jobs(
         &mut self,
         engine: &mut Engine,
         connection: &Connection,
@@ -1426,10 +1565,11 @@ impl Diagnostics {
                 continue;
             }
             job.discard_preview("superseded", "content_modified");
-            for consumer in job.consumers {
+            for Subscriber { consumer, .. } in job.subscribers {
                 if consumer.is_push() && engine.is_open(&job.path) {
+                    let subscriber = self.subscriber(&job.path, consumer, now);
                     requested = self
-                        .submit_at(engine, connection, job.path.clone(), consumer, false, now)?
+                        .submit_subscriber(engine, connection, job.path.clone(), subscriber, false)?
                         .or(requested);
                 } else {
                     consumer.error_for(
@@ -1448,9 +1588,12 @@ impl Diagnostics {
                     && !engine.pending_document_affects(&pending.path)
             })
             .collect();
-        for Pending { path, consumer, .. } in ready {
+        for Pending {
+            path, subscriber, ..
+        } in ready
+        {
             requested = self
-                .submit_at(engine, connection, path, consumer, false, now)?
+                .submit_subscriber(engine, connection, path, subscriber, false)?
                 .or(requested);
         }
         let mut republish = Vec::new();
@@ -1473,17 +1616,17 @@ impl Diagnostics {
                 && !self
                     .jobs
                     .get(&current)
-                    .is_some_and(|job| job.consumers.iter().any(Consumer::is_push))
+                    .is_some_and(|job| job.subscribers.iter().any(|sub| sub.consumer.is_push()))
             {
                 republish.push((key.path_key.clone(), uri.clone()));
             }
         }
         for (path, uri) in republish {
+            let subscriber = self.subscriber(&path, Consumer::Push(uri), now);
             requested = self
-                .submit_at(engine, connection, path, Consumer::Push(uri), false, now)?
+                .submit_subscriber(engine, connection, path, subscriber, false)?
                 .or(requested);
         }
-        self.start_ready(engine, connection, now)?;
         Ok(requested)
     }
 
@@ -1498,8 +1641,8 @@ impl Diagnostics {
             .diagnostic_report_for_key(&key)
             .is_some_and(|report| report.diagnostic_stage == DiagnosticStage::Stage2)
         {
-            for consumer in job.consumers {
-                self.deliver(engine, connection, &job.path, &key, consumer, true)?;
+            for Subscriber { consumer, .. } in job.subscribers {
+                self.deliver_current(engine, connection, &job.path, &key, consumer, true)?;
             }
             if job.continue_pull {
                 self.sequence += 1;
@@ -1507,10 +1650,8 @@ impl Diagnostics {
             }
         } else if let Some(existing) = self.jobs.get_mut(&key) {
             existing.continue_pull |= job.continue_pull;
-            for consumer in job.consumers {
-                if !consumer.is_push() || !existing.consumers.iter().any(Consumer::is_push) {
-                    existing.consumers.push(consumer);
-                }
+            for subscriber in job.subscribers {
+                existing.subscribe(subscriber);
             }
         } else {
             if job.stage != DiagnosticStage::Stage2 {
@@ -1527,16 +1668,16 @@ impl Diagnostics {
     pub(super) fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<()> {
         for pending in self
             .pending
-            .extract_if(.., |pending| pending.consumer.id() == Some(id))
+            .extract_if(.., |pending| pending.subscriber.consumer.id() == Some(id))
         {
             fail_pending(connection, pending, ErrorCode::RequestCanceled, CANCELLED)?;
         }
         let mut cancelled = Vec::new();
         self.jobs.retain(|key, job| {
             cancelled.extend(
-                job.consumers
-                    .extract_if(.., |consumer| consumer.id() == Some(id))
-                    .map(|consumer| (key.clone(), consumer, job.last_attempt)),
+                job.subscribers
+                    .extract_if(.., |sub| sub.consumer.id() == Some(id))
+                    .map(|sub| (key.clone(), sub.consumer, job.last_attempt)),
             );
             let keep = job.needs_work();
             if !keep {
@@ -1578,7 +1719,7 @@ impl Diagnostics {
             job.discard_preview("superseded", "document_closed");
             fail_attempt(
                 connection,
-                job.consumers,
+                job.subscribers,
                 ErrorCode::ContentModified,
                 DIAGNOSTICS_CHANGED,
                 &key,
@@ -1602,7 +1743,7 @@ impl Diagnostics {
             job.discard_preview(delivery, reason);
             fail_attempt(
                 connection,
-                job.consumers,
+                job.subscribers,
                 code,
                 message,
                 &key,
@@ -1634,6 +1775,10 @@ fn report_fields(report: &DiagnosticReport) -> Value {
         provenance.map(|source| source.lane),
     );
     fields["run"] = json!(provenance.map(|source| source.run));
+    fields["report_stage"] = json!(report.diagnostic_stage.as_str());
+    if let Some(attempt) = provenance {
+        fields["stage"] = json!(attempt.stage.as_str());
+    }
     fields
 }
 
@@ -1651,7 +1796,7 @@ fn delivery_fields(report: &DiagnosticReport, consumer: &Consumer, cache_hit: bo
     fields
 }
 
-fn error_fields(key: &DiagnosticSnapshotKey, attempt: Option<Attempt>) -> Value {
+fn error_fields(key: &DiagnosticSnapshotKey, attempt: Option<DiagnosticProvenance>) -> Value {
     let mut fields = if let Some(attempt) = attempt {
         attempt.fields(key)
     } else {
@@ -1686,7 +1831,7 @@ fn log_report_disposition(report: &DiagnosticReport, delivery: &'static str, rea
 
 fn log_attempt_disposition(
     key: &DiagnosticSnapshotKey,
-    attempt: Option<Attempt>,
+    attempt: Option<DiagnosticProvenance>,
     delivery: &'static str,
     reason: &'static str,
 ) {
@@ -1701,15 +1846,14 @@ fn fail_pending(
     code: ErrorCode,
     message: &str,
 ) -> Result<()> {
+    let consumer = pending.subscriber.consumer;
     match pending.waiting_for {
         PendingInput::Workspace(key) => {
-            pending
-                .consumer
-                .error_for(connection, (code, message.into()), &key, None)
+            consumer.error_for(connection, (code, message.into()), &key, None)
         }
         PendingInput::OpenParse(identity) => {
             if telemetry::enabled()
-                && let Some(id) = pending.consumer.id()
+                && let Some(id) = consumer.id()
             {
                 let (delivery, reason) = error_disposition(code);
                 rpc_telemetry::diagnostic_response(
@@ -1727,11 +1871,11 @@ fn fail_pending(
                         "diagnostic_codes": {},
                         "delivery": delivery,
                         "reason": reason,
-                        "transport": pending.consumer.transport(),
+                        "transport": consumer.transport(),
                     }),
                 );
             }
-            pending.consumer.error(connection, (code, message.into()))
+            consumer.error(connection, (code, message.into()))
         }
     }
 }
@@ -1756,11 +1900,11 @@ fn current_key(engine: &mut Engine, path: &Path) -> Option<DiagnosticSnapshotKey
 
 fn fail(
     connection: &Connection,
-    consumers: Vec<Consumer>,
+    subscribers: Vec<Subscriber>,
     code: ErrorCode,
     message: &str,
 ) -> Result<()> {
-    for consumer in consumers {
+    for Subscriber { consumer, .. } in subscribers {
         consumer.error(connection, (code, message.into()))?;
     }
     Ok(())
@@ -1768,13 +1912,13 @@ fn fail(
 
 fn fail_attempt(
     connection: &Connection,
-    consumers: Vec<Consumer>,
+    subscribers: Vec<Subscriber>,
     code: ErrorCode,
     message: &str,
     key: &DiagnosticSnapshotKey,
-    attempt: Option<Attempt>,
+    attempt: Option<DiagnosticProvenance>,
 ) -> Result<()> {
-    for consumer in consumers {
+    for Subscriber { consumer, .. } in subscribers {
         consumer.error_for(connection, (code, message.into()), key, attempt)?;
     }
     Ok(())
@@ -1797,12 +1941,10 @@ mod tests {
         let enqueued_at = Instant::now();
         let after = |millis| enqueued_at + Duration::from_millis(millis);
         let trace = WorkTrace {
-            attempt: Attempt {
-                provenance: DiagnosticProvenance {
-                    job: 2,
-                    run: 1,
-                    lane: "foreground",
-                },
+            attempt: DiagnosticProvenance {
+                job: 2,
+                run: 1,
+                lane: "foreground",
                 stage: DiagnosticStage::Stage1,
             },
             queue: QueueTimes {
@@ -1929,6 +2071,8 @@ mod tests {
                 report: Ok(report),
                 ready_at: self.now,
                 attempt: None,
+                published_at: None,
+                stage: work.stage,
             });
         }
 
@@ -1941,6 +2085,8 @@ mod tests {
                 report,
                 ready_at: self.now,
                 attempt: None,
+                published_at: None,
+                stage: work.stage,
             });
         }
 
@@ -1984,6 +2130,15 @@ mod tests {
         }
     }
 
+    fn actions(id: i32, path: &Path) -> Consumer {
+        Consumer::Actions {
+            id: id.into(),
+            uri: path_uri(path).unwrap(),
+            range: Range::default(),
+            only: Some(vec![CodeActionKind::QUICKFIX]),
+        }
+    }
+
     fn unresolved(name: &str) -> DiagnosticItem {
         DiagnosticItem::new(
             DiagnosticCode::NameUnresolved,
@@ -1994,61 +2149,94 @@ mod tests {
     }
 
     #[test]
-    fn large_and_normal_work_do_not_take_the_fast_or_cancellation_reserve_slots() {
-        let mut fixture = Fixture::new(Mode::Push { versioned: true });
+    fn blocked_stage2_and_large_work_do_not_take_fast_or_reserve() {
+        let mut fixture = Fixture::new(Mode::Pull { refresh: true });
         let text = "package sample\nvar _ = Missing\n";
-        let large = fixture.open(
-            "large.go",
-            &format!(
-                "package sample\nfunc generated() {{\n{}}}\n",
-                "_ = 0\n".repeat(350_000)
-            ),
-            1,
-        );
-        let parsed = fixture.engine.open_parse_wake().recv().unwrap();
-        fixture.engine.complete_open_parse(parsed).unwrap();
+        let large_text = format!("package sample\n//{}\n", " ".repeat(LARGE_DOCUMENT_BYTES));
+        let large = fixture.open("large.go", &large_text, 1);
+        let large_preview = fixture.open("large_preview.go", &large_text, 1);
+        for _ in 0..2 {
+            let parsed = fixture.engine.open_parse_wake().recv().unwrap();
+            fixture.engine.complete_open_parse(parsed).unwrap();
+        }
         let background = fixture.open("background.go", text, 1);
         let edited = fixture.open("edited.go", text, 1);
-        fixture.install_graph(&["large.go", "background.go", "edited.go"]);
-        let push = |path: &Path| Consumer::Push(path_uri(path).unwrap());
+        fixture.install_graph(&["large.go", "large_preview.go", "background.go", "edited.go"]);
 
-        assert!(fixture.submit(&large, push(&large)).is_none());
+        assert!(fixture.submit(&large, actions(1, &large)).is_none());
         let large_work = fixture.work(Lane::Large);
-        assert!(fixture.submit(&background, push(&background)).is_none());
+        assert_eq!(large_work.stage, DiagnosticStage::Stage2);
+        assert!(
+            fixture
+                .submit(&background, actions(2, &background))
+                .is_none()
+        );
         let background_work = fixture.work(Lane::Background);
+        assert_eq!(background_work.stage, DiagnosticStage::Stage2);
+        fixture.submit(&large_preview, pull(5, None));
+        let large_fast_report = fixture.work(Lane::LargePreview);
+        assert_eq!(large_fast_report.stage, DiagnosticStage::Stage1);
+        assert!(fixture.no_work(Lane::Fast));
 
-        fixture.diagnostics.note_edit(&edited, fixture.now);
-        fixture.submit(&edited, push(&edited));
+        fixture.edit(&edited, text, 2);
+        fixture.submit(&edited, pull(3, None));
         assert!(fixture.no_work(Lane::Fast));
         fixture.advance(EDIT_DELAY);
         let old = fixture.work(Lane::Fast);
         assert_eq!(old.stage, DiagnosticStage::Stage1);
 
-        fixture.edit(&edited, text, 2);
+        fixture.edit(&edited, text, 3);
+        fixture.submit(&edited, pull(4, None));
+        assert_eq!(fixture.response(3).error.unwrap().code, -32801);
         assert!(old.cancelled.load(Ordering::Relaxed));
         assert!(!large_work.cancelled.load(Ordering::Relaxed));
         assert!(!background_work.cancelled.load(Ordering::Relaxed));
+        assert!(fixture.no_work(Lane::Reserve));
         fixture.advance(EDIT_DELAY);
         let current = fixture.work(Lane::Reserve);
         assert_eq!(current.stage, DiagnosticStage::Stage1);
-        assert_eq!(current.key.version, Some(2));
-        fixture.run(Lane::Reserve, current);
+        assert_eq!(current.key.version, Some(3));
+        fixture.finish(Lane::Reserve, current, vec![unresolved("Missing")]);
         fixture.advance(STAGE2_BUDGET);
-        let fast_push = fixture.push();
-        assert_eq!(fast_push["version"], 2);
-        assert_eq!(fast_push["diagnostics"][0]["code"], "name.unresolved");
+        let preview = fixture.response(4).result.unwrap();
+        assert_eq!(preview["items"][0]["message"], "Undefined Missing");
 
+        let stale_key = old.key.clone();
         fixture.finish(Lane::Fast, old, vec![unresolved("Stale")]);
+        assert!(
+            fixture
+                .engine
+                .diagnostic_report_for_key(&stale_key)
+                .is_none()
+        );
         assert!(fixture.client.receiver.is_empty());
+        fixture.advance(STAGE2_EDIT_DELAY - EDIT_DELAY - STAGE2_BUDGET);
+        assert!(fixture.no_work(Lane::Background2));
+        assert!(fixture.no_work(Lane::Fast));
         fixture.finish(Lane::Background, background_work, vec![]);
+        assert_eq!(fixture.response(2).result.unwrap(), json!([]));
         let promoted = fixture.work(Lane::Background);
-        assert_eq!(promoted.key.version, Some(2));
+        assert_eq!(promoted.key.version, Some(3));
         assert_eq!(promoted.stage, DiagnosticStage::Stage2);
         fixture.finish(Lane::Background, promoted, vec![unresolved("Missing")]);
+        assert!(fixture.diagnostics.drain_refresh().is_empty());
         assert!(
             fixture.client.receiver.is_empty(),
-            "equal terminal content must not publish twice"
+            "each pull receives one response"
         );
+
+        fixture.finish(Lane::LargePreview, large_fast_report, vec![]);
+        fixture.advance(STAGE2_BUDGET);
+        assert_eq!(fixture.response(5).result.unwrap()["items"], json!([]));
+        assert!(fixture.no_work(Lane::Background));
+        fixture.finish(Lane::Large, large_work, vec![]);
+        assert_eq!(fixture.response(1).result.unwrap(), json!([]));
+        let large_terminal = fixture.work(Lane::Large);
+        assert_eq!(large_terminal.key.path_key, path_key(&large_preview));
+        assert_eq!(large_terminal.stage, DiagnosticStage::Stage2);
+        fixture.finish(Lane::Large, large_terminal, vec![]);
+        assert!(fixture.diagnostics.drain_refresh().is_empty());
+        assert!(fixture.client.receiver.is_empty());
     }
 
     #[test]
@@ -2070,32 +2258,56 @@ mod tests {
         assert_eq!(work.key.version, Some(6));
         fixture.finish(Lane::Fast, work, vec![unresolved("Missing")]);
 
-        let complete = fixture.work(Lane::Background);
-        assert_eq!(complete.key.version, Some(6));
+        assert!(fixture.no_work(Lane::Background));
+        assert!(fixture.no_work(Lane::Background2));
         assert!(fixture.client.receiver.is_empty());
-        fixture.finish(Lane::Background, complete, vec![]);
+        fixture.advance(STAGE2_BUDGET);
         assert_eq!(fixture.push()["version"], 6);
+        let before_stage2 =
+            start + Duration::from_millis(80) + STAGE2_EDIT_DELAY - Duration::from_millis(1);
+        fixture.advance(before_stage2 - fixture.now);
+        assert!(fixture.no_work(Lane::Background));
+        fixture.advance(Duration::from_millis(1));
+        let old = fixture.work(Lane::Background);
+        assert_eq!(old.key.version, Some(6));
+        assert_eq!(old.stage, DiagnosticStage::Stage2);
+
+        fixture.edit(&path, text, 7);
+        assert!(old.cancelled.load(Ordering::Relaxed));
+        let stale_key = old.key.clone();
+        let previous = fixture
+            .engine
+            .diagnostic_report_for_key(&stale_key)
+            .cloned();
+        fixture.finish(Lane::Background, old, vec![unresolved("Stale")]);
+        assert_eq!(
+            fixture.engine.diagnostic_report_for_key(&stale_key),
+            previous.as_ref()
+        );
+
+        fixture.advance(EDIT_DELAY);
+        let latest = fixture.work(Lane::Fast);
+        assert_eq!(latest.key.version, Some(7));
+        fixture.finish(Lane::Fast, latest, vec![unresolved("Missing")]);
+        fixture.advance(STAGE2_BUDGET);
+        assert_eq!(fixture.push()["version"], 7);
+        fixture.advance(STAGE2_EDIT_DELAY - EDIT_DELAY - STAGE2_BUDGET);
+        let terminal = fixture.work(Lane::Background);
+        assert_eq!(terminal.key.version, Some(7));
+        fixture.finish(Lane::Background, terminal, vec![unresolved("Missing")]);
         assert!(fixture.client.receiver.is_empty());
     }
 
     #[test]
     fn client_cancellation_wakes_already_queued_foreground_work() {
-        let mut fixture = Fixture::new(Mode::Pull { refresh: false });
+        let mut fixture = Fixture::new(Mode::Pull { refresh: true });
         let first = fixture.open("a.go", "package sample\n", 1);
         let next = fixture.open("b.go", "package sample\n", 1);
         fixture.install_graph(&["a.go", "b.go"]);
 
         fixture.submit(&first, pull(1, None));
         let blocked = fixture.work(Lane::Fast);
-        fixture.submit(
-            &next,
-            Consumer::Actions {
-                id: 2.into(),
-                uri: path_uri(&next).unwrap(),
-                range: Range::default(),
-                only: Some(vec![CodeActionKind::QUICKFIX]),
-            },
-        );
+        fixture.submit(&next, pull(2, None));
         assert!(fixture.diagnostics.next_deadline().is_none());
         assert!(fixture.no_work(Lane::Reserve));
 
@@ -2109,8 +2321,9 @@ mod tests {
         fixture.advance(Duration::ZERO);
         let ready = fixture.work(Lane::Reserve);
         assert_eq!(ready.key.path_key, path_key(&next));
-        fixture.run(Lane::Reserve, ready);
-        assert_eq!(fixture.response(2).result.unwrap(), serde_json::json!([]));
+        fixture.finish(Lane::Reserve, ready, vec![]);
+        fixture.advance(STAGE2_BUDGET);
+        assert_eq!(fixture.response(2).result.unwrap()["items"], json!([]));
 
         fixture.finish(Lane::Fast, blocked, vec![]);
         assert!(fixture.client.receiver.is_empty());
@@ -2132,9 +2345,10 @@ mod tests {
             },
         );
         fixture.submit(&path, pull(3, None));
-        let work = fixture.work(Lane::Fast);
+        let work = fixture.work(Lane::Background);
         assert_eq!(work.stage, DiagnosticStage::Stage2);
-        assert!(fixture.no_work(Lane::Background));
+        assert!(fixture.no_work(Lane::Fast));
+        assert!(fixture.no_work(Lane::Background2));
         fixture
             .diagnostics
             .cancel(&fixture.server, &1.into())
@@ -2142,7 +2356,7 @@ mod tests {
         assert!(!work.cancelled.load(Ordering::Relaxed));
         assert_eq!(fixture.response(1).error.unwrap().code, -32800);
 
-        fixture.run(Lane::Fast, work);
+        fixture.run(Lane::Background, work);
         assert_eq!(
             fixture.response(2).result.unwrap()[0]["title"],
             "Replace unused variable 'unused' with '_'"
@@ -2156,6 +2370,69 @@ mod tests {
             .cancel(&fixture.server, &4.into())
             .unwrap();
         assert!(fixture.client.receiver.is_empty());
+    }
+
+    #[test]
+    fn stage2_runs_two_jobs_and_balances_latest_subscriptions_with_background_work() {
+        let mut fixture = Fixture::new(Mode::Push { versioned: false });
+        let text = "package sample\n";
+        let first = fixture.open("first.go", text, 1);
+        let second = fixture.open("second.go", text, 1);
+        let ordinary = fixture.open("ordinary.go", text, 1);
+        let older = fixture.open("older.go", text, 1);
+        let newer = fixture.open("newer.go", text, 1);
+        fixture.install_graph(&[
+            "first.go",
+            "second.go",
+            "ordinary.go",
+            "older.go",
+            "newer.go",
+        ]);
+
+        fixture.submit(&first, actions(1, &first));
+        fixture.submit(&second, actions(2, &second));
+        let first_work = fixture.work(Lane::Background);
+        let second_work = fixture.work(Lane::Background2);
+        assert_ne!(first_work.ticket, second_work.ticket);
+        assert_eq!(first_work.stage, DiagnosticStage::Stage2);
+        assert_eq!(second_work.stage, DiagnosticStage::Stage2);
+
+        fixture.submit(&ordinary, Consumer::Push(path_uri(&ordinary).unwrap()));
+        fixture.submit(&older, pull(3, None));
+        fixture.advance(PULL_BURST);
+        fixture.submit(&newer, pull(4, None));
+        fixture.advance(PULL_BURST);
+        fixture.submit(&older, pull(5, None));
+        fixture
+            .diagnostics
+            .cancel(&fixture.server, &5.into())
+            .unwrap();
+        assert_eq!(fixture.response(5).error.unwrap().code, -32800);
+        assert!(fixture.no_work(Lane::Fast));
+        assert!(fixture.no_work(Lane::Reserve));
+        assert!(fixture.diagnostics.next_deadline().is_none());
+
+        fixture.finish(Lane::Background2, second_work, vec![]);
+        assert_eq!(fixture.response(2).result.unwrap(), json!([]));
+        let newest = fixture.work(Lane::Background2);
+        assert_eq!(newest.key.path_key, path_key(&newer));
+
+        fixture.finish(Lane::Background2, newest, vec![]);
+        assert_eq!(fixture.response(4).result.unwrap()["items"], json!([]));
+        let background_turn = fixture.work(Lane::Background2);
+        assert_eq!(background_turn.key.path_key, path_key(&ordinary));
+
+        fixture.finish(Lane::Background2, background_turn, vec![]);
+        assert_eq!(fixture.push()["uri"], json!(path_uri(&ordinary).unwrap()));
+        let queued = fixture.work(Lane::Background2);
+        assert_eq!(queued.key.path_key, path_key(&older));
+        fixture.finish(Lane::Background2, queued, vec![]);
+        assert_eq!(fixture.response(3).result.unwrap()["items"], json!([]));
+
+        fixture.finish(Lane::Background, first_work, vec![]);
+        assert_eq!(fixture.response(1).result.unwrap(), json!([]));
+        assert!(fixture.client.receiver.is_empty());
+        assert!(fixture.diagnostics.slots.iter().all(Option::is_none));
     }
 
     #[test]
@@ -2256,16 +2533,69 @@ mod tests {
             .unwrap();
         assert!(partial.cancelled.load(Ordering::Relaxed));
         assert!(fixture.client.receiver.is_empty());
-        let full = fixture.work(Lane::Reserve);
+        let full = fixture.work(Lane::Background);
         assert!(!full.key.partial);
         assert_eq!(full.stage, DiagnosticStage::Stage2);
         fixture.finish(Lane::Fast, partial, vec![]);
         assert!(fixture.client.receiver.is_empty());
-        fixture.finish(Lane::Reserve, full, vec![unresolved("Missing")]);
+        fixture.finish(Lane::Background, full, vec![unresolved("Missing")]);
         assert_eq!(
             fixture.response(1).result.unwrap()["items"][0]["code"],
             "name.unresolved"
         );
+        assert!(fixture.client.receiver.is_empty());
+    }
+
+    #[test]
+    fn graph_replay_prioritizes_the_latest_subscribers_across_resumed_jobs() {
+        let mut fixture = Fixture::new(Mode::Pull { refresh: true });
+        let text = "package sample\n";
+        let partial_path = fixture.open("partial.go", text, 1);
+        let earlier_path = fixture.open("earlier.go", text, 1);
+        let latest_path = fixture.open("latest.go", text, 1);
+        assert!(fixture.submit(&partial_path, pull(1, None)).is_some());
+        let partial = fixture.work(Lane::Fast);
+        assert!(partial.key.partial);
+        assert!(
+            fixture
+                .submit(&earlier_path, actions(2, &earlier_path))
+                .is_some()
+        );
+        assert!(
+            fixture
+                .submit(&latest_path, actions(3, &latest_path))
+                .is_some()
+        );
+        assert_eq!(fixture.diagnostics.pending_count(), 2);
+
+        fixture.install_graph(&["partial.go", "earlier.go", "latest.go"]);
+        fixture
+            .diagnostics
+            .revalidate_before_replay(&mut fixture.engine, &fixture.server)
+            .unwrap();
+        assert!(partial.cancelled.load(Ordering::Relaxed));
+        fixture
+            .diagnostics
+            .replay(&mut fixture.engine, &fixture.server, false)
+            .unwrap();
+        assert!(fixture.no_work(Lane::Reserve));
+        let latest = fixture.work(Lane::Background);
+        let earlier = fixture.work(Lane::Background2);
+        assert_eq!(latest.key.path_key, path_key(&latest_path));
+        assert_eq!(earlier.key.path_key, path_key(&earlier_path));
+
+        fixture.finish(Lane::Fast, partial, vec![]);
+        assert!(fixture.client.receiver.is_empty());
+        fixture.finish(Lane::Background, latest, vec![]);
+        assert_eq!(fixture.response(3).result.unwrap(), json!([]));
+        let promoted = fixture.work(Lane::Background);
+        assert_eq!(promoted.key.path_key, path_key(&partial_path));
+        assert!(!promoted.key.partial);
+        assert_eq!(promoted.stage, DiagnosticStage::Stage2);
+        fixture.finish(Lane::Background, promoted, vec![]);
+        assert_eq!(fixture.response(1).result.unwrap()["items"], json!([]));
+        fixture.finish(Lane::Background2, earlier, vec![]);
+        assert_eq!(fixture.response(2).result.unwrap(), json!([]));
         assert!(fixture.client.receiver.is_empty());
     }
 
@@ -2278,9 +2608,9 @@ mod tests {
                 .submit(&path, Consumer::Push(path_uri(&path).unwrap()))
                 .is_some()
         );
-        let cold = fixture.work(Lane::Background);
+        let cold = fixture.work(Lane::Fast);
         assert_eq!(cold.stage, DiagnosticStage::Stage1);
-        fixture.run(Lane::Background, cold);
+        fixture.run(Lane::Fast, cold);
         fixture.advance(STAGE2_BUDGET);
         assert_eq!(fixture.push()["diagnostics"], serde_json::json!([]));
 
@@ -2299,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_sibling_keeps_terminal_report_on_the_foreground_lane() {
+    fn cold_sibling_withholds_unverified_preview_but_terminal_uses_stage2_pool() {
         let mut fixture = Fixture::new(Mode::Pull { refresh: true });
         let path = fixture.open("a.go", "package sample\nvar _ = Missing\n", 1);
         fixture
@@ -2311,10 +2641,10 @@ mod tests {
         fixture.run(Lane::Fast, fast);
         fixture.advance(STAGE2_BUDGET);
         assert!(fixture.client.receiver.is_empty());
-        assert!(fixture.no_work(Lane::Background));
-        let terminal = fixture.work(Lane::Fast);
+        assert!(fixture.no_work(Lane::Fast));
+        let terminal = fixture.work(Lane::Background);
         assert_eq!(terminal.stage, DiagnosticStage::Stage2);
-        fixture.run(Lane::Fast, terminal);
+        fixture.run(Lane::Background, terminal);
         assert_eq!(
             fixture.response(1).result.unwrap()["items"][0]["code"],
             "name.unresolved"
@@ -2368,22 +2698,24 @@ mod tests {
         let path = fixture.open("a.go", "package sample\n", 1);
         fixture.install_graph(&["a.go"]);
         fixture.submit(&path, pull(1, None));
-        let work = fixture.work(Lane::Fast);
+        let work = fixture.work(Lane::Background);
         fixture.complete(Completed {
             key: work.key,
             ticket: work.ticket,
-            lane: Lane::Fast,
+            lane: Lane::Background,
             report: run_analysis(|| panic!("injected analysis panic")),
             ready_at: fixture.now,
             attempt: None,
+            published_at: None,
+            stage: work.stage,
         });
         assert_eq!(
             fixture.response(1).error.unwrap().code,
             ErrorCode::InternalError as i32
         );
         fixture.submit(&path, pull(2, None));
-        let next = fixture.work(Lane::Fast);
-        fixture.run(Lane::Fast, next);
+        let next = fixture.work(Lane::Background);
+        fixture.run(Lane::Background, next);
         assert_eq!(
             fixture.response(2).result.unwrap()["items"],
             serde_json::json!([])
@@ -2391,7 +2723,7 @@ mod tests {
     }
 
     #[test]
-    fn two_cancelled_foreground_loads_do_not_block_the_next_pull() {
+    fn two_cancelled_stage2_loads_release_their_own_slots() {
         use crate::semantic::CacheEvent;
 
         let mut fixture = Fixture::new(Mode::Pull { refresh: false });
@@ -2414,7 +2746,7 @@ mod tests {
                 }
             })));
 
-        for (id, path, lane) in [(1, first, Lane::Fast), (2, second, Lane::Reserve)] {
+        for (id, path, lane) in [(1, first, Lane::Background), (2, second, Lane::Background2)] {
             fixture.now += PULL_BURST;
             fixture.submit(&path, pull(id, None));
             assert_eq!(
@@ -2450,13 +2782,13 @@ mod tests {
         let preview = fixture.work(Lane::Fast);
         fixture.finish_work(Lane::Fast, preview, None);
 
-        let complete = fixture.work(Lane::Fast);
+        let complete = fixture.work(Lane::Background);
         assert_eq!(complete.stage, DiagnosticStage::Stage2);
         fixture.submit(&path, pull(2, None));
         fixture.advance(STAGE2_BUDGET);
-        assert!(fixture.no_work(Lane::Background));
+        assert!(fixture.no_work(Lane::Fast));
         assert!(fixture.client.receiver.is_empty());
-        fixture.finish(Lane::Fast, complete, vec![unresolved("Missing")]);
+        fixture.finish(Lane::Background, complete, vec![unresolved("Missing")]);
         assert_eq!(fixture.response(1).result, fixture.response(2).result);
         assert!(fixture.diagnostics.drain_refresh().is_empty());
         assert!(fixture.client.receiver.is_empty());
@@ -2474,12 +2806,13 @@ mod tests {
 
         fixture.edit(&dependency, "package sample\nvar Other int\n", 2);
         assert!(old.cancelled.load(Ordering::Relaxed));
+        let current = fixture.work(Lane::Background2);
         fixture.finish(Lane::Background, old, vec![]);
+        assert!(fixture.engine.diagnostic_report_for_key(&old_key).is_none());
         assert!(fixture.client.receiver.is_empty());
-        let current = fixture.work(Lane::Background);
         assert!(old_key.same_document(&current.key));
         assert_ne!(old_key, current.key);
-        fixture.finish(Lane::Background, current, vec![unresolved("Name")]);
+        fixture.finish(Lane::Background2, current, vec![unresolved("Name")]);
         let published = fixture.push();
         assert_eq!(published["version"], 1);
         assert_eq!(published["diagnostics"][0]["message"], "Undefined Name");

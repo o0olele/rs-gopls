@@ -1,6 +1,9 @@
-use lsp_types::request::WorkspaceDiagnosticRefresh;
+use lsp_types::{Position, Range, TextEdit, request::WorkspaceDiagnosticRefresh};
+use std::sync::{Arc, Mutex};
 
 use super::*;
+use crate::semantic::CacheEvent;
+use crate::semantic::diagnostics::{DiagnosticFixData, DiagnosticStage};
 
 const CHANGED: &str = "package sample\nfunc f() { _ = Missing }\nfunc g() { unused := 1 }\n";
 const EQUIVALENT: &str = "package sample\nfunc f() { _ = Missing }\n";
@@ -62,13 +65,25 @@ fn delivery_deadline(session: &mut Session) -> Instant {
 }
 
 fn finish_stage1(session: &mut Session) {
+    finish_stage1_at(session, Instant::now() + Duration::from_secs(1));
+}
+
+fn finish_stage1_at(session: &mut Session, ready: Instant) {
     let mut completed = session.take_diagnostic_completion();
-    completed.set_ready_at(Instant::now() + Duration::from_secs(1));
+    assert_eq!(completed.stage(), DiagnosticStage::Stage1);
+    completed.set_ready_at(ready);
     session.complete_diagnostic(completed);
+}
+
+fn finish_edited_preview(session: &mut Session) {
+    let ready = delivery_deadline(session);
+    finish_stage1_at(session, ready);
+    delivery_deadline(session);
 }
 
 fn finish_stage2_within_budget(session: &mut Session) {
     let mut completed = session.take_diagnostic_completion();
+    assert_eq!(completed.stage(), DiagnosticStage::Stage2);
     if let Some(deadline) = session.running().scheduler.diagnostic_deadline() {
         completed.set_ready_at(deadline - Duration::from_millis(1));
     }
@@ -118,6 +133,374 @@ fn close(session: &mut Session, path: &Path) {
         DidCloseTextDocument::METHOD,
         json!({ "textDocument": { "uri": path_uri(path).unwrap() } }),
     );
+}
+
+fn code_actions(
+    session: &mut Session,
+    id: i32,
+    path: &Path,
+    range: Range,
+    diagnostics: &[Value],
+    only: Option<&str>,
+) -> Vec<Value> {
+    let mut context = json!({ "diagnostics": diagnostics });
+    if let Some(kind) = only {
+        context["only"] = json!([kind]);
+    }
+    session.request(
+        id,
+        CodeActionRequest::METHOD,
+        json!({
+            "textDocument": { "uri": path_uri(path).unwrap() },
+            "range": range,
+            "context": context,
+        }),
+    );
+    session
+        .reply(id)
+        .result
+        .as_ref()
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn token(session: &mut Session, path: &Path, token: &str) -> Range {
+    let mut snapshot = session.running().engine.snapshot();
+    let document = snapshot.document(path).unwrap().unwrap();
+    let start = document.text().find(token).unwrap();
+    document.byte_range(start..start + token.len())
+}
+
+fn apply_action(session: &mut Session, path: &Path, action: &Value) -> String {
+    let changes = action["edit"]["changes"].as_object().unwrap();
+    assert_eq!(changes.len(), 1);
+    let mut edits: Vec<TextEdit> =
+        serde_json::from_value(changes[path_uri(path).unwrap().as_str()].clone()).unwrap();
+    assert!(!edits.is_empty());
+    edits.sort_by_key(|edit| edit.range.start);
+    for pair in edits.windows(2) {
+        assert!(pair[0].range.end <= pair[1].range.start);
+    }
+    let mut snapshot = session.running().engine.snapshot();
+    let document = snapshot.document(path).unwrap().unwrap();
+    let mut result = document.text().to_owned();
+    for edit in edits.iter().rev() {
+        let start = document.offset(edit.range.start).unwrap();
+        let end = document.offset(edit.range.end).unwrap();
+        assert_eq!(document.byte_range(start..end), edit.range);
+        result.replace_range(start..end, &edit.new_text);
+    }
+    result
+}
+
+fn load_imports(project: &TestProject, packages: &[(&str, &str)]) -> Session {
+    let imports: Vec<_> = packages
+        .iter()
+        .map(|(name, _)| format!("example.test/{name}"))
+        .collect();
+    let mut listing = json!({
+        "Dir": project.root, "ImportPath": "example.test/sample", "Name": "sample",
+        "GoFiles": ["api.go"], "Imports": imports,
+    })
+    .to_string();
+    for (name, text) in packages {
+        let path = project.write(&format!("{name}/pkg.go"), text);
+        listing.push_str(
+            &json!({
+                "Dir": path.parent().unwrap(), "ImportPath": format!("example.test/{name}"),
+                "Name": name, "GoFiles": ["pkg.go"],
+            })
+            .to_string(),
+        );
+    }
+    let mut session = Session::with_capabilities(project, pull_capabilities(true, false));
+    let engine = &mut session.running().engine;
+    let load = engine.workspace_load();
+    let graph = Workspace::from_test_listing(
+        std::slice::from_ref(&project.root),
+        &listing,
+        load.include_tests,
+    );
+    assert!(engine.install_workspace(load, graph));
+    session
+}
+
+fn block_dependency_read(session: &mut Session, path: &Path) -> (Sender<()>, Receiver<()>) {
+    let (started, start) = crossbeam_channel::bounded(1);
+    let (release, blocked) = crossbeam_channel::bounded(1);
+    let blocked = Mutex::new(Some(blocked));
+    let dependency = path_key(path);
+    session
+        .running()
+        .engine
+        .set_shared_disk_hook(Some(Arc::new(move |path, event| {
+            if path == dependency.as_path()
+                && event == CacheEvent::Read
+                && let Some(blocked) = blocked.lock().unwrap().take()
+            {
+                started.send(()).unwrap();
+                let _ = blocked.recv_timeout(Duration::from_secs(10));
+            }
+        })));
+    (release, start)
+}
+
+fn unused_variable_context(name: &str, range: Range) -> Value {
+    json!({
+        "range": range, "code": "var.unused", "source": "rs-gopls",
+        "message": format!("{name} declared and unused"), "severity": 1, "tags": [1],
+    })
+}
+
+#[test]
+fn quickfix_uses_verified_context_while_stage2_waits_and_reuses_current_cache() {
+    let project = TestProject::new();
+    let text = "package sample\r\nimport dep \"example.test/dep\"\r\nfunc f() { _ = \"😀\"; unused := dep.Value; other := 1 }\r\n";
+    let path = project.write("api.go", text);
+    let mut session = load_imports(&project, &[("dep", "package dep\nvar Value = 42\n")]);
+    let (release, start) = block_dependency_read(&mut session, &project.root.join("dep/pkg.go"));
+    session.open(&path, text);
+    pull(&mut session, 1, &path, None);
+    finish_stage1(&mut session);
+    start.recv_timeout(Duration::from_secs(5)).unwrap();
+    delivery_deadline(&mut session);
+    let fast = session.reply(1).result.clone().unwrap();
+    assert!(codes(&fast["items"]).is_empty());
+
+    let range = token(&mut session, &path, "unused");
+    assert_eq!(
+        range,
+        Range::new(Position::new(2, 21), Position::new(2, 27))
+    );
+    let cursor = Range::new(Position::new(2, 23), Position::new(2, 23));
+    let diagnostic = unused_variable_context("unused", range);
+    let other = unused_variable_context("other", token(&mut session, &path, "other"));
+    let actions = code_actions(
+        &mut session,
+        2,
+        &path,
+        cursor,
+        &[other, diagnostic.clone(), diagnostic.clone()],
+        Some("quickfix"),
+    );
+    assert_eq!(actions.len(), 1);
+    let action = &actions[0];
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["title"], "Replace unused variable 'unused' with '_'");
+    assert_eq!(action["diagnostics"], json!([diagnostic]));
+    let fixed = text.replace("unused := dep.Value", "_ = dep.Value");
+    assert_eq!(apply_action(&mut session, &path, action), fixed);
+    assert!(
+        session
+            .scheduler()
+            .diagnostic_completions()
+            .unwrap()
+            .is_empty()
+    );
+
+    release.send(()).unwrap();
+    session.finish_diagnostic_job();
+    // The full report is cached but has not yet been delivered by Pull.
+    assert_eq!(
+        code_actions(&mut session, 3, &path, cursor, &[], Some("quickfix")),
+        actions
+    );
+    assert!(code_actions(&mut session, 4, &path, cursor, &[], Some("refactor")).is_empty());
+    assert!(
+        code_actions(
+            &mut session,
+            5,
+            &path,
+            Range::default(),
+            &[],
+            Some("quickfix")
+        )
+        .is_empty()
+    );
+    pull(&mut session, 6, &path, Some(&fast["resultId"]));
+    let complete = session.reply(6).result.clone().unwrap();
+    assert_eq!(codes(&complete["items"]), ["var.unused", "var.unused"]);
+    assert_eq!(complete["items"][0], diagnostic);
+    assert_eq!(
+        code_actions(&mut session, 7, &path, cursor, &[], Some("quickfix")),
+        actions
+    );
+    session.count(8);
+}
+
+#[test]
+fn quickfix_rejects_invalid_context_after_out_of_order_edits_and_reopen() {
+    let project = TestProject::new();
+    let old = "package sample\nfunc f() { _ = \"😀\"; unused := 1; _ = 0; other := 2 }\n";
+    let current = old.replace("_ = 0", "_ = unused");
+    let path = project.write("api.go", old);
+    let mut session = loaded(&project, &["api.go"], pull_capabilities(false, false));
+    session.open(&path, old);
+    pull(&mut session, 1, &path, None);
+    session.finish_diagnostic_job();
+    let stale = session.reply(1).result.as_ref().unwrap()["items"][0].clone();
+    assert_eq!(stale["code"], "var.unused");
+    let range = token(&mut session, &path, "unused");
+    session.edit(&path, 3, &current);
+    session.edit(&path, 2, old);
+    let other = token(&mut session, &path, "other");
+    let other_diagnostic = unused_variable_context("other", other);
+    let mut unknown = other_diagnostic.clone();
+    unknown["code"] = json!("unknown.diagnostic");
+    let mut split_surrogate = stale.clone();
+    split_surrogate["range"]["start"]["character"] = json!(17);
+    let mut invalid = stale.clone();
+    invalid["range"]["end"]["character"] = json!(10000);
+    for (id, requested_range, diagnosis) in [
+        (2, range, stale.clone()),
+        (3, other, unknown),
+        (4, range, split_surrogate),
+        (5, range, invalid),
+        (
+            6,
+            Range::new(Position::new(1, 17), other.end),
+            other_diagnostic,
+        ),
+    ] {
+        assert!(
+            code_actions(
+                &mut session,
+                id,
+                &path,
+                requested_range,
+                &[diagnosis],
+                Some("quickfix")
+            )
+            .is_empty()
+        );
+    }
+
+    close(&mut session, &path);
+    session.open(&path, &current);
+    assert!(code_actions(&mut session, 7, &path, range, &[stale], Some("quickfix")).is_empty());
+    pull(&mut session, 8, &path, None);
+    session.finish_diagnostic_job();
+    let items = &session.reply(8).result.as_ref().unwrap()["items"];
+    assert_eq!(codes(items), ["var.unused"]);
+    assert_eq!(items[0]["message"], "other declared and unused");
+    assert!(code_actions(&mut session, 9, &path, range, &[], Some("quickfix")).is_empty());
+    session.count(10);
+}
+
+#[test]
+fn quickfix_rechecks_current_fast_diagnostic_without_retained_fix_data() {
+    let project = TestProject::new();
+    let text = "package sample\nfunc f() { unused := 1 }\nfunc g() { _ = 0 }\n";
+    let path = project.write("api.go", text);
+    let mut session = loaded(&project, &["api.go"], pull_capabilities(true, false));
+    session.open(&path, text);
+    pull(&mut session, 1, &path, None);
+    finish_stage1(&mut session);
+    finish_stage2_within_budget(&mut session);
+    let complete = session.reply(1).result.clone().unwrap();
+    assert_eq!(codes(&complete["items"]), ["var.unused"]);
+
+    let edited = text.replace("_ = 0", "_ = 2");
+    session.edit(&path, 2, &edited);
+    pull(&mut session, 2, &path, Some(&complete["resultId"]));
+    finish_edited_preview(&mut session);
+    let fast = session.reply(2).result.clone().unwrap();
+    assert_eq!(codes(&fast["items"]), ["var.unused"]);
+    let engine = &mut session.running().engine;
+    let key = engine.diagnostic_key(&path).unwrap();
+    let report = engine.diagnostic_report_for_key(&key).unwrap();
+    assert_eq!(report.diagnostic_stage, DiagnosticStage::Stage1);
+    assert_eq!(report.items[0].fix_data, DiagnosticFixData::None);
+
+    let range = token(&mut session, &path, "unused");
+    let actions = code_actions(&mut session, 3, &path, range, &[], Some("quickfix"));
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["diagnostics"], fast["items"]);
+    assert_eq!(
+        apply_action(&mut session, &path, &actions[0]),
+        edited.replace("unused :=", "_ =")
+    );
+    session.count(4);
+}
+
+#[test]
+fn organize_imports_matches_complete_diagnostics_while_stage2_waits() {
+    let project = TestProject::new();
+    let text = concat!(
+        "package sample\n\nimport (\n",
+        "\tshadow \"example.test/shadow\"\n\tkeep \"example.test/dep\"\n",
+        "\t_ \"example.test/blank\"\n\t. \"example.test/dot\"\n\t\"example.test/typed\"\n)\n\n",
+        "func f() {\n\tshadow := struct{ Value int }{}\n\t_ = shadow.Value\n\t_ = keep.Value\n",
+        "\tvar _ typed.Type\n\t_ = Dot\n}\n",
+    );
+    let path = project.write("api.go", text);
+    let mut session = load_imports(
+        &project,
+        &[
+            ("dep", "package dep\nvar Value = 42\n"),
+            ("shadow", "package shadow\nvar Value = 7\n"),
+            ("blank", "package blank\n"),
+            ("dot", "package dot\nvar Dot = 3\n"),
+            ("typed", "package typed\ntype Type int\n"),
+        ],
+    );
+    let (release, start) = block_dependency_read(&mut session, &project.root.join("dep/pkg.go"));
+    session.open(&path, text);
+    pull(&mut session, 1, &path, None);
+    finish_stage1(&mut session);
+    start.recv_timeout(Duration::from_secs(5)).unwrap();
+    delivery_deadline(&mut session);
+    let fast = session.reply(1).result.clone().unwrap();
+    assert!(codes(&fast["items"]).is_empty());
+
+    let actions = code_actions(
+        &mut session,
+        2,
+        &path,
+        Range::default(),
+        &[],
+        Some("source.organizeImports"),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "source.organizeImports");
+    assert!(actions[0].get("diagnostics").is_none());
+    let organized = apply_action(&mut session, &path, &actions[0]);
+    assert_eq!(organized, text.replace("\tshadow \"example.test/shadow\"\n\tkeep \"example.test/dep\"\n\t_ \"example.test/blank\"", "\t_ \"example.test/blank\"\n\tkeep \"example.test/dep\""));
+    assert_eq!(
+        code_actions(&mut session, 3, &path, Range::default(), &[], None),
+        actions
+    );
+    assert!(
+        session
+            .scheduler()
+            .diagnostic_completions()
+            .unwrap()
+            .is_empty()
+    );
+
+    release.send(()).unwrap();
+    session.finish_diagnostic_job();
+    pull(&mut session, 4, &path, Some(&fast["resultId"]));
+    let complete = session.reply(4).result.clone().unwrap();
+    assert_eq!(codes(&complete["items"]), ["import.unused"]);
+    assert_eq!(
+        complete["items"][0]["message"],
+        "\"example.test/shadow\" imported as shadow and unused"
+    );
+    assert_eq!(
+        code_actions(
+            &mut session,
+            5,
+            &path,
+            Range::default(),
+            &[],
+            Some("source.organizeImports")
+        ),
+        actions
+    );
+    session.count(6);
 }
 
 #[test]
@@ -357,10 +740,10 @@ fn global_refresh_merges_document_and_workspace_marks_while_pulls_keep_running()
     // resulting re-pull. The other documents can use cached Stage 2 while ACK waits.
     session.edit(&paths[0], 2, "package sample\nfunc a() {}\n");
     pull(&mut session, 4, &paths[0], Some(&a["resultId"]));
-    delivery_deadline(&mut session);
-    finish_stage1(&mut session);
-    finish_stage2_within_budget(&mut session);
+    finish_edited_preview(&mut session);
     assert!(codes(&session.reply(4).result.as_ref().unwrap()["items"]).is_empty());
+    delivery_deadline(&mut session);
+    session.finish_diagnostic_job();
     pull(&mut session, 5, &paths[1], Some(&b["resultId"]));
     assert_eq!(
         codes(&session.reply(5).result.as_ref().unwrap()["items"]).len(),
@@ -392,6 +775,7 @@ fn late_workers_and_out_of_order_requests_keep_open_generations_and_versions_mon
     session.open(&path, CHANGED);
     pull(&mut session, 4, &path, None);
     pull(&mut session, 2, &path, None);
+    let stale_key = session.running().engine.diagnostic_key(&path).unwrap();
     let stale = session.take_diagnostic_completion();
     session.cancel(4);
     session.edit(&path, 2, CLEAN);
@@ -400,11 +784,18 @@ fn late_workers_and_out_of_order_requests_keep_open_generations_and_versions_mon
     assert_eq!(session.reply(2).error.as_ref().unwrap().code, -32801);
     pull(&mut session, 1, &path, None);
     session.complete_diagnostic(stale);
-    delivery_deadline(&mut session);
-    finish_stage1(&mut session);
-    finish_stage2_within_budget(&mut session);
+    assert!(
+        session
+            .running()
+            .engine
+            .diagnostic_report_for_key(&stale_key)
+            .is_none()
+    );
+    finish_edited_preview(&mut session);
     let clean = session.reply(1).result.clone().unwrap();
     assert!(codes(&clean["items"]).is_empty());
+    delivery_deadline(&mut session);
+    session.finish_diagnostic_job();
 
     close(&mut session, &path);
     session.open(&path, EQUIVALENT);

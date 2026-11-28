@@ -1,14 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, Range, TextEdit, Uri, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, NumberOrString, Range, TextEdit,
+    Uri, WorkspaceEdit,
 };
 
 use super::{ImportEditError, ImportOperation, import_edits};
 use crate::semantic::diagnostics::{
-    DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, snapshot_key,
+    DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, DiagnosticStage,
+    local_imports, local_variable_fixes, snapshot_key,
 };
 use crate::semantic::snapshot::{DocumentSnapshot, EngineSnapshot};
 use crate::semantic::source::{node_at_range, node_text};
@@ -21,10 +23,11 @@ pub(crate) fn code_actions(
     range: Range,
     only: Option<&[CodeActionKind]>,
     report: Option<&DiagnosticReport>,
+    context: &[Diagnostic],
 ) -> Result<Vec<CodeActionOrCommand>> {
     let organize = wants_kind(only, &CodeActionKind::SOURCE_ORGANIZE_IMPORTS);
     let quickfix = wants_kind(only, &CodeActionKind::QUICKFIX);
-    if !organize && (!quickfix || report.is_none()) {
+    if (!organize && !quickfix) || exact_range(document, range).is_none() {
         return Ok(Vec::new());
     }
 
@@ -35,17 +38,86 @@ pub(crate) fn code_actions(
     let report = report.filter(|report| {
         snapshot_key(snapshot, document).is_ok_and(|current| current == report.snapshot)
     });
+    let mut selected: Vec<_> = report
+        .filter(|_| quickfix)
+        .into_iter()
+        .flat_map(|r| r.items_overlapping(range))
+        .filter(|item| exact_range(document, item.range).is_some())
+        .collect();
+    let hints: Vec<_> = context
+        .iter()
+        .filter(|hint| {
+            quickfix && overlaps(range, hint.range) && exact_range(document, hint.range).is_some()
+        })
+        .filter_map(|hint| hint_code(hint).map(|code| (code, hint)))
+        .filter(|(code, hint)| {
+            !selected.iter().any(|item| {
+                item.code == *code
+                    && item.range == hint.range
+                    && item.message == hint.message
+                    && item.fix_data != DiagnosticFixData::None
+            })
+        })
+        .collect();
+    if !organize && selected.is_empty() && hints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let complete = report.filter(|r| r.diagnostic_stage == DiagnosticStage::Stage2);
+    let import_hint = hints
+        .iter()
+        .any(|(code, _)| *code == DiagnosticCode::ImportUnused);
+    let check_import_usage = organize && complete.is_none()
+        || import_hint
+        || selected.iter().any(|item| {
+            item.code == DiagnosticCode::ImportUnused && item.fix_data == DiagnosticFixData::None
+        });
+    let imports = if organize
+        || import_hint
+        || selected
+            .iter()
+            .any(|item| item.code == DiagnosticCode::ImportUnused)
+    {
+        local_imports(snapshot, document, check_import_usage)?
+    } else {
+        Default::default()
+    };
+    let variable_hints: Vec<_> = selected
+        .iter()
+        .filter_map(|item| variable_target(document, item))
+        .chain(hints.iter().filter_map(|(code, hint)| {
+            matches!(
+                code,
+                DiagnosticCode::VarUnused | DiagnosticCode::ShortVarNoNewVars
+            )
+            .then_some((*code, hint.range))
+        }))
+        .collect();
+    let variables = local_variable_fixes(document, &variable_hints)?;
+    let unused_by_range: HashMap<_, _> = imports
+        .unused
+        .iter()
+        .map(|item| (item.range, item))
+        .collect();
+    selected.extend(hints.into_iter().filter_map(|(code, hint)| {
+        let verified = if code == DiagnosticCode::ImportUnused {
+            unused_by_range.get(&hint.range).copied()
+        } else {
+            variables.get(&(code, hint.range)).map(|(item, _)| item)
+        };
+        verified.filter(|item| item.message == hint.message)
+    }));
     let local_prefixes: Vec<_> = workspace
         .into_iter()
         .flat_map(Workspace::module_paths)
         .map(String::as_str)
         .collect();
-    let organize_edits = |unused_paths: &[&str]| {
+    let organize_edits = |unused_specs: &[usize]| {
         action_import_edits(
             document,
             ImportOperation::OrganizeImports {
-                unused_paths,
+                unused_specs,
                 local_prefixes: &local_prefixes,
+                package_names: &imports.package_names,
             },
         )
     };
@@ -57,7 +129,17 @@ pub(crate) fn code_actions(
         } else {
             CodeActionKind::SOURCE_ORGANIZE_IMPORTS
         };
-        if !edits.is_empty() && seen.insert((kind.clone(), title.clone())) {
+        let site = diagnostic
+            .filter(|item| {
+                matches!(
+                    item.code,
+                    DiagnosticCode::ImportUnused
+                        | DiagnosticCode::VarUnused
+                        | DiagnosticCode::ShortVarNoNewVars
+                )
+            })
+            .map(|item| item.range);
+        if !edits.is_empty() && seen.insert((kind.clone(), title.clone(), site)) {
             actions.push(
                 CodeAction {
                     title,
@@ -75,43 +157,49 @@ pub(crate) fn code_actions(
     };
 
     if organize {
-        let unused_paths: Vec<_> = report
+        let unused_specs: Vec<_> = complete
             .into_iter()
-            .flat_map(|r| &r.items)
-            .filter_map(|item| match (item.code, &item.fix_data) {
-                (
-                    DiagnosticCode::ImportUnused,
-                    DiagnosticFixData::RemoveUnusedImport { import_path, .. },
-                ) => Some(import_path.as_str()),
-                _ => None,
-            })
+            .flat_map(|report| &report.items)
+            .chain(&imports.unused)
+            .filter_map(|item| unused_spec(document, item))
             .collect();
         add(
             "Organize Imports".into(),
-            organize_edits(&unused_paths)?,
+            organize_edits(&unused_specs)?,
             None,
         );
     }
-    if quickfix && let Some(report) = report {
+    if quickfix {
         let owner = workspace
             .and_then(|workspace| snapshot.diagnostic_package(workspace, document.path(), source));
         let mut searched = HashSet::new();
-        for item in report.items_overlapping(range) {
+        for item in selected {
             let mut fix = |title, edits| add(title, edits, Some(item));
             match (item.code, &item.fix_data) {
-                (
-                    DiagnosticCode::ImportUnused,
-                    DiagnosticFixData::RemoveUnusedImport { import_path, .. },
-                ) => {
-                    fix(
-                        format!("Remove unused import \"{import_path}\""),
-                        organize_edits(&[import_path])?,
-                    );
+                (DiagnosticCode::ImportUnused, _) => {
+                    let verified = unused_by_range
+                        .get(&item.range)
+                        .copied()
+                        .filter(|found| found.message == item.message);
+                    if let Some((path, offset)) = unused_import_fix(document, item)
+                        .or_else(|| verified.and_then(|found| unused_import_fix(document, found)))
+                    {
+                        fix(
+                            format!("Remove unused import \"{path}\""),
+                            organize_edits(&[offset])?,
+                        );
+                    }
                 }
                 (
                     DiagnosticCode::NameUnresolved,
-                    DiagnosticFixData::ImportMissingPackage { qualifier, .. },
-                ) if searched.insert(qualifier) => {
+                    DiagnosticFixData::ImportMissingPackage {
+                        qualifier,
+                        ident_range,
+                    },
+                ) if overlaps(item.range, *ident_range)
+                    && selector_qualifier(document, *ident_range, qualifier)
+                    && searched.insert(qualifier) =>
+                {
                     for path in import_candidates(qualifier, workspace, owner, document.path()) {
                         let edits = action_import_edits(
                             document,
@@ -120,23 +208,14 @@ pub(crate) fn code_actions(
                         fix(format!("Import \"{path}\""), edits);
                     }
                 }
-                (
-                    DiagnosticCode::VarUnused,
-                    DiagnosticFixData::ReplaceUnusedVarWithBlank { name, ident_range },
-                ) => {
-                    fix(
-                        format!("Replace unused variable '{name}' with '_'"),
-                        replace_unused_variable(document, *ident_range),
-                    );
-                }
-                (
-                    DiagnosticCode::ShortVarNoNewVars,
-                    DiagnosticFixData::ChangeShortDeclToAssign { operator_range },
-                ) => {
-                    fix(
-                        "Replace ':=' with '='".into(),
-                        vec![TextEdit::new(*operator_range, "=".into())],
-                    );
+                (DiagnosticCode::VarUnused | DiagnosticCode::ShortVarNoNewVars, _) => {
+                    if let Some((verified, edits)) =
+                        variable_target(document, item).and_then(|key| variables.get(&key))
+                        && (item.fix_data != DiagnosticFixData::None
+                            || item.message == verified.message)
+                    {
+                        fix(variable_fix_title(verified, edits), edits.clone());
+                    }
                 }
                 _ => {}
             }
@@ -145,27 +224,121 @@ pub(crate) fn code_actions(
     Ok(actions)
 }
 
-fn replace_unused_variable(document: &DocumentSnapshot<'_>, range: Range) -> Vec<TextEdit> {
-    let mut edits = vec![TextEdit::new(range, "_".into())];
-    if let Some(name) = node_at_range(document.indexed(), range)
-        && let Some(left) = name.parent()
-        && let Some(decl) = left.parent()
-        && decl.kind() == "short_var_declaration"
-        && decl.child_by_field_name("left") == Some(left)
-        && left.named_children(&mut left.walk()).all(|other| {
-            other == name || other.is_extra() || node_text(other, document.text()) == "_"
-        })
-        && let Some(operator) = decl.children(&mut decl.walk()).find(|n| n.kind() == ":=")
-    {
-        edits.push(TextEdit::new(
-            document.byte_range(operator.byte_range()),
-            "=".into(),
-        ));
+fn hint_code(hint: &Diagnostic) -> Option<DiagnosticCode> {
+    if hint.source.as_deref() != Some("rs-gopls") {
+        return None;
     }
-    edits
+    let Some(NumberOrString::String(code)) = &hint.code else {
+        return None;
+    };
+    [
+        DiagnosticCode::ImportUnused,
+        DiagnosticCode::VarUnused,
+        DiagnosticCode::ShortVarNoNewVars,
+    ]
+    .into_iter()
+    .find(|known| known.as_str() == code)
 }
 
-fn wants_kind(only: Option<&[CodeActionKind]>, target: &CodeActionKind) -> bool {
+fn variable_target(
+    document: &DocumentSnapshot<'_>,
+    item: &DiagnosticItem,
+) -> Option<(DiagnosticCode, Range)> {
+    let target = match (item.code, &item.fix_data) {
+        (
+            DiagnosticCode::VarUnused,
+            DiagnosticFixData::ReplaceUnusedVarWithBlank { ident_range, .. },
+        ) => *ident_range,
+        (
+            DiagnosticCode::ShortVarNoNewVars,
+            DiagnosticFixData::ChangeShortDeclToAssign { operator_range },
+        ) => *operator_range,
+        (
+            DiagnosticCode::VarUnused | DiagnosticCode::ShortVarNoNewVars,
+            DiagnosticFixData::None,
+        ) => item.range,
+        _ => return None,
+    };
+    (overlaps(item.range, target) && exact_range(document, target).is_some())
+        .then_some((item.code, target))
+}
+
+fn variable_fix_title(item: &DiagnosticItem, edits: &[TextEdit]) -> String {
+    match &item.fix_data {
+        DiagnosticFixData::ReplaceUnusedVarWithBlank { name, .. }
+            if edits.first().is_some_and(|edit| edit.new_text.is_empty()) =>
+        {
+            format!("Remove unused variable '{name}'")
+        }
+        DiagnosticFixData::ReplaceUnusedVarWithBlank { name, .. } => {
+            format!("Replace unused variable '{name}' with '_'")
+        }
+        _ => "Replace ':=' with '='".into(),
+    }
+}
+
+fn unused_spec(document: &DocumentSnapshot<'_>, item: &DiagnosticItem) -> Option<usize> {
+    unused_import_fix(document, item).map(|(_, offset)| offset)
+}
+
+fn unused_import_fix<'a>(
+    document: &DocumentSnapshot<'_>,
+    item: &'a DiagnosticItem,
+) -> Option<(&'a str, usize)> {
+    let (
+        DiagnosticCode::ImportUnused,
+        DiagnosticFixData::RemoveUnusedImport {
+            import_path,
+            spec_range,
+        },
+    ) = (item.code, &item.fix_data)
+    else {
+        return None;
+    };
+    let bytes = exact_range(document, *spec_range)?;
+    let diagnostic = exact_range(document, item.range)?;
+    document
+        .indexed()
+        .diagnostic_imports
+        .iter()
+        .find(|spec| {
+            spec.spec == bytes
+                && spec.path.as_ref() == Some(import_path)
+                && spec.spec.start <= diagnostic.start
+                && diagnostic.end <= spec.spec.end
+                && !matches!(spec.alias.as_deref(), Some("." | "_"))
+                && import_path != "C"
+        })
+        .map(|spec| (import_path.as_str(), spec.spec.start))
+}
+
+fn selector_qualifier(document: &DocumentSnapshot<'_>, range: Range, qualifier: &str) -> bool {
+    exact_range(document, range).is_some()
+        && node_at_range(document.indexed(), range).is_some_and(|node| {
+            node_text(node, document.text()) == qualifier
+                && node.parent().is_some_and(|parent| match parent.kind() {
+                    "qualified_type" => parent.child_by_field_name("package") == Some(node),
+                    "selector_expression" => parent.child_by_field_name("operand") == Some(node),
+                    _ => false,
+                })
+        })
+}
+
+fn overlaps(range: Range, diagnostic: Range) -> bool {
+    range.start == diagnostic.start
+        || (range.start < diagnostic.end && diagnostic.start < range.end)
+}
+
+pub(crate) fn exact_range(
+    document: &DocumentSnapshot<'_>,
+    range: Range,
+) -> Option<std::ops::Range<usize>> {
+    let start = document.offset(range.start)?;
+    let end = document.offset(range.end)?;
+    (start <= end && document.byte_range(start..end) == range).then_some(start..end)
+}
+
+pub(crate) fn wants_kind(only: Option<&[CodeActionKind]>, target: &CodeActionKind) -> bool {
     only.is_none_or(|kinds| {
         kinds.iter().any(|kind| {
             kind.as_str().is_empty()
@@ -177,7 +350,7 @@ fn wants_kind(only: Option<&[CodeActionKind]>, target: &CodeActionKind) -> bool 
     })
 }
 
-pub(crate) fn needs_diagnostics(only: Option<&[CodeActionKind]>) -> bool {
+pub(crate) fn supports_code_actions(only: Option<&[CodeActionKind]>) -> bool {
     wants_kind(only, &CodeActionKind::QUICKFIX)
         || wants_kind(only, &CodeActionKind::SOURCE_ORGANIZE_IMPORTS)
 }
@@ -191,6 +364,7 @@ fn action_import_edits(
         Err(
             ImportEditError::UnsafeSyntaxTree
             | ImportEditError::MissingPackageClause
+            | ImportEditError::InvalidImportPath
             | ImportEditError::ConflictingBinding { .. },
         ) => Ok(Vec::new()),
         Err(error) => Err(error.into()),

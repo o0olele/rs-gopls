@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::semantic::inference_memo::{InferenceKey, InferenceMode, Lookup};
 use crate::semantic::resolver::{
-    MAX_TYPE_DEPTH, TypeIdentity, TypeKind, explicit_type_arguments, is_exported,
-    is_predeclared_type, materialize_type, untyped_default,
+    MAX_TYPE_DEPTH, TypeIdentity, TypeKind, clean_inference_node, explicit_type_arguments,
+    is_exported, is_predeclared_type, materialize_type, untyped_default,
 };
 use crate::semantic::source::{function_at, import_path};
 use crate::symbols::{self, Container, OutlineKind, SymbolKind};
@@ -92,50 +93,58 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
     }
 
     pub(super) fn inferred(&mut self, node: Node<'_>) -> Result<Option<Ty<'w>>> {
-        Ok(self
-            .inferred_at(unparen(node), 0)?
-            .filter(|ty| !sdk_placeholder(ty)))
+        Ok(self.inferred_at(node, 0)?.filter(|ty| !sdk_placeholder(ty)))
     }
 
     fn inferred_at(&mut self, node: Node<'_>, depth: usize) -> Result<Option<Ty<'w>>> {
-        if depth >= MAX_TYPE_DEPTH {
-            return Ok(None);
+        #[cfg(test)]
+        if !self.resolver.inference_memo.enabled() {
+            return if depth >= MAX_TYPE_DEPTH {
+                Ok(None)
+            } else {
+                self.inferred_uncached(unparen(node), depth)
+            };
         }
+        let stable_input =
+            clean_inference_node(node) && !self.locals.may_have_recovered_binding(node);
         let node = unparen(node);
+        let key = InferenceKey::expr(
+            self.source,
+            self.package,
+            InferenceMode::Diagnostics,
+            node,
+            0,
+        );
+        match self
+            .resolver
+            .inference_memo
+            .start(key, depth, stable_input, self.cancelled)?
+        {
+            Lookup::Ready(value) => Ok(value),
+            Lookup::Evaluate(evaluation) => {
+                let result = self.inferred_uncached(node, depth);
+                self.resolver
+                    .inference_memo
+                    .finish(evaluation, result, self.cancelled)
+            }
+        }
+    }
+
+    fn inferred_uncached(&mut self, node: Node<'_>, depth: usize) -> Result<Option<Ty<'w>>> {
         let name = self.text(node);
         let local = declarations::is_identifier(node)
             .then(|| self.locals.lookup(node, name))
             .flatten();
-        if let Some(local) = local {
-            if !local.is_type() {
-                if let Some(syntax) = local.explicit_type {
-                    let ty = self.source_type(syntax);
-                    return Ok(ty.map(|mut ty| {
-                        if local.kind == "variadic_parameter_declaration" {
-                            ty = Ty::new(
-                                self.package,
-                                TypeKind::Container(Box::new(Container::Slice(ty)), None),
-                                0,
-                            );
-                        }
-                        ty.addressable = local.kind != "const_spec";
-                        ty
-                    }));
-                }
-                if local.kind == "const_spec" {
-                    // An untyped constant takes its type from the assignment context.
-                    return Ok(None);
-                }
-                if local.result_index == 0
-                    && let Some(value) = local.initializer
-                {
-                    let mut ty = self.inferred_at(value, depth + 1)?;
-                    if let Some(ty) = &mut ty {
-                        ty.addressable = true;
-                    }
-                    return Ok(ty);
-                }
-            }
+        if let Some(local) = local
+            && !local.is_type()
+            && (local.explicit_type.is_some()
+                || local.kind == "const_spec"
+                || (local.result_index == 0 && local.initializer.is_some()))
+        {
+            return self.inferred_local(local, depth);
+        }
+        if local.is_some_and(|local| local.recovered) {
+            self.resolver.inference_memo.transient();
         }
         if let Some(default) = untyped_default(node)
             && (!matches!(node.kind(), "true" | "false") || self.universe(node))
@@ -167,15 +176,33 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
         }
         if node.kind() == "call_expression"
             && let Some(callee) = node.child_by_field_name("function")
-            && callee.kind() == "identifier"
-            && self.universe(callee)
         {
-            let name = self.text(callee);
-            if is_predeclared_type(name) {
-                return Ok(Some(Ty::named(self.package, name)));
+            if callee.kind() == "identifier" && self.universe(callee) {
+                let name = self.text(callee);
+                if is_predeclared_type(name) {
+                    return Ok(Some(Ty::named(self.package, name)));
+                }
+                if matches!(name, "len" | "cap" | "copy")
+                    && !self.locals.globals.contains_key("int")
+                {
+                    return Ok(Some(Ty::named(self.package, "int")));
+                }
             }
-            if matches!(name, "len" | "cap" | "copy") && !self.locals.globals.contains_key("int") {
-                return Ok(Some(Ty::named(self.package, "int")));
+            // The Stage 2 lexical pass already knows whether the receiver
+            // shadows the import. Reuse that binding and the callee inferred
+            // by call checking instead of scanning earlier statements again.
+            if self.is_imported_callee(callee) {
+                let Some(ty) = self.inferred_at(callee, depth + 1)? else {
+                    return Ok(None);
+                };
+                return self.resolver.call_result_from_callee(
+                    self.package,
+                    self.source,
+                    node,
+                    ty,
+                    depth + 1,
+                    0,
+                );
             }
         }
         if node.kind() == "type_conversion_expression"
@@ -265,6 +292,91 @@ impl<'s, 'w> Analysis<'s, 'w, '_> {
             return self.resolver.symbol_type(self.source, &symbol, name, depth);
         }
         Ok(None)
+    }
+
+    fn is_imported_callee(&self, callee: Node<'_>) -> bool {
+        if callee.kind() != "selector_expression" || self.source.tree.root_node().has_error() {
+            return false;
+        }
+        let Some(receiver) = callee
+            .child_by_field_name("operand")
+            .filter(|receiver| matches!(receiver.kind(), "identifier" | "package_identifier"))
+        else {
+            return false;
+        };
+        let qualifier = self.text(receiver);
+        self.locals.lookup(receiver, qualifier).is_none()
+            && self.imports.package(qualifier).is_some_and(|package| {
+                self.source
+                    .imported_package(self.resolver.workspace, self.package, qualifier)
+                    .is_some_and(|(_, target)| std::ptr::eq(package, target))
+            })
+    }
+
+    fn inferred_local(
+        &mut self,
+        local: declarations::Local<'_>,
+        depth: usize,
+    ) -> Result<Option<Ty<'w>>> {
+        #[cfg(test)]
+        if !self.resolver.inference_memo.enabled() {
+            return self.inferred_local_uncached(local, depth);
+        }
+        let key = InferenceKey::local(
+            self.source,
+            self.package,
+            InferenceMode::Diagnostics,
+            local.scope_node,
+            local.name,
+            local.result_index,
+        );
+        let stable_input = !local.recovered
+            && clean_inference_node(local.name)
+            && local.name.parent().is_none_or(clean_inference_node);
+        match self
+            .resolver
+            .inference_memo
+            .start(key, depth, stable_input, self.cancelled)?
+        {
+            Lookup::Ready(value) => Ok(value),
+            Lookup::Evaluate(evaluation) => {
+                let result = self.inferred_local_uncached(local, depth);
+                self.resolver
+                    .inference_memo
+                    .finish(evaluation, result, self.cancelled)
+            }
+        }
+    }
+
+    fn inferred_local_uncached(
+        &mut self,
+        local: declarations::Local<'_>,
+        depth: usize,
+    ) -> Result<Option<Ty<'w>>> {
+        if let Some(syntax) = local.explicit_type {
+            let ty = self.source_type(syntax);
+            return Ok(ty.map(|mut ty| {
+                if local.kind == "variadic_parameter_declaration" {
+                    ty = Ty::new(
+                        self.package,
+                        TypeKind::Container(Box::new(Container::Slice(ty)), None),
+                        0,
+                    );
+                }
+                ty.addressable = local.kind != "const_spec";
+                ty
+            }));
+        }
+        if local.kind == "const_spec" {
+            // An untyped constant takes its type from the assignment context.
+            return Ok(None);
+        }
+        let value = local.initializer.expect("inferred local initializer");
+        let mut ty = self.inferred_at(value, depth + 1)?;
+        if let Some(ty) = &mut ty {
+            ty.addressable = true;
+        }
+        Ok(ty)
     }
 
     fn inferred_selector(&mut self, node: Node<'_>, depth: usize) -> Result<Option<Ty<'w>>> {
@@ -874,8 +986,9 @@ fn check_assignment(
     node: Node<'_>,
     parents: Parents<'_, '_>,
 ) -> Result<()> {
-    let var = node.kind() == "var_spec";
-    if node.kind() == "assignment_statement" && token(node, "=").is_none() {
+    let kind = node.kind();
+    let var = kind == "var_spec";
+    if kind == "assignment_statement" && token(node, "=").is_none() {
         return Ok(());
     }
     let Some(rhs) = node.child_by_field_name(if var { "value" } else { "right" }) else {
@@ -890,7 +1003,29 @@ fn check_assignment(
     };
     let annotation = node.child_by_field_name("type");
     let expressions = children(rhs);
+    let existing_binding = |analysis: &Analysis<'_, '_, '_>, name: Node<'_>| {
+        !var && (kind == "assignment_statement" || {
+            let spelling = analysis.text(name);
+            analysis
+                .locals
+                .lookup(name, spelling)
+                .is_some_and(|binding| {
+                    analysis
+                        .locals
+                        .declared_in_same_block(parents, spelling, binding.name)
+                })
+        })
+    };
     if var && annotation.is_none() && !expressions.iter().any(|v| unparen(*v).kind() == "nil") {
+        return Ok(());
+    }
+    // Without a destination type, this check can only reject a bare nil.
+    // A call on the right is still checked when the walk visits the call.
+    if kind == "short_var_declaration"
+        && let ([name], [value]) = (lhs.as_slice(), expressions.as_slice())
+        && unparen(*value).kind() != "nil"
+        && !existing_binding(analysis, *name)
+    {
         return Ok(());
     }
     let Some(values) = supplied(analysis, &expressions)? else {
@@ -900,18 +1035,7 @@ fn check_assignment(
         return Ok(());
     }
     for (name, value) in lhs.into_iter().zip(values) {
-        let existing = !var
-            && (node.kind() == "assignment_statement"
-                || analysis
-                    .locals
-                    .lookup(name, analysis.text(name))
-                    .is_some_and(|binding| {
-                        analysis.locals.declared_in_same_block(
-                            parents,
-                            analysis.text(name),
-                            binding.name,
-                        )
-                    }));
+        let existing = existing_binding(analysis, name);
         let nil = unparen(value.node());
         if !existing && annotation.is_none() && nil.kind() == "nil" && analysis.universe(nil) {
             analysis.error(

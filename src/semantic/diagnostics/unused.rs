@@ -16,12 +16,12 @@ pub(super) fn assignment_target<'t>(parents: Parents<'t, '_>) -> Option<Node<'t>
 }
 
 pub(super) fn value_name(
-    analysis: &Analysis<'_, '_, '_>,
+    locals: &declarations::Locals<'_>,
     node: Node<'_>,
     kind: &str,
     parents: Parents<'_, '_>,
 ) -> bool {
-    !analysis.locals.declarations.contains(&node.id())
+    !locals.declarations.contains(&node.id())
         && !parents.at(1).is_some_and(|p| match p.kind() {
             "package_clause" | "import_spec" => true,
             "qualified_type" => p.child_by_field_name("name") == Some(node),
@@ -49,14 +49,18 @@ pub(super) fn collect(analysis: &mut Analysis<'_, '_, '_>, used: &HashSet<usize>
     for node in std::mem::take(&mut analysis.locals.variables) {
         checkpoint(analysis.cancelled)?;
         if !used.contains(&node.id()) {
-            let name = analysis.text(node);
-            let item = analysis.error(
-                DiagnosticCode::VarUnused,
-                node,
-                format!("{name} declared and unused"),
-            );
-            item.fix = Fix::ReplaceWithBlank(name.to_owned());
+            analysis.items.push(unused_variable(node, analysis.source));
         }
     }
     Ok(())
+}
+
+pub(super) fn unused_variable(node: Node<'_>, source: &IndexedSource) -> PendingItem {
+    let name = node_text(node, &source.text);
+    PendingItem {
+        code: DiagnosticCode::VarUnused,
+        range: node.byte_range(),
+        message: format!("{name} declared and unused"),
+        fix: Fix::ReplaceWithBlank(name.to_owned()),
+    }
 }

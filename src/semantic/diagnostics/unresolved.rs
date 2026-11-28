@@ -17,7 +17,7 @@ pub(super) fn inspect_bare(
         walk_mode,
         |node, kind, parents, _| {
             if kind == "identifier"
-                && unused::value_name(analysis, node, kind, parents)
+                && unused::value_name(&analysis.locals, node, kind, parents)
                 && reliable_bare_use(node, parents)
                 && !analysis.locals.may_have_recovered_binding(node)
             {

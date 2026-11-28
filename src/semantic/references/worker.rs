@@ -16,10 +16,11 @@ use super::large_file::{
     AnchorWork, CandidateDiscovery, CandidateResult, CandidateWork, DiscoveredCandidate,
     ReferenceAnchorResult, contains_spelling,
 };
-use crate::semantic::index::{NavigationText, PreparedReferenceSource};
+use crate::semantic::index::NavigationText;
 use crate::semantic::navigation_trace::{NavigationProbe, record};
-use crate::semantic::shared_disk::SharedDiskCache;
+use crate::semantic::shared_disk::{PreparedDeclarations, SharedDiskCache};
 use crate::semantic::source::check_cancelled;
+use crate::telemetry;
 
 const POOL_SIZE: usize = 4;
 const QUEUE_SIZE: usize = 16;
@@ -71,6 +72,7 @@ struct Job {
     work: Work,
     cancelled: Arc<AtomicBool>,
     done: JobDone,
+    context: Option<telemetry::Context>,
 }
 
 struct JobDone {
@@ -109,6 +111,7 @@ impl PendingWork {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut jobs = VecDeque::new();
         let mut results = VecDeque::new();
+        let context = telemetry::context();
         for work in work {
             let (done, result) = bounded(1);
             jobs.push_back(Job {
@@ -118,6 +121,7 @@ impl PendingWork {
                     signal: None,
                 },
                 cancelled: cancelled.clone(),
+                context,
             });
             results.push_back(result);
         }
@@ -216,15 +220,18 @@ impl ReferenceWorker {
                             work,
                             cancelled,
                             mut done,
+                            context,
                         }) = jobs.recv()
                         {
                             let _ = signal.try_send(());
-                            let result = catch_unwind(AssertUnwindSafe(|| {
-                                work.run(&mut parser, &dependencies, &cancelled)
-                            }))
-                            .unwrap_or_else(|_| {
-                                parser.reset();
-                                Err(anyhow::anyhow!("Go reference worker panicked"))
+                            let result = telemetry::with_context(context, || {
+                                catch_unwind(AssertUnwindSafe(|| {
+                                    work.run(&mut parser, &dependencies, &cancelled)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    parser.reset();
+                                    Err(anyhow::anyhow!("Go reference worker panicked"))
+                                })
                             });
                             done.send(result);
                         }
@@ -251,6 +258,7 @@ struct DependencyJob {
     spelling: Arc<str>,
     done: Sender<DependencyResult>,
     trace: bool,
+    context: Option<telemetry::Context>,
 }
 
 struct DependencyResult {
@@ -260,7 +268,7 @@ struct DependencyResult {
 }
 
 pub(in crate::semantic) enum DependencySource {
-    Ready(PreparedReferenceSource),
+    Ready(PreparedDeclarations),
     Absent(NavigationText),
 }
 
@@ -290,36 +298,40 @@ impl ReferenceDependencyPool {
                 .spawn(move || {
                     while let Ok(job) = jobs.recv() {
                         let probe = NavigationProbe::default();
-                        let source = catch_unwind(AssertUnwindSafe(|| {
-                            let trace = job.trace.then_some(&probe);
-                            let text = match job.text {
-                                Some(text) => {
-                                    record(trace, |counts| counts.text_hits += 1);
-                                    text
+                        let source = telemetry::with_context(job.context, || {
+                            catch_unwind(AssertUnwindSafe(|| {
+                                let trace = job.trace.then_some(&probe);
+                                let text = match job.text {
+                                    Some(text) => {
+                                        record(trace, |counts| counts.text_hits += 1);
+                                        text
+                                    }
+                                    None => {
+                                        shared_disk.read(&job.path, Some(&job.cancelled), trace)?
+                                    }
+                                };
+                                if !contains_spelling(&text.text, &job.spelling, &job.cancelled)?
+                                    || shared_disk
+                                        .reference_identifiers(&text, &job.cancelled)?
+                                        .offsets(&job.spelling)
+                                        .is_some_and(|offsets| offsets.is_empty())
+                                {
+                                    return Ok(DependencySource::Absent(text));
                                 }
-                                None => shared_disk.read(&job.path, Some(&job.cancelled), trace)?,
-                            };
-                            if !contains_spelling(&text.text, &job.spelling, &job.cancelled)?
-                                || shared_disk
-                                    .reference_identifiers(&text, &job.cancelled)?
-                                    .offsets(&job.spelling)
-                                    .is_some_and(|offsets| offsets.is_empty())
-                            {
-                                return Ok(DependencySource::Absent(text));
-                            }
-                            shared_disk
-                                .load_declarations(
-                                    &mut parser,
-                                    &job.path,
-                                    text,
-                                    &job.cancelled,
-                                    trace,
-                                )
-                                .map(DependencySource::Ready)
-                        }))
-                        .unwrap_or_else(|_| {
-                            parser.reset();
-                            Err(anyhow::anyhow!("Go reference dependency worker panicked"))
+                                shared_disk
+                                    .load_declarations(
+                                        &mut parser,
+                                        &job.path,
+                                        Some(text),
+                                        Some(&job.cancelled),
+                                        trace,
+                                    )
+                                    .map(DependencySource::Ready)
+                            }))
+                            .unwrap_or_else(|_| {
+                                parser.reset();
+                                Err(anyhow::anyhow!("Go reference dependency worker panicked"))
+                            })
                         });
                         let _ = job.done.send(DependencyResult {
                             index: job.index,
@@ -344,6 +356,7 @@ impl ReferenceDependencies<'_> {
         let count = paths.len();
         let (done, results) = bounded(count);
         let spelling = Arc::<str>::from(spelling);
+        let context = telemetry::context();
         for (index, (path, text)) in paths.into_iter().enumerate() {
             let mut job = DependencyJob {
                 path,
@@ -353,6 +366,7 @@ impl ReferenceDependencies<'_> {
                 spelling: spelling.clone(),
                 done: done.clone(),
                 trace: probe.is_some(),
+                context,
             };
             loop {
                 check_cancelled(self.cancelled)?;
@@ -412,6 +426,7 @@ mod tests {
                             anyhow::bail!("reference worker ran again");
                         })),
                         cancelled: Arc::default(),
+                        context: None,
                         done: JobDone {
                             result: Some(done),
                             signal: Some(worker.signal.clone()),

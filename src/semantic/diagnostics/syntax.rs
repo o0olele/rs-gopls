@@ -6,7 +6,7 @@ use lsp_types::Range;
 
 use super::{DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DocumentSnapshot, checkpoint};
 
-pub(super) fn has_reliable_declarations(
+pub(in crate::semantic) fn has_reliable_declarations(
     root: tree_sitter::Node<'_>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<bool> {

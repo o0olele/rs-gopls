@@ -1,18 +1,25 @@
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::Result;
 use lsp_types::{Position, Range};
 use tree_sitter::Node;
 
-use super::index::IndexReader;
+use super::index::{IndexReader, SourceRev};
+use super::inference_memo::{InferenceKey, InferenceMemo, InferenceMode, Lookup};
 use super::navigation_trace::record;
+use super::package_index::PackageLookup;
 use super::source::{
-    Import, ReferenceQuery, Source, is_declaration_name, is_type_declaration, node_text,
+    Import, ReferenceQuery, Source, check_optional_cancelled, is_declaration_name,
+    is_type_declaration, node_text,
 };
 use crate::scope::{
-    declaration_binding, lexical_binding, receiver_type_parameters, reference_binding,
+    declaration_binding, lexical_binding, lexical_binding_cancellable, receiver_type_parameters,
+    reference_binding,
 };
 use crate::symbols::{
     self, Container, FunctionSignature, GenericParameter, InlineType, Symbol, SymbolKind,
@@ -107,6 +114,7 @@ pub(super) struct ResolvedSymbol<'w> {
     pub(super) symbol: Symbol,
     pub(super) receiver: Option<TypeIdentity<'w>>,
     pub(super) method_receiver: Option<Box<TypeIdentity<'w>>>,
+    pub(super) completion_revision: Option<SourceRev>,
 }
 
 impl ResolvedSymbol<'_> {
@@ -162,6 +170,17 @@ fn package_identity(package: &Package) -> &str {
         .map_or(&package.id, |(id, _)| id)
 }
 
+pub(super) fn receiver_parameter_origin(parameter: Node<'_>) -> Option<(Node<'_>, usize)> {
+    let method = std::iter::successors(parameter.parent(), |node| node.parent())
+        .find(|node| node.kind() == "method_declaration")?;
+    let (base, arguments) = receiver_type_parameters(method)?;
+    let index = arguments
+        .named_children(&mut arguments.walk())
+        .filter(|node| node.kind() == "type_elem")
+        .position(|node| node.named_child(0) == Some(parameter))?;
+    Some((base, index))
+}
+
 pub(super) type Substitutions<'w> = Vec<(String, Option<TypeIdentity<'w>>)>;
 
 enum DeclarationSelection<'a> {
@@ -176,7 +195,10 @@ enum DeclarationSelection<'a> {
 pub(super) struct Resolver<'w, 'idx> {
     pub(super) workspace: &'w Workspace,
     pub(super) indexes: IndexReader<'idx>,
-    diagnostic_symbols: Option<SymbolMemo<'w>>,
+    pub(super) inference_memo: InferenceMemo<'w>,
+    symbols: Option<SymbolMemo<'w>>,
+    #[cfg(test)]
+    symbol_memo_hits: usize,
 }
 
 type SymbolMemo<'w> = HashMap<(&'w str, String, Option<String>), Option<ResolvedSymbol<'w>>>;
@@ -187,15 +209,23 @@ impl<'w, 'idx> Resolver<'w, 'idx> {
         indexes: IndexReader<'idx>,
         diagnostics: bool,
     ) -> Self {
+        let memoize_symbols = diagnostics || indexes.foreground.is_some();
         Self {
             workspace,
             indexes,
-            diagnostic_symbols: diagnostics.then(HashMap::new),
+            inference_memo: InferenceMemo::new(),
+            symbols: memoize_symbols.then(HashMap::new),
+            #[cfg(test)]
+            symbol_memo_hits: 0,
         }
     }
 }
 
 impl<'w> Resolver<'w, '_> {
+    pub(super) fn check_cancelled(&self) -> Result<()> {
+        check_optional_cancelled(self.indexes.cancelled)
+    }
+
     pub(super) fn declaration_location(
         &mut self,
         from: &'w Package,
@@ -365,7 +395,7 @@ impl<'w> Resolver<'w, '_> {
                     });
                     return Ok(location(local));
                 }
-                self.source_type(from, source, explicit)
+                self.source_type_checked(from, source, explicit)?
             } else if let Some(initializer) = binding.initializer {
                 if binding.result_index == 0
                     && let Some(local) = lexical_expression_type(source, initializer)
@@ -392,18 +422,19 @@ impl<'w> Resolver<'w, '_> {
                 "function_declaration" | "method_declaration" | "method_elem"
             ) && node.child_by_field_name("name") == Some(name)
         }) {
-            self.source_type(from, source, owner)
+            self.source_type_checked(from, source, owner)?
         } else if source
             .imported_package(self.workspace, from, spelling)
             .is_some()
         {
             None
         } else {
-            self.infer_type(from, source, name, 0, 0)?.or_else(|| {
-                (name.kind() == "type_identifier")
-                    .then(|| self.source_type(from, source, name))
-                    .flatten()
-            })
+            let ty = self.infer_type(from, source, name, 0, 0)?;
+            if ty.is_none() && name.kind() == "type_identifier" {
+                self.source_type_checked(from, source, name)?
+            } else {
+                ty
+            }
         };
         match ty {
             Some(ty) => self.type_location(ty, root),
@@ -416,13 +447,13 @@ impl<'w> Resolver<'w, '_> {
         name: &str,
         root: &Path,
     ) -> Result<Option<(PathBuf, Range)>> {
-        let file = self.workspace.builtin_source(root)?;
+        let file = self.indexes.builtin_path(root)?;
         let probe = self.indexes.navigation;
-        let found = self.indexes.file_index(file)?.symbols.declaration(name);
+        let found = self.indexes.file_index(&file)?.symbols.declaration(name);
         if found.is_some() {
             record(probe, |counts| counts.definition_route = "builtin");
         }
-        Ok(found.map(|symbol| (file.to_owned(), symbol.range)))
+        Ok(found.map(|symbol| (file, symbol.range)))
     }
 
     fn type_location(
@@ -511,17 +542,17 @@ impl<'w> Resolver<'w, '_> {
         if location.is_some() || !is_predeclared(identifier) {
             return Ok(location);
         }
-        let file = self.workspace.builtin_source(root)?;
+        let file = self.indexes.builtin_path(root)?;
         let probe = self.indexes.navigation;
         let definition = self
             .indexes
-            .file_index(file)?
+            .file_index(&file)?
             .symbols
             .declaration(identifier);
         if definition.is_some() {
             record(probe, |counts| counts.definition_route = "builtin");
         }
-        Ok(definition.map(|symbol| (file.to_owned(), symbol.range)))
+        Ok(definition.map(|symbol| (file, symbol.range)))
     }
 
     pub(super) fn source_name_location(
@@ -540,18 +571,26 @@ impl<'w> Resolver<'w, '_> {
         if let Some((import, _)) = source.imported_package(self.workspace, from, identifier) {
             return Ok(Some((source.path.clone(), import.binding)));
         }
-        if let Some(location) = self.indexes.find(from, identifier, |index| {
-            index
-                .symbols
-                .declaration(identifier)
-                .map(|symbol| symbol.range)
-        })? {
-            return Ok(Some(location));
+        if let Some(symbol) = self.find_symbol(from, identifier, None)? {
+            return Ok(Some(symbol.location()));
         }
         if is_exported(identifier) {
-            return self
-                .indexes
-                .find_dot_import(self.workspace, from, &source.imports, identifier);
+            let mut found = None;
+            for import in source
+                .imports
+                .iter()
+                .filter(|import| import.alias.as_deref() == Some("."))
+            {
+                if let Some(package) = self.workspace.resolve_import(from, &import.path)
+                    && let Some(symbol) = self.find_symbol(package, identifier, None)?
+                {
+                    if found.is_some() {
+                        return Ok(None);
+                    }
+                    found = Some(symbol.location());
+                }
+            }
+            return Ok(found);
         }
         Ok(None)
     }
@@ -570,9 +609,10 @@ impl<'w> Resolver<'w, '_> {
             return Ok(None);
         };
         if parent.kind() == "composite_literal" {
-            return Ok(parent
-                .child_by_field_name("type")
-                .and_then(|ty| self.source_type(from, source, ty)));
+            return match parent.child_by_field_name("type") {
+                Some(ty) => self.source_type_checked(from, source, ty),
+                None => Ok(None),
+            };
         }
         let Some(container_element) = parent.parent() else {
             return Ok(None);
@@ -664,7 +704,11 @@ impl<'w> Resolver<'w, '_> {
             for (mut owner, mut visited) in frontier {
                 let mut inherited = false;
                 while let Some(key) = owner.key() {
-                    if owner.pointers > 1 || visited.contains(&key) {
+                    if owner.pointers > 1 {
+                        break;
+                    }
+                    if visited.contains(&key) {
+                        self.inference_memo.transient();
                         break;
                     }
                     visited.push(key);
@@ -735,6 +779,7 @@ impl<'w> Resolver<'w, '_> {
             }
             frontier = next;
         }
+        self.inference_memo.transient();
         Ok(None)
     }
 
@@ -785,39 +830,49 @@ impl<'w> Resolver<'w, '_> {
         let local = !matches!(selection, DeclarationSelection::Exports(_))
             && package_identity(from) == package_identity(target);
         let project = self.workspace.is_project_package(target);
-        let external = target.is_external();
         let can_prefilter = self.indexes.completion.is_some() && !target.load_error;
         for file in self.indexes.files(target).iter() {
+            self.check_cancelled()?;
+            let cancelled = self.indexes.cancelled;
             let index = match &mut selection {
                 DeclarationSelection::Exports(matches) if can_prefilter => self
                     .indexes
-                    .filtered_index(file, project, external, |names| names.may_export(*matches))?,
+                    .filtered_index(file, project, |names| names.may_export(*matches, cancelled))?,
                 DeclarationSelection::Local { matches, skipped } if can_prefilter => {
-                    self.indexes
-                        .filtered_index(file, project, external, |names| {
-                            names.local_matches(*matches, skipped)
-                        })?
+                    self.indexes.filtered_index(file, project, |names| {
+                        names.local_matches(*matches, skipped, cancelled)
+                    })?
                 }
                 _ => Some(self.indexes.file_index(file)?),
             };
             let Some(index) = index else {
                 continue;
             };
+            let mut symbols = Vec::new();
             for (name, symbol) in index.symbols.declarations() {
+                check_optional_cancelled(cancelled)?;
                 if name != "init"
                     && (local || is_exported(name))
                     && !matches!(selection, DeclarationSelection::Exports(matches) if !matches(name))
+                    && !declarations.contains_key(name)
                 {
-                    declarations
-                        .entry(name.to_owned())
-                        .or_insert_with(|| ResolvedSymbol {
-                            package: target,
-                            file: file.clone(),
-                            symbol: symbol.clone(),
-                            receiver: None,
-                            method_receiver: None,
-                        });
+                    symbols.push((name.to_owned(), symbol.clone()));
                 }
+            }
+            let completion_revision = self.indexes.completion_revision(file);
+            for (name, symbol) in symbols {
+                self.check_cancelled()?;
+                declarations.insert(
+                    name,
+                    ResolvedSymbol {
+                        package: target,
+                        file: file.clone(),
+                        symbol,
+                        receiver: None,
+                        method_receiver: None,
+                        completion_revision: completion_revision.clone(),
+                    },
+                );
             }
         }
         Ok(declarations.into_iter().collect())
@@ -873,6 +928,7 @@ impl<'w> Resolver<'w, '_> {
         members
             .into_iter()
             .map(|member| {
+                self.check_cancelled()?;
                 let visible =
                     member.visible_from(from) && !hidden_paths.contains(&member.embedded_path);
                 if !visible {
@@ -909,16 +965,21 @@ impl<'w> Resolver<'w, '_> {
             fields_only,
         }];
         for depth in 0..MAX_TYPE_DEPTH {
+            self.check_cancelled()?;
             if frontier.is_empty() {
                 break;
             }
             let mut next = Vec::new();
             for path in frontier {
                 for (member, pointer_allowed) in self.members_at_path(path, &mut next)? {
+                    self.check_cancelled()?;
                     visit(depth, member, pointer_allowed);
                 }
             }
             frontier = next;
+        }
+        if !frontier.is_empty() {
+            self.inference_memo.transient();
         }
         Ok(())
     }
@@ -938,7 +999,12 @@ impl<'w> Resolver<'w, '_> {
         let mut members = BTreeMap::new();
         let mut inherited = false;
         while let Some(key) = owner.key() {
-            if owner.pointers > 1 || ancestors.len() >= MAX_TYPE_DEPTH || ancestors.contains(&key) {
+            self.check_cancelled()?;
+            if owner.pointers > 1 {
+                break;
+            }
+            if ancestors.len() >= MAX_TYPE_DEPTH || ancestors.contains(&key) {
+                self.inference_memo.transient();
                 break;
             }
             let Some((file, details, substitutions)) = self.type_context(&owner)? else {
@@ -961,6 +1027,7 @@ impl<'w> Resolver<'w, '_> {
                 &mut members,
             )?;
 
+            let cancelled = self.indexes.cancelled;
             let imports = &self.indexes.file_index(&file)?.imports;
             let resolve = |reference| {
                 materialize_type(
@@ -988,6 +1055,7 @@ impl<'w> Resolver<'w, '_> {
             }
 
             for embedded in details.embedded {
+                check_optional_cancelled(cancelled)?;
                 let TypeRefKind::Named(named) = &embedded.kind else {
                     continue;
                 };
@@ -1018,21 +1086,28 @@ impl<'w> Resolver<'w, '_> {
         embedded_path: &[String],
         members: &mut BTreeMap<MemberKey<'w>, (VisibleMember<'w>, bool)>,
     ) -> Result<()> {
+        self.check_cancelled()?;
         if ancestors.len() >= MAX_TYPE_DEPTH {
+            self.inference_memo.transient();
             return Ok(());
         }
         let Some((owner, file, details, substitutions)) = self.constraint_interface(ty)? else {
             return Ok(());
         };
-        let Some(key) = owner.key().filter(|key| !ancestors.contains(key)) else {
+        let Some(key) = owner.key() else {
             return Ok(());
         };
+        if ancestors.contains(&key) {
+            self.inference_memo.transient();
+            return Ok(());
+        }
         ancestors.push(key);
         self.add_direct_members(&owner, embedded_path, false, false, members)?;
         let imports = self.indexes.file_index(&file)?.imports.clone();
         // Interface embedding contributes to one method set. The embedding
         // depth for selectors counts struct fields, not interface elements.
         for embedded in details.embedded {
+            self.check_cancelled()?;
             let Some(embedded) = materialize_type(
                 self.workspace,
                 owner.package,
@@ -1057,7 +1132,7 @@ impl<'w> Resolver<'w, '_> {
         pointer_allowed: bool,
         members: &mut BTreeMap<MemberKey<'w>, (VisibleMember<'w>, bool)>,
     ) -> Result<()> {
-        let mut add = |file: &Path, name: &str, symbol: &Symbol| {
+        let mut add = |file: &Path, name: &str, symbol: Symbol, completion_revision| {
             if name.is_empty()
                 || name == "_"
                 || (fields_only && matches!(symbol.kind, SymbolKind::Function(_)))
@@ -1069,9 +1144,10 @@ impl<'w> Resolver<'w, '_> {
                 resolved: ResolvedSymbol {
                     package: owner.package,
                     file: file.to_owned(),
-                    symbol: symbol.clone(),
+                    symbol,
                     receiver: Some(owner.clone()),
                     method_receiver: None,
+                    completion_revision,
                 },
                 embedded_path: embedded_path.to_vec(),
             };
@@ -1081,15 +1157,27 @@ impl<'w> Resolver<'w, '_> {
         };
         match &owner.kind {
             TypeKind::Named { name, .. } => {
-                for file in self.indexes.files(owner.package).iter() {
+                let files = self.indexes.lookup_files(owner.package)?;
+                for file in files.iter(PackageLookup::Receiver(name)) {
+                    self.check_cancelled()?;
+                    let cancelled = self.indexes.cancelled;
+                    let mut symbols = Vec::new();
                     for (name, symbol) in self.indexes.file_index(file)?.symbols.members_of(name) {
-                        add(file, name, symbol);
+                        check_optional_cancelled(cancelled)?;
+                        symbols.push((name.to_owned(), symbol.clone()));
+                    }
+                    let revision = self.indexes.completion_revision(file);
+                    for (name, symbol) in symbols {
+                        self.check_cancelled()?;
+                        add(file, &name, symbol, revision.clone());
                     }
                 }
             }
             TypeKind::Inline { file, shape, .. } => {
+                let revision = self.indexes.completion_revision(file);
                 for (name, symbol) in &shape.members {
-                    add(file, name, symbol);
+                    self.check_cancelled()?;
+                    add(file, name, symbol.clone(), revision.clone());
                 }
             }
             _ => {}
@@ -1125,6 +1213,7 @@ impl<'w> Resolver<'w, '_> {
                     symbol: symbol.clone(),
                     receiver: None,
                     method_receiver: None,
+                    completion_revision: self.indexes.completion_revision(file),
                 }))
             }
             TypeKind::Container(..) | TypeKind::Function { .. } | TypeKind::Parameter(_) => {
@@ -1200,6 +1289,7 @@ impl<'w> Resolver<'w, '_> {
         mut ty: TypeIdentity<'w>,
     ) -> Result<Option<TypeIdentity<'w>>> {
         for _ in 0..MAX_TYPE_DEPTH {
+            self.check_cancelled()?;
             if !matches!(ty.kind, TypeKind::Named { .. }) {
                 return Ok(Some(ty));
             }
@@ -1223,6 +1313,7 @@ impl<'w> Resolver<'w, '_> {
             underlying.project_properties(&ty);
             ty = underlying;
         }
+        self.inference_memo.transient();
         Ok(None)
     }
 
@@ -1232,23 +1323,24 @@ impl<'w> Resolver<'w, '_> {
         name: &str,
         receiver: Option<&str>,
     ) -> Result<Option<ResolvedSymbol<'w>>> {
-        if self.diagnostic_symbols.is_some() {
-            let key = (
-                package.id.as_str(),
-                name.to_owned(),
-                receiver.map(str::to_owned),
-            );
-            if let Some(cached) = self.diagnostic_symbols.as_ref().unwrap().get(&key) {
-                return Ok(cached.clone());
+        let Some(symbols) = &self.symbols else {
+            return self.find_symbol_in_files(package, name, receiver);
+        };
+        let key = (
+            package.id.as_str(),
+            name.to_owned(),
+            receiver.map(str::to_owned),
+        );
+        if let Some(cached) = symbols.get(&key) {
+            #[cfg(test)]
+            {
+                self.symbol_memo_hits += 1;
             }
-            let result = self.find_symbol_in_files(package, name, receiver)?;
-            self.diagnostic_symbols
-                .as_mut()
-                .unwrap()
-                .insert(key, result.clone());
-            return Ok(result);
+            return Ok(cached.clone());
         }
-        self.find_symbol_in_files(package, name, receiver)
+        let result = self.find_symbol_in_files(package, name, receiver)?;
+        self.symbols.as_mut().unwrap().insert(key, result.clone());
+        Ok(result)
     }
 
     fn find_symbol_in_files(
@@ -1271,15 +1363,17 @@ impl<'w> Resolver<'w, '_> {
                 symbol,
                 receiver: None,
                 method_receiver: None,
+                completion_revision: None,
             }));
         }
-        for file in self.indexes.files(package).iter() {
+        let files = self.indexes.lookup_files(package)?;
+        for file in files.iter(PackageLookup::Symbol(name, receiver)) {
+            self.check_cancelled()?;
             let index =
                 if receiver.is_none() && self.indexes.completion.is_some() && !package.load_error {
                     self.indexes.filtered_index(
                         file,
                         self.workspace.is_project_package(package),
-                        package.is_external(),
                         |names| names.may_declare(name),
                     )?
                 } else {
@@ -1293,12 +1387,14 @@ impl<'w> Resolver<'w, '_> {
                 None => index.declaration(name),
             };
             if let Some(symbol) = symbol {
+                let symbol = symbol.clone();
                 return Ok(Some(ResolvedSymbol {
                     package,
-                    file: file.clone(),
-                    symbol: symbol.clone(),
+                    file: file.to_owned(),
+                    symbol,
                     receiver: None,
                     method_receiver: None,
+                    completion_revision: self.indexes.completion_revision(file),
                 }));
             }
         }
@@ -1313,9 +1409,44 @@ impl<'w> Resolver<'w, '_> {
         depth: usize,
         result_index: usize,
     ) -> Result<Option<TypeIdentity<'w>>> {
-        if depth >= MAX_TYPE_DEPTH {
-            return Ok(None);
+        self.check_cancelled()?;
+        #[cfg(test)]
+        if !self.inference_memo.enabled() {
+            return if depth >= MAX_TYPE_DEPTH {
+                Ok(None)
+            } else {
+                self.infer_type_uncached(from, source, expression, depth, result_index)
+            };
         }
+        let key = InferenceKey::expr(
+            source,
+            from,
+            InferenceMode::Resolver,
+            expression,
+            result_index,
+        );
+        let cancelled = self.indexes.cancelled;
+        match self
+            .inference_memo
+            .start(key, depth, clean_inference_node(expression), cancelled)?
+        {
+            Lookup::Ready(value) => Ok(value),
+            Lookup::Evaluate(evaluation) => {
+                let result =
+                    self.infer_type_uncached(from, source, expression, depth, result_index);
+                self.inference_memo.finish(evaluation, result, cancelled)
+            }
+        }
+    }
+
+    fn infer_type_uncached(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        expression: Node<'_>,
+        depth: usize,
+        result_index: usize,
+    ) -> Result<Option<TypeIdentity<'w>>> {
         if expression.kind() == "call_expression" {
             return self.call_result(from, source, expression, depth + 1, result_index);
         }
@@ -1354,33 +1485,26 @@ impl<'w> Resolver<'w, '_> {
         match expression.kind() {
             "identifier" | "type_identifier" | "package_identifier" | "true" | "false" => {
                 let name = node_text(expression, &source.text);
-                if let Some(binding) = lexical_binding(expression, name, &source.text) {
-                    let addressable = binding
-                        .name
-                        .parent()
-                        .is_none_or(|node| node.kind() != "const_spec");
-                    let result = if let Some(ty) = binding.explicit_type {
-                        self.source_type(from, source, ty)
-                    } else if let Some(initializer) = binding.initializer {
-                        self.infer_type(from, source, initializer, depth + 1, binding.result_index)?
-                    } else {
-                        None
-                    };
-                    return Ok(result.map(|mut ty| {
-                        ty.type_expression = binding.name.parent().is_some_and(is_type_declaration);
-                        ty.addressable = addressable && !ty.type_expression;
-                        ty
-                    }));
+                if let Some(binding) = lexical_binding_cancellable(
+                    expression,
+                    name,
+                    &source.text,
+                    self.indexes.cancelled,
+                ) {
+                    return self.infer_local(from, source, binding, depth);
                 }
                 let Some(symbol) = self.find_symbol(from, name, None)? else {
                     return Ok(None);
                 };
                 self.symbol_type(source, &symbol, name, depth + 1)
             }
-            "func_literal" => Ok(self.source_type(from, source, expression)),
-            "composite_literal" | "type_assertion_expression" => Ok(expression
-                .child_by_field_name("type")
-                .and_then(|ty| self.source_type(from, source, ty))),
+            "func_literal" => self.source_type_checked(from, source, expression),
+            "composite_literal" | "type_assertion_expression" => {
+                match expression.child_by_field_name("type") {
+                    Some(ty) => self.source_type_checked(from, source, ty),
+                    None => Ok(None),
+                }
+            }
             "index_expression" | "slice_expression" => {
                 let Some(operand) = expression.child_by_field_name("operand") else {
                     return Ok(None);
@@ -1500,6 +1624,64 @@ impl<'w> Resolver<'w, '_> {
         }
     }
 
+    fn infer_local(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        binding: crate::scope::Binding<'_>,
+        depth: usize,
+    ) -> Result<Option<TypeIdentity<'w>>> {
+        #[cfg(test)]
+        if !self.inference_memo.enabled() {
+            return self.infer_local_uncached(from, source, binding, depth);
+        }
+        let scope = binding.scope.expect("lexical binding scope");
+        let key = InferenceKey::local(
+            source,
+            from,
+            InferenceMode::Resolver,
+            scope.id(),
+            binding.name,
+            binding.result_index,
+        );
+        let stable_input = clean_inference_node(binding.name)
+            && binding.name.parent().is_none_or(clean_inference_node)
+            && clean_inference_node(scope);
+        let cancelled = self.indexes.cancelled;
+        match self
+            .inference_memo
+            .start(key, depth, stable_input, cancelled)?
+        {
+            Lookup::Ready(value) => Ok(value),
+            Lookup::Evaluate(evaluation) => {
+                let result = self.infer_local_uncached(from, source, binding, depth);
+                self.inference_memo.finish(evaluation, result, cancelled)
+            }
+        }
+    }
+
+    fn infer_local_uncached(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        binding: crate::scope::Binding<'_>,
+        depth: usize,
+    ) -> Result<Option<TypeIdentity<'w>>> {
+        let owner = binding.name.parent();
+        let result = if let Some(ty) = binding.explicit_type {
+            self.source_type_checked(from, source, ty)?
+        } else if let Some(initializer) = binding.initializer {
+            self.infer_type(from, source, initializer, depth + 1, binding.result_index)?
+        } else {
+            None
+        };
+        Ok(result.map(|mut ty| {
+            ty.type_expression = owner.is_some_and(is_type_declaration);
+            ty.addressable = !ty.type_expression && owner.is_none_or(|n| n.kind() != "const_spec");
+            ty
+        }))
+    }
+
     fn call_result(
         &mut self,
         from: &'w Package,
@@ -1515,14 +1697,17 @@ impl<'w> Resolver<'w, '_> {
         if result_index == 0
             && function.kind() == "identifier"
             && matches!(spelling, "new" | "make")
-            && lexical_binding(function, spelling, &source.text).is_none()
+            && lexical_binding_cancellable(function, spelling, &source.text, self.indexes.cancelled)
+                .is_none()
             && self.find_symbol(from, spelling, None)?.is_none()
         {
             let Some(argument) = call
                 .child_by_field_name("arguments")
                 .and_then(|args| args.named_child(0))
-                .and_then(|node| self.source_type(from, source, node))
             else {
+                return Ok(None);
+            };
+            let Some(argument) = self.source_type_checked(from, source, argument)? else {
                 return Ok(None);
             };
             if spelling == "new" {
@@ -1543,9 +1728,21 @@ impl<'w> Resolver<'w, '_> {
             )
             .then_some(argument));
         }
-        let Some(mut ty) = self.infer_type(from, source, function, depth, 0)? else {
+        let Some(ty) = self.infer_type(from, source, function, depth, 0)? else {
             return Ok(None);
         };
+        self.call_result_from_callee(from, source, call, ty, depth, result_index)
+    }
+
+    pub(super) fn call_result_from_callee(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        call: Node<'_>,
+        mut ty: TypeIdentity<'w>,
+        depth: usize,
+        result_index: usize,
+    ) -> Result<Option<TypeIdentity<'w>>> {
         if let Some(explicit) = call.child_by_field_name("type_arguments") {
             let Some(specialized) =
                 self.specialize_function(from, source, ty, explicit_type_arguments(explicit))?
@@ -1615,9 +1812,11 @@ impl<'w> Resolver<'w, '_> {
                 );
             }
         }
-        Ok((result_index == 0)
-            .then(|| self.source_type(from, source, syntax))
-            .flatten())
+        if result_index == 0 {
+            self.source_type_checked(from, source, syntax)
+        } else {
+            Ok(None)
+        }
     }
 
     pub(super) fn indexed_element(
@@ -1655,6 +1854,7 @@ impl<'w> Resolver<'w, '_> {
         };
         let mut parameters = signature.type_parameters.iter();
         for argument in arguments {
+            self.check_cancelled()?;
             let Some(parameter) = parameters.next() else {
                 return Ok(None);
             };
@@ -1684,6 +1884,7 @@ impl<'w> Resolver<'w, '_> {
             return Ok(None);
         };
         for argument in arguments {
+            self.check_cancelled()?;
             if let Some(argument) = self.type_argument(caller, source, argument)? {
                 actual.push(Some(argument));
             } else {
@@ -1700,9 +1901,10 @@ impl<'w> Resolver<'w, '_> {
         argument: Node<'_>,
     ) -> Result<Option<TypeIdentity<'w>>> {
         if argument.has_error() {
+            self.inference_memo.transient();
             return Ok(None);
         }
-        let Some(ty) = self.source_type(caller, source, argument) else {
+        let Some(ty) = self.source_type_checked(caller, source, argument)? else {
             return Ok(None);
         };
         if let TypeKind::Named { name, .. } = &ty.kind
@@ -1766,15 +1968,37 @@ impl<'w> Resolver<'w, '_> {
             };
             substitutions = inferred;
         }
+        let cancelled = self.indexes.cancelled;
         let imports = &self.indexes.file_index(&file)?.imports;
-        Ok(materialize_type(
-            self.workspace,
-            package,
-            &file,
-            imports,
-            reference.clone(),
-            &substitutions,
-        ))
+        let materialize = || {
+            Ok(materialize_type(
+                self.workspace,
+                package,
+                &file,
+                imports,
+                reference.clone(),
+                &substitutions,
+            ))
+        };
+        // The caller's syntax is evaluated in its lexical environment. The
+        // substituted callee result has its own immutable context.
+        if depth >= MAX_TYPE_DEPTH {
+            return materialize();
+        }
+        let Some(subst) =
+            self.inference_memo
+                .substitution_id(package, &file, &signature, &substitutions)
+        else {
+            return materialize();
+        };
+        let key = InferenceKey::InstantiatedResult(subst, result_index);
+        match self.inference_memo.start(key, depth, true, cancelled)? {
+            Lookup::Ready(value) => Ok(value),
+            Lookup::Evaluate(evaluation) => {
+                let value = materialize();
+                self.inference_memo.finish(evaluation, value, cancelled)
+            }
+        }
     }
 
     pub(super) fn infer_type_arguments(
@@ -1784,6 +2008,7 @@ impl<'w> Resolver<'w, '_> {
         signature: &FunctionSignature,
         explicit: &Substitutions<'w>,
     ) -> Result<Option<Substitutions<'w>>> {
+        self.check_cancelled()?;
         let count = signature.parameters.len();
         let variadic = signature.variadic && count > 0;
         if !call.allow_partial
@@ -1830,6 +2055,7 @@ impl<'w> Resolver<'w, '_> {
         };
         let mut untyped = Vec::new();
         for (index, argument) in call.arguments.iter().copied().enumerate() {
+            self.check_cancelled()?;
             let Some(parameter) = signature
                 .parameters
                 .get(index)
@@ -1857,6 +2083,7 @@ impl<'w> Resolver<'w, '_> {
                 (argument, expected)
             };
             if argument.has_error() {
+                self.inference_memo.transient();
                 if call.allow_partial {
                     continue;
                 }
@@ -1885,6 +2112,7 @@ impl<'w> Resolver<'w, '_> {
             return Ok(None);
         }
         for (expected, default) in untyped {
+            self.check_cancelled()?;
             if let TypeKind::Parameter(index) = expected.kind
                 && let Some(bound) = bindings.get(index).and_then(Clone::clone)
                 && expected.pointers == 0
@@ -1913,6 +2141,7 @@ impl<'w> Resolver<'w, '_> {
             .map(|(param, ty)| (param.name.clone(), ty.clone()))
             .collect::<Vec<_>>();
         for (param, actual) in parameters.iter().zip(bindings) {
+            self.check_cancelled()?;
             if let (Some(reference), Some(mut actual)) = (param.constraint.methods.clone(), actual)
                 && let Some(required) = materialize_type(
                     workspace,
@@ -1947,8 +2176,10 @@ impl<'w> Resolver<'w, '_> {
         // A typed S with S ~[]E (or ~map[K]V) supplies the remaining
         // arguments through its underlying container shape.
         for _ in 0..bindings.len() {
+            self.check_cancelled()?;
             let previous_len = bindings.iter().filter(|slot| slot.is_some()).count();
             for (i, expected) in approximations.iter().enumerate() {
+                self.check_cancelled()?;
                 if let (Some(expected), Some(actual)) = (expected.clone(), bindings[i].clone()) {
                     let Some(underlying) = self.underlying_type(actual)? else {
                         return Ok(false);
@@ -1970,6 +2201,7 @@ impl<'w> Resolver<'w, '_> {
         mut ty: TypeIdentity<'w>,
     ) -> Result<Option<(TypeIdentity<'w>, PathBuf, TypeDetails, Substitutions<'w>)>> {
         for _ in 0..MAX_TYPE_DEPTH {
+            self.check_cancelled()?;
             let Some((file, details, substitutions)) = self.type_context(&ty)? else {
                 return Ok(None);
             };
@@ -1993,6 +2225,7 @@ impl<'w> Resolver<'w, '_> {
             next.project_properties(&ty);
             ty = next;
         }
+        self.inference_memo.transient();
         Ok(None)
     }
 
@@ -2002,16 +2235,22 @@ impl<'w> Resolver<'w, '_> {
         names: &mut Vec<(&'w Package, String)>,
         ancestors: &[TypeKey],
     ) -> Result<()> {
+        self.check_cancelled()?;
         if ancestors.len() >= MAX_TYPE_DEPTH {
+            self.inference_memo.transient();
             return Ok(());
         }
         let Some((ty, file, details, substitutions)) = self.constraint_interface(constraint)?
         else {
             return Ok(());
         };
-        let Some(key) = ty.key().filter(|key| !ancestors.contains(key)) else {
+        let Some(key) = ty.key() else {
             return Ok(());
         };
+        if ancestors.contains(&key) {
+            self.inference_memo.transient();
+            return Ok(());
+        }
         names.extend(
             details
                 .method_names
@@ -2022,6 +2261,7 @@ impl<'w> Resolver<'w, '_> {
         ancestors.push(key);
         let imports = self.indexes.file_index(&file)?.imports.clone();
         for embedded in details.embedded {
+            self.check_cancelled()?;
             if let Some(interface) = materialize_type(
                 self.workspace,
                 ty.package,
@@ -2043,6 +2283,7 @@ impl<'w> Resolver<'w, '_> {
         bindings: &mut [Option<TypeIdentity<'w>>],
         loose: bool,
     ) -> Result<bool> {
+        self.check_cancelled()?;
         if let TypeKind::Parameter(index) = expected.kind {
             let Some(pointers) = actual.pointers.checked_sub(expected.pointers) else {
                 return Ok(false);
@@ -2175,6 +2416,7 @@ impl<'w> Resolver<'w, '_> {
         mut ty: TypeIdentity<'w>,
     ) -> Result<Option<TypeIdentity<'w>>> {
         for _ in 0..MAX_TYPE_DEPTH {
+            self.check_cancelled()?;
             let TypeKind::Named { name, .. } = &ty.kind else {
                 return Ok(Some(ty));
             };
@@ -2199,6 +2441,7 @@ impl<'w> Resolver<'w, '_> {
             underlying.project_properties(&ty);
             ty = underlying;
         }
+        self.inference_memo.transient();
         Ok(None)
     }
 
@@ -2208,7 +2451,8 @@ impl<'w> Resolver<'w, '_> {
         source: &Source,
         ty: Node<'_>,
     ) -> Option<TypeIdentity<'w>> {
-        self.source_type_with_scope(from, source, ty, true)
+        debug_assert!(self.indexes.foreground.is_none());
+        self.source_type_checked(from, source, ty).ok().flatten()
     }
 
     pub(super) fn source_type_unscoped(
@@ -2218,6 +2462,16 @@ impl<'w> Resolver<'w, '_> {
         ty: Node<'_>,
     ) -> Option<TypeIdentity<'w>> {
         self.source_type_with_scope(from, source, ty, false)
+            .expect("unscoped type syntax does not read dependencies")
+    }
+
+    fn source_type_checked(
+        &mut self,
+        from: &'w Package,
+        source: &Source,
+        ty: Node<'_>,
+    ) -> Result<Option<TypeIdentity<'w>>> {
+        self.source_type_with_scope(from, source, ty, true)
     }
 
     fn source_type_with_scope(
@@ -2226,52 +2480,94 @@ impl<'w> Resolver<'w, '_> {
         source: &Source,
         ty: Node<'_>,
         lexical: bool,
-    ) -> Option<TypeIdentity<'w>> {
-        let parse = |node| symbols::type_ref(node, &source.text, &|node| source.range(node));
-        let mut reference = parse(ty)?;
+    ) -> Result<Option<TypeIdentity<'w>>> {
+        let cancelled = if lexical {
+            self.indexes.cancelled
+        } else {
+            None
+        };
+        check_optional_cancelled(cancelled)?;
+        if !clean_inference_node(ty) {
+            self.inference_memo.transient();
+        }
+        let parse = |node| {
+            symbols::type_ref_inner(node, &source.text, &|node| source.range(node), cancelled)
+        };
+        let Some(mut reference) = parse(ty) else {
+            return Ok(None);
+        };
         let mut constrained = false;
         if lexical
             && let TypeRefKind::Named(named) = &reference.kind
             && named.qualifier.is_none()
-            && let Some(binding) = lexical_binding(ty, &named.name, &source.text)
+            && let Some(binding) =
+                lexical_binding_cancellable(ty, &named.name, &source.text, cancelled)
         {
-            let owner = binding.name.parent()?;
+            let Some(owner) = binding.name.parent() else {
+                return Ok(None);
+            };
+            if !clean_inference_node(owner)
+                || binding
+                    .scope
+                    .is_some_and(|scope| !clean_inference_node(scope))
+            {
+                self.inference_memo.transient();
+            }
             if owner.kind() == "type_parameter_declaration" && reference.pointers == 0 {
                 constrained = true;
-                reference =
-                    symbols::type_constraint(binding.explicit_type?, &source.text, &|node| {
-                        source.range(node)
-                    })
-                    .methods?;
+                let Some(constraint) = binding.explicit_type.and_then(|explicit| {
+                    symbols::type_constraint(
+                        explicit,
+                        &source.text,
+                        &|node| source.range(node),
+                        cancelled,
+                    )
+                    .methods
+                }) else {
+                    return Ok(None);
+                };
+                reference = constraint;
             } else if owner.kind() == "type_elem" && reference.pointers == 0 {
                 return self.receiver_constraint(from, source, binding.name);
             } else {
-                if !is_type_declaration(owner) {
-                    return None;
-                }
-                let mut underlying = parse(binding.explicit_type?)?;
+                let Some(mut underlying) = binding
+                    .explicit_type
+                    .filter(|_| is_type_declaration(owner))
+                    .and_then(parse)
+                else {
+                    return Ok(None);
+                };
                 if !matches!(
                     underlying.kind,
                     TypeRefKind::Function(_) | TypeRefKind::Inline(_)
                 ) {
-                    return None;
+                    return Ok(None);
                 }
-                underlying.pointers = underlying.pointers.checked_add(reference.pointers)?;
+                let Some(pointers) = underlying.pointers.checked_add(reference.pointers) else {
+                    return Ok(None);
+                };
+                underlying.pointers = pointers;
                 reference = underlying;
             }
         }
-        let ty = materialize_type(
+        let ty = materialize_type_cancellable(
             self.workspace,
             from,
             &source.path,
             &source.imports,
             reference,
             &[],
-        )?;
+            cancelled,
+        );
+        check_optional_cancelled(cancelled)?;
+        let Some(ty) = ty else {
+            return Ok(None);
+        };
         if !constrained {
-            return Some(ty);
+            return Ok(Some(ty));
         }
-        Some(self.constraint_interface(ty).ok()??.0)
+        let result = self.constraint_interface(ty);
+        Ok(self.type_dependency(result)?.flatten().map(|(ty, ..)| ty))
     }
 
     fn receiver_constraint(
@@ -2279,23 +2575,48 @@ impl<'w> Resolver<'w, '_> {
         from: &'w Package,
         source: &Source,
         parameter: Node<'_>,
-    ) -> Option<TypeIdentity<'w>> {
-        let mut method = parameter.parent()?;
-        while method.kind() != "method_declaration" {
-            method = method.parent()?;
-        }
-        let (base, arguments) = receiver_type_parameters(method)?;
-        let mut cursor = arguments.walk();
-        let index = arguments
-            .named_children(&mut cursor)
-            .filter(|node| node.kind() == "type_elem")
-            .position(|node| node.named_child(0) == Some(parameter))?;
+    ) -> Result<Option<TypeIdentity<'w>>> {
+        let Some((base, index)) = receiver_parameter_origin(parameter) else {
+            return Ok(None);
+        };
         let name = node_text(base, &source.text);
-        let (file, details) = self.type_info(from, name).ok()??;
-        let reference = details.parameters.get(index)?.constraint.methods.clone()?;
-        let imports = &self.indexes.file_index(&file).ok()?.imports;
-        let ty = materialize_type(self.workspace, from, &file, imports, reference, &[])?;
-        Some(self.constraint_interface(ty).ok()??.0)
+        let result = self.type_info(from, name);
+        let Some((file, details)) = self.type_dependency(result)?.flatten() else {
+            return Ok(None);
+        };
+        let Some(reference) = details
+            .parameters
+            .get(index)
+            .and_then(|parameter| parameter.constraint.methods.clone())
+        else {
+            return Ok(None);
+        };
+        let foreground = self.indexes.foreground.is_some();
+        let imports = match self.indexes.file_index(&file) {
+            Ok(index) => &index.imports,
+            Err(error) if foreground => return Err(error),
+            Err(_) => {
+                self.inference_memo.transient();
+                return Ok(None);
+            }
+        };
+        let Some(ty) = materialize_type(self.workspace, from, &file, imports, reference, &[])
+        else {
+            return Ok(None);
+        };
+        let result = self.constraint_interface(ty);
+        Ok(self.type_dependency(result)?.flatten().map(|(ty, ..)| ty))
+    }
+
+    fn type_dependency<T>(&mut self, result: Result<T>) -> Result<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if self.indexes.foreground.is_some() => Err(error),
+            Err(_) => {
+                self.inference_memo.transient();
+                Ok(None)
+            }
+        }
     }
 
     pub(super) fn symbol_type(
@@ -2327,7 +2648,7 @@ impl<'w> Resolver<'w, '_> {
                 } else {
                     cached = self
                         .indexes
-                        .declaration_source(&resolved.file)?
+                        .declaration_syntax(&resolved.file)?
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
                     cached.as_ref()
                 };
@@ -2337,6 +2658,7 @@ impl<'w> Resolver<'w, '_> {
                     .named_descendant_for_byte_range(initializer.start, initializer.end)
                     .filter(|node| node.byte_range() == *initializer)
                 else {
+                    self.inference_memo.transient();
                     return Ok(None);
                 };
                 let mut ty =
@@ -2409,6 +2731,10 @@ impl<'w> Resolver<'w, '_> {
 pub(super) struct TypeOrigin<'w, 'path> {
     pub(super) package: &'w Package,
     pub(super) file: &'path Path,
+}
+
+pub(super) fn clean_inference_node(node: Node<'_>) -> bool {
+    !node.has_error() && !node.is_error() && !node.is_missing()
 }
 
 pub(super) fn explicit_type_arguments(list: Node<'_>) -> Vec<Node<'_>> {
@@ -2530,8 +2856,41 @@ pub(super) fn materialize_type<'w>(
     reference: TypeRef,
     substitutions: &[(String, Option<TypeIdentity<'w>>)],
 ) -> Option<TypeIdentity<'w>> {
-    let resolve =
-        |reference| materialize_type(workspace, from, file, imports, reference, substitutions);
+    materialize_type_cancellable(
+        workspace,
+        from,
+        file,
+        imports,
+        reference,
+        substitutions,
+        None,
+    )
+}
+
+pub(super) fn materialize_type_cancellable<'w>(
+    workspace: &'w Workspace,
+    from: &'w Package,
+    file: &Path,
+    imports: &[Import],
+    reference: TypeRef,
+    substitutions: &[(String, Option<TypeIdentity<'w>>)],
+    cancelled: Option<&AtomicBool>,
+) -> Option<TypeIdentity<'w>> {
+    let is_cancelled = || cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    if is_cancelled() {
+        return None;
+    }
+    let resolve = |reference| {
+        materialize_type_cancellable(
+            workspace,
+            from,
+            file,
+            imports,
+            reference,
+            substitutions,
+            cancelled,
+        )
+    };
     let (package, kind) = match reference.kind {
         TypeRefKind::Named(named) => {
             if named.qualifier.is_none()
@@ -2549,6 +2908,7 @@ pub(super) fn materialize_type<'w>(
             let arguments = named
                 .arguments
                 .into_iter()
+                .take_while(|_| !is_cancelled())
                 .map(|arg| arg.and_then(resolve))
                 .collect();
             (
@@ -2854,6 +3214,57 @@ mod enumeration_tests {
 
     fn names<'a>(members: &'a [VisibleMember<'_>]) -> Vec<&'a str> {
         members.iter().map(|member| member.name.as_str()).collect()
+    }
+
+    #[test]
+    fn foreground_resolver_reuses_member_hits_and_completed_misses() {
+        let project = TestProject::new();
+        let text = "package sample\ntype Node interface { Next() Node }\n";
+        let path = project.write("types.go", text);
+        let mut engine = Engine::new(project.root.clone());
+        assert!(engine.install_workspace(
+            engine.workspace_load(),
+            project.workspace(&["types.go"], false)
+        ));
+        engine.open(path.clone(), text.into(), 1).unwrap();
+        let document = engine.snapshot().document(&path).unwrap().unwrap();
+        let _ = document.declarations();
+
+        let memo = super::super::QueryReadMemo::default();
+        let mut snapshot = engine.snapshot().with_foreground(&memo);
+        let workspace = snapshot.workspace().unwrap();
+        let package = workspace.package_of_file(&path).unwrap();
+        let ty = TypeIdentity::named(package, "Node");
+        let mut resolver = snapshot.resolver(workspace);
+        let next = resolver
+            .direct_member(&ty, "Next", true)
+            .unwrap()
+            .unwrap()
+            .location();
+        assert_eq!(next.0, path);
+        assert_eq!(
+            resolver
+                .direct_member(&ty, "Next", true)
+                .unwrap()
+                .unwrap()
+                .location(),
+            next
+        );
+        assert!(
+            resolver
+                .direct_member(&ty, "Missing", true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolver
+                .direct_member(&ty, "Missing", true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(resolver.symbol_memo_hits, 2);
+        let types = resolver.indexes.diagnostic_types.as_ref().unwrap();
+        assert!(types[&package.id]["Node"].as_ref().unwrap().1.interface);
     }
 
     #[test]

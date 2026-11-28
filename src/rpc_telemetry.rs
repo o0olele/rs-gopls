@@ -1,8 +1,8 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Request, RequestId, Response};
@@ -38,18 +38,28 @@ struct RequestTrace {
     received: Instant,
     method: &'static str,
     fields: Value,
+    context: telemetry::Context,
     active_ms: f64,
     serialize_ms: f64,
     wait_reason: Option<&'static str>,
     replay_count: u32,
+    waiting: Option<(Wait, Instant)>,
+    workspace_wait: Duration,
+    shared_source_wait: Duration,
+    shared_source_replays: u32,
+    shared_disk: telemetry::SharedDiskStats,
+    phases: Phases,
     navigation: Option<NavigationTrace>,
 }
 
+#[derive(Clone, Copy)]
+enum Wait {
+    Workspace,
+    SharedSource,
+}
+
 pub(super) fn request_id(id: &RequestId) -> Value {
-    match json!(id) {
-        Value::String(id) => json!(telemetry::hash(&id)),
-        id => id,
-    }
+    telemetry::request_id(id)
 }
 
 pub(super) fn received(message: &Message) {
@@ -63,13 +73,15 @@ pub(super) fn received(message: &Message) {
 pub(super) fn begin(request: &Request, method: &'static str) -> Step {
     let now = Instant::now();
     let received = RECEIVED.lock().unwrap().remove(&request.id).unwrap_or(now);
+    let context = telemetry::Context::request(&request.id);
     let document = request
         .params
         .pointer("/textDocument/uri")
+        .or_else(|| request.params.pointer("/data/uri"))
         .and_then(Value::as_str)
         .and_then(document_path);
     let fields = json!({
-        "req_id": request_id(&request.id),
+        "req_id": context.req_id(),
         "method": method,
         "document": document,
         "line": request.params.pointer("/position/line").and_then(Value::as_u64),
@@ -84,10 +96,17 @@ pub(super) fn begin(request: &Request, method: &'static str) -> Step {
                 received,
                 method,
                 fields,
+                context,
                 active_ms: 0.0,
                 serialize_ms: 0.0,
                 wait_reason: None,
                 replay_count: 0,
+                waiting: None,
+                workspace_wait: Duration::ZERO,
+                shared_source_wait: Duration::ZERO,
+                shared_source_replays: 0,
+                shared_disk: telemetry::SharedDiskStats::default(),
+                phases: Phases::default(),
                 navigation: NavigationTrace::new(request, received, document),
             },
         );
@@ -102,6 +121,7 @@ fn document_path(uri: &str) -> Option<String> {
 
 pub(super) struct Step {
     previous: Option<Active>,
+    _context: Option<telemetry::ContextGuard>,
 }
 
 impl Step {
@@ -110,14 +130,21 @@ impl Step {
             id: id.clone(),
             start,
         };
-        let previous = REQUESTS.with_borrow_mut(|requests| {
+        let (previous, context) = REQUESTS.with_borrow_mut(|requests| {
             let previous = requests.active.replace(active);
             if let Some(previous) = &previous {
                 requests.account_step(previous, start);
             }
-            previous
+            let context = requests.entries.get_mut(id).map(|trace| {
+                trace.finish_wait(start, true);
+                trace.context
+            });
+            (previous, context)
         });
-        Self { previous }
+        Self {
+            previous,
+            _context: telemetry::enter_context(context),
+        }
     }
 }
 
@@ -138,20 +165,90 @@ impl Drop for Step {
 
 impl Requests {
     fn account_step(&mut self, active: &Active, end: Instant) {
+        let shared_disk = telemetry::take_shared_disk_stats();
         if let Some(trace) = self.entries.get_mut(&active.id) {
             trace.active_ms += telemetry::millis(end.saturating_duration_since(active.start));
+            trace.shared_disk.merge(shared_disk);
+        } else {
+            telemetry::merge_shared_disk_stats(shared_disk);
         }
     }
 
     fn take_trace(&mut self, id: &RequestId, end: Instant) -> Option<RequestTrace> {
         let mut trace = self.entries.remove(id)?;
+        trace.finish_wait(end, false);
         if let Some(active) = &self.active
             && &active.id == id
         {
             trace.active_ms += telemetry::millis(end.saturating_duration_since(active.start));
+            trace.shared_disk.merge(telemetry::take_shared_disk_stats());
         }
         Some(trace)
     }
+}
+
+impl RequestTrace {
+    fn finish_wait(&mut self, end: Instant, resumed: bool) {
+        if let Some((kind, start)) = self.waiting.take() {
+            let elapsed = end.saturating_duration_since(start);
+            match kind {
+                Wait::Workspace => self.workspace_wait += elapsed,
+                Wait::SharedSource => {
+                    self.shared_source_wait += elapsed;
+                    self.shared_source_replays += u32::from(resumed);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Phases {
+    active: Option<(&'static str, Instant)>,
+    elapsed: BTreeMap<&'static str, f64>,
+}
+
+impl Phases {
+    fn account(&mut self, end: Instant) -> Option<&'static str> {
+        let (name, start) = self.active.take()?;
+        *self.elapsed.entry(name).or_default() +=
+            telemetry::millis(end.saturating_duration_since(start));
+        Some(name)
+    }
+}
+
+struct Phase {
+    id: RequestId,
+    previous: Option<&'static str>,
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) {
+        REQUESTS.with_borrow_mut(|requests| {
+            if let Some(trace) = requests.entries.get_mut(&self.id) {
+                let now = Instant::now();
+                trace.phases.account(now);
+                trace.phases.active = self.previous.map(|name| (name, now));
+            }
+        });
+    }
+}
+
+pub(crate) fn phase(name: &'static str) -> Option<impl Drop> {
+    if !telemetry::enabled() {
+        return None;
+    }
+    REQUESTS.with_borrow_mut(|requests| {
+        let id = &requests.active.as_ref()?.id;
+        let trace = requests.entries.get_mut(id)?;
+        let now = Instant::now();
+        let previous = trace.phases.account(now);
+        trace.phases.active = Some((name, now));
+        Some(Phase {
+            id: id.clone(),
+            previous,
+        })
+    })
 }
 
 pub(super) fn step(id: &RequestId, replay: bool) -> Option<Step> {
@@ -180,6 +277,18 @@ pub(super) fn navigation_step() -> Option<impl Drop> {
 }
 
 pub(super) fn wait(reason: impl FnOnce() -> &'static str) -> &'static str {
+    note_wait(Some(reason), None)
+}
+
+pub(super) fn wait_workspace(reason: impl FnOnce() -> &'static str) -> &'static str {
+    note_wait(Some(reason), Some(Wait::Workspace))
+}
+
+pub(super) fn wait_shared_source() {
+    note_wait(None::<fn() -> &'static str>, Some(Wait::SharedSource));
+}
+
+fn note_wait(reason: Option<impl FnOnce() -> &'static str>, kind: Option<Wait>) -> &'static str {
     if !telemetry::enabled() {
         return "request";
     }
@@ -187,7 +296,14 @@ pub(super) fn wait(reason: impl FnOnce() -> &'static str) -> &'static str {
         if let Some(active) = &requests.active
             && let Some(trace) = requests.entries.get_mut(&active.id)
         {
-            trace.wait_reason = Some(reason());
+            if let Some(reason) = reason {
+                trace.wait_reason = Some(reason());
+            }
+            if let Some(kind) = kind {
+                let now = Instant::now();
+                trace.finish_wait(now, false);
+                trace.waiting = Some((kind, now));
+            }
             return trace.method;
         }
         "request"
@@ -344,6 +460,13 @@ pub(super) fn responding(response: &Response) {
     trace.fields["waited_workspace"] = json!(trace.wait_reason.is_some());
     trace.fields["wait_reason"] = json!(trace.wait_reason);
     trace.fields["replay_count"] = json!(trace.replay_count);
+    trace.fields["workspace_wait_ms"] = json!(telemetry::millis(trace.workspace_wait));
+    trace.fields["shared_source_wait_ms"] = json!(telemetry::millis(trace.shared_source_wait));
+    trace.fields["shared_source_replay_count"] = json!(trace.shared_source_replays);
+    trace.shared_disk.add_fields(&mut trace.fields);
+    if !trace.phases.elapsed.is_empty() {
+        trace.fields["phases_ms"] = json!(trace.phases.elapsed);
+    }
     let outgoing = Outgoing {
         received: trace.received,
         fields: trace.fields,
@@ -363,6 +486,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nested_phases_charge_only_active_time_across_replays() {
+        let time = Instant::now();
+        let at = |ms| time + Duration::from_millis(ms);
+        let mut phases = Phases {
+            active: Some(("symbol", at(0))),
+            ..Phases::default()
+        };
+        let outer = phases.account(at(2)).unwrap();
+        phases.active = Some(("package_doc", at(2)));
+        phases.account(at(5));
+        phases.active = Some((outer, at(5)));
+        phases.account(at(7));
+        phases.active = Some(("symbol", at(20)));
+        phases.account(at(21));
+        assert_eq!(phases.elapsed["symbol"], 5.0);
+        assert_eq!(phases.elapsed["package_doc"], 3.0);
+    }
+
+    #[test]
     fn nested_diagnostic_delivery_retains_dispatch_time() {
         let id = RequestId::from(1);
         let received = Instant::now();
@@ -373,10 +515,17 @@ mod tests {
                     received,
                     method: "textDocument/diagnostic",
                     fields: Value::Null,
+                    context: telemetry::Context::request(&id),
                     active_ms: 0.0,
                     serialize_ms: 0.0,
                     wait_reason: None,
                     replay_count: 0,
+                    waiting: None,
+                    workspace_wait: Duration::ZERO,
+                    shared_source_wait: Duration::ZERO,
+                    shared_source_replays: 0,
+                    shared_disk: telemetry::SharedDiskStats::default(),
+                    phases: Phases::default(),
                     navigation: None,
                 },
             );

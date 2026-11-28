@@ -22,8 +22,9 @@ pub(crate) enum ImportOperation<'a> {
         alias: Option<&'a str>,
     },
     OrganizeImports {
-        unused_paths: &'a [&'a str],
+        unused_specs: &'a [usize],
         local_prefixes: &'a [&'a str],
+        package_names: &'a HashMap<&'a str, &'a str>,
     },
 }
 
@@ -84,11 +85,12 @@ pub(crate) fn import_edits(
             header.add(document, path, alias, eol, completion)
         }
         ImportOperation::OrganizeImports {
-            unused_paths,
+            unused_specs,
             local_prefixes,
+            package_names,
         } => {
-            let unused: HashSet<_> = unused_paths.iter().copied().collect();
-            let redundant = redundant_aliases(&header, &unused);
+            let unused: HashSet<_> = unused_specs.iter().copied().collect();
+            let redundant = redundant_aliases(&header, &unused, package_names);
             let mut merged = ImportBlock::default();
             let mut sections: Vec<Range<usize>> = Vec::new();
             for decl in header.declarations {
@@ -109,9 +111,7 @@ pub(crate) fn import_edits(
                     if spec.is_unused(&unused) {
                         continue;
                     }
-                    if redundant.contains(&spec.path)
-                        && spec.alias == Some(assumed_name(&spec.path))
-                    {
+                    if redundant.contains(&spec.start) {
                         spec.alias = None;
                     }
                     spec.group = classify(&spec.path, local_prefixes);
@@ -456,6 +456,7 @@ struct Spec<'a> {
     path: String,
     alias: Option<&'a str>,
     literal: &'a str,
+    start: usize,
     bytes: Range<usize>,
     indent: Option<&'a str>,
     leading: Vec<&'a str>,
@@ -478,6 +479,7 @@ impl<'a> Spec<'a> {
             path,
             alias: node.child_by_field_name("name").map(|n| node_text(n, text)),
             literal,
+            start: node.start_byte(),
             bytes: node.start_byte()..trailing_end(node, text),
             indent: line_indent(text, node.start_byte()),
             leading: Vec::new(),
@@ -505,10 +507,8 @@ impl<'a> Spec<'a> {
             }
     }
 
-    fn is_unused(&self, unused: &HashSet<&str>) -> bool {
-        self.path != "C"
-            && !matches!(self.alias, Some("_" | "."))
-            && unused.contains(self.path.as_str())
+    fn is_unused(&self, unused: &HashSet<usize>) -> bool {
+        self.path != "C" && !matches!(self.alias, Some("_" | ".")) && unused.contains(&self.start)
     }
 
     fn line(&self, extra: &[&str]) -> String {
@@ -591,11 +591,15 @@ fn assumed_name(path: &str) -> &str {
     name.strip_prefix("go-").unwrap_or(name)
 }
 
-fn redundant_aliases(header: &Header<'_>, unused: &HashSet<&str>) -> HashSet<String> {
+fn redundant_aliases(
+    header: &Header<'_>,
+    unused: &HashSet<usize>,
+    package_names: &HashMap<&str, &str>,
+) -> HashSet<usize> {
     let mut bindings = HashMap::new();
     let mut conflicts = HashSet::new();
     let mut renamed = HashSet::new();
-    let mut redundant = HashSet::new();
+    let mut redundant = Vec::new();
     for spec in header.declarations.iter().flat_map(|decl| {
         let cgo = decl.cgo();
         decl.block
@@ -606,7 +610,8 @@ fn redundant_aliases(header: &Header<'_>, unused: &HashSet<&str>) -> HashSet<Str
         if matches!(spec.alias, Some("_" | ".")) {
             continue;
         }
-        let name = spec.binding();
+        let actual_name = package_names.get(spec.path.as_str()).copied();
+        let name = spec.alias.or(actual_name).unwrap_or_else(|| spec.binding());
         if bindings
             .insert(name, &spec.path)
             .is_some_and(|p| p != &spec.path)
@@ -614,15 +619,18 @@ fn redundant_aliases(header: &Header<'_>, unused: &HashSet<&str>) -> HashSet<Str
             conflicts.insert(name);
         }
         if spec.alias.is_some() {
-            if name == assumed_name(&spec.path) {
-                redundant.insert(spec.path.clone());
+            if actual_name == Some(name) {
+                redundant.push((spec.start, &spec.path, name));
             } else {
                 renamed.insert(&spec.path);
             }
         }
     }
-    redundant.retain(|p| !renamed.contains(p) && !conflicts.contains(assumed_name(p)));
     redundant
+        .into_iter()
+        .filter(|(_, path, name)| !renamed.contains(path) && !conflicts.contains(name))
+        .map(|(start, ..)| start)
+        .collect()
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -946,12 +954,19 @@ mod tests {
         text: &str,
         operation: ImportOperation<'_>,
     ) -> Result<(Vec<TextEdit>, String), ImportEditError> {
+        apply_with(text, |document| import_edits(document, operation))
+    }
+
+    fn apply_with(
+        text: &str,
+        edit: impl FnOnce(&super::DocumentSnapshot<'_>) -> Result<Vec<TextEdit>, ImportEditError>,
+    ) -> Result<(Vec<TextEdit>, String), ImportEditError> {
         let project = TestProject::new();
         let path = project.root.join("p.go");
         let mut engine = Engine::new(project.root.clone());
         engine.open(path.clone(), text.into(), 1).unwrap();
         let document = engine.snapshot().document(&path).unwrap().unwrap();
-        let edits = import_edits(&document, operation)?;
+        let edits = edit(&document)?;
         for pair in edits.windows(2) {
             assert!(
                 pair[0].range.start < pair[1].range.start
@@ -985,13 +1000,32 @@ mod tests {
         local_prefixes: &[&str],
         after: &str,
     ) -> Vec<TextEdit> {
-        let organize = ImportOperation::OrganizeImports {
-            unused_paths,
-            local_prefixes,
+        let organize = |document: &super::DocumentSnapshot<'_>| {
+            let header = super::Header::parse(document)?;
+            let specs = header
+                .declarations
+                .iter()
+                .flat_map(|decl| &decl.block.specs);
+            let package_names = specs
+                .clone()
+                .map(|spec| (spec.path.as_str(), super::assumed_name(&spec.path)))
+                .collect();
+            let unused_specs: Vec<_> = specs
+                .filter(|spec| unused_paths.contains(&spec.path.as_str()))
+                .map(|spec| spec.start)
+                .collect();
+            import_edits(
+                document,
+                ImportOperation::OrganizeImports {
+                    unused_specs: &unused_specs,
+                    local_prefixes,
+                    package_names: &package_names,
+                },
+            )
         };
-        let (edits, result) = apply(before, organize).unwrap();
+        let (edits, result) = apply_with(before, organize).unwrap();
         assert_eq!(result, after);
-        assert!(apply(after, organize).unwrap().0.is_empty());
+        assert!(apply_with(after, organize).unwrap().0.is_empty());
         edits
     }
 
@@ -1331,8 +1365,9 @@ mod tests {
             for operation in [
                 add("fmt", None),
                 ImportOperation::OrganizeImports {
-                    unused_paths: &[],
+                    unused_specs: &[],
                     local_prefixes: &[],
+                    package_names: &Default::default(),
                 },
             ] {
                 assert_eq!(
@@ -1710,8 +1745,9 @@ mod completion_tests {
             import_edits(
                 doc,
                 ImportOperation::OrganizeImports {
-                    unused_paths: &[],
+                    unused_specs: &[],
                     local_prefixes: &[],
+                    package_names: &Default::default(),
                 },
             )
         })

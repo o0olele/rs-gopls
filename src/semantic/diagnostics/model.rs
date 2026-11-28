@@ -330,6 +330,7 @@ pub(crate) struct DiagnosticProvenance {
     pub(crate) job: u64,
     pub(crate) run: u64,
     pub(crate) lane: &'static str,
+    pub(crate) stage: DiagnosticStage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

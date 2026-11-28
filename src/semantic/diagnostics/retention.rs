@@ -8,7 +8,7 @@ use lsp_types::Range;
 use tree_sitter::{Node, Tree};
 
 use super::{DiagnosticCode, DiagnosticFixData, DiagnosticReport, DiagnosticSnapshotKey};
-use crate::semantic::source::{LineIndex, Source, check_cancelled};
+use crate::semantic::source::{LineIndex, Source, check_cancelled, text_change_ranges};
 
 // Keep a cheap text/tree revision for an open document's last visible report.
 // Larger documents can still deliver a complete report without keeping a second tree alive.
@@ -49,6 +49,10 @@ pub(super) struct DeliveredReport {
 impl DeliveredReport {
     pub(super) fn new(report: Arc<DiagnosticReport>, source: Option<DiagnosticSource>) -> Self {
         Self { report, source }
+    }
+
+    pub(super) fn report_for_key(&self, key: &DiagnosticSnapshotKey) -> Option<&DiagnosticReport> {
+        (&self.report.snapshot == key).then_some(&self.report)
     }
 
     pub(super) fn retention<'a>(
@@ -206,25 +210,8 @@ struct Difference {
 
 impl Difference {
     fn between(previous: &str, current: &str) -> Self {
-        let start = previous.floor_char_boundary(
-            previous
-                .bytes()
-                .zip(current.bytes())
-                .take_while(|(a, b)| a == b)
-                .count(),
-        );
-        let shared_tail = previous[start..]
-            .bytes()
-            .rev()
-            .zip(current[start..].bytes().rev())
-            .take_while(|(a, b)| a == b)
-            .count();
-        let previous_end = previous.ceil_char_boundary(previous.len() - shared_tail);
-        let current_end = current.len() - (previous.len() - previous_end);
-        Self {
-            previous: start..previous_end,
-            current: start..current_end,
-        }
+        let (previous, current) = text_change_ranges(previous, current);
+        Self { previous, current }
     }
 
     fn has_edit(&self) -> bool {

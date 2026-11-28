@@ -1,17 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::*;
 use crate::scope::{initializer_at, receiver_type_parameters};
 use crate::semantic::completion::render::package_name;
 use crate::semantic::index::draft_files;
+use crate::semantic::package_index::PackageDeclFile;
 use crate::semantic::source::EditorNames;
-use crate::symbols::{self, OutlineKind};
+use crate::symbols::{DiagnosticOutline, OutlineKind};
 use crate::workspace::path_key;
 
 #[derive(Clone, Copy)]
 pub(super) struct Local<'t> {
     pub(super) name: Node<'t>,
+    pub(super) scope_node: usize,
+    pub(super) recovered: bool,
     pub(super) kind: &'static str,
     pub(super) explicit_type: Option<Node<'t>>,
     pub(super) initializer: Option<Node<'t>>,
@@ -23,6 +27,8 @@ impl<'t> Local<'t> {
     fn new(name: Node<'t>, owner: Node<'t>, visible_from: usize) -> Self {
         Self {
             name,
+            scope_node: owner.id(),
+            recovered: false,
             kind: owner.kind(),
             explicit_type: owner.child_by_field_name("type"),
             initializer: None,
@@ -47,7 +53,7 @@ pub(super) struct Locals<'t> {
     current_scope: Option<usize>,
     pub(super) declarations: HashSet<usize>,
     pub(super) variables: Vec<Node<'t>>,
-    pub(super) globals: HashMap<String, OutlineKind>,
+    pub(super) globals: Arc<HashMap<String, OutlineKind>>,
     pub(super) incomplete_package: bool,
     uncertain_bindings: Vec<Bytes<usize>>,
 }
@@ -128,10 +134,61 @@ pub(super) fn collect_locals<'s>(
     analysis: &mut Analysis<'s, '_, '_>,
     mode: WalkMode<'_>,
 ) -> Result<()> {
+    let mut lexical = LexicalAnalysis {
+        source: analysis.source,
+        locals: &mut analysis.locals,
+        items: &mut analysis.items,
+        cancelled: analysis.cancelled,
+    };
+    lexical.collect(analysis.source.tree.root_node(), mode, !mode.recovers())
+}
+
+pub(super) struct LexicalAnalysis<'s, 'c, 'a> {
+    pub(super) source: &'s IndexedSource,
+    pub(super) locals: &'a mut Locals<'s>,
+    pub(super) items: &'a mut Vec<PendingItem>,
+    pub(super) cancelled: Option<&'c AtomicBool>,
+}
+
+impl<'s> LexicalAnalysis<'s, '_, '_> {
+    fn text(&self, node: Node<'_>) -> &'s str {
+        node_text(node, &self.source.text)
+    }
+
+    fn error(
+        &mut self,
+        code: DiagnosticCode,
+        node: Node<'_>,
+        message: impl Into<String>,
+    ) -> &mut PendingItem {
+        self.items.push(PendingItem {
+            code,
+            range: node.byte_range(),
+            message: message.into(),
+            fix: Fix::None,
+        });
+        self.items.last_mut().unwrap()
+    }
+
+    pub(super) fn collect(
+        &mut self,
+        root: Node<'s>,
+        mode: WalkMode<'_>,
+        detailed: bool,
+    ) -> Result<()> {
+        collect_lexical(self, root, mode, detailed)
+    }
+}
+
+fn collect_lexical<'s>(
+    analysis: &mut LexicalAnalysis<'s, '_, '_>,
+    root: Node<'s>,
+    mode: WalkMode<'_>,
+    detailed: bool,
+) -> Result<()> {
     let mut member_names = HashSet::new();
-    let detailed = !mode.recovers();
     walk(
-        analysis.source.tree.root_node(),
+        root,
         analysis.cancelled,
         mode,
         |node, kind, parents, entering| {
@@ -545,9 +602,9 @@ fn scope_node(kind: &str) -> bool {
 }
 
 fn bind<'s>(
-    analysis: &mut Analysis<'s, '_, '_>,
+    analysis: &mut LexicalAnalysis<'s, '_, '_>,
     scope: Node<'s>,
-    local: Local<'s>,
+    mut local: Local<'s>,
     variable: bool,
     detailed: bool,
 ) {
@@ -560,6 +617,8 @@ fn bind<'s>(
     if let std::collections::hash_map::Entry::Vacant(entry) =
         analysis.locals.bindings.entry((scope.id(), spelling))
     {
+        local.scope_node = scope.id();
+        local.recovered = !detailed;
         entry.insert(local);
         if variable && detailed {
             analysis.locals.variables.push(name);
@@ -569,7 +628,7 @@ fn bind<'s>(
     }
 }
 
-fn redeclared(analysis: &mut Analysis<'_, '_, '_>, name: Node<'_>) {
+fn redeclared(analysis: &mut LexicalAnalysis<'_, '_, '_>, name: Node<'_>) {
     analysis.error(
         DiagnosticCode::NameRedeclared,
         name,
@@ -579,7 +638,7 @@ fn redeclared(analysis: &mut Analysis<'_, '_, '_>, name: Node<'_>) {
 
 // A flat field list contains no declarations outside the fields themselves.
 fn member_declarations<'s>(
-    analysis: &mut Analysis<'s, '_, '_>,
+    analysis: &mut LexicalAnalysis<'s, '_, '_>,
     list: Node<'_>,
     kind: &str,
     seen: &mut HashSet<&'s str>,
@@ -624,19 +683,188 @@ fn member_declarations<'s>(
     Ok(flat)
 }
 
+pub(in crate::semantic) struct DiagnosticPackageNames {
+    globals: Arc<HashMap<String, OutlineKind>>,
+    first_globals: HashMap<String, usize>,
+    first_methods: HashMap<String, HashMap<String, usize>>,
+    direct_fields: HashMap<String, HashSet<String>>,
+    paths: Vec<PathBuf>,
+    incomplete: bool,
+}
+
+impl DiagnosticPackageNames {
+    pub(in crate::semantic) fn collect(
+        files: &[PackageDeclFile],
+        package_name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        let mut files: Vec<_> = files.iter().collect();
+        files.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut globals = HashMap::new();
+        let mut first_globals = HashMap::new();
+        let mut first_methods = HashMap::<String, HashMap<String, usize>>::new();
+        let mut direct_fields = HashMap::<String, HashSet<String>>::new();
+        let mut paths = Vec::with_capacity(files.len());
+        let mut incomplete = false;
+        for file in files {
+            checkpoint(Some(cancelled))?;
+            let outline = &file.declarations.outline;
+            if !file.declarations.reliable_declarations
+                || outline.package.as_deref() != Some(package_name)
+            {
+                incomplete = true;
+                continue;
+            }
+            let index = paths.len();
+            paths.push(file.key.clone());
+            for (i, symbol) in outline.declarations.iter().enumerate() {
+                if i & 255 == 0 {
+                    checkpoint(Some(cancelled))?;
+                }
+                if let Some(receiver) = &symbol.receiver {
+                    first_methods
+                        .entry(receiver.clone())
+                        .or_default()
+                        .entry(symbol.name.clone())
+                        .or_insert(index);
+                } else {
+                    globals.insert(symbol.name.clone(), symbol.kind);
+                    first_globals.entry(symbol.name.clone()).or_insert(index);
+                }
+                if !symbol.direct_fields.is_empty() {
+                    let fields = direct_fields.entry(symbol.name.clone()).or_default();
+                    for (i, field) in symbol.direct_fields.iter().enumerate() {
+                        if i & 255 == 0 {
+                            checkpoint(Some(cancelled))?;
+                        }
+                        fields.insert(field.clone());
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            globals: Arc::new(globals),
+            first_globals,
+            first_methods,
+            direct_fields,
+            paths,
+            incomplete,
+        })
+    }
+
+    fn first_declaration_file(&self, receiver: Option<&str>, name: &str) -> Option<&Path> {
+        let names = match receiver {
+            Some(receiver) => self.first_methods.get(receiver)?,
+            None => &self.first_globals,
+        };
+        Some(&self.paths[*names.get(name)?])
+    }
+
+    fn has_direct_field(&self, receiver: &str, name: &str) -> bool {
+        self.direct_fields
+            .get(receiver)
+            .is_some_and(|fields| fields.contains(name))
+    }
+
+    pub(in crate::semantic) fn cache_weight(&self) -> usize {
+        fn map_weight<V>(map: &HashMap<String, V>) -> usize {
+            map.capacity().saturating_mul(2) * (size_of::<(String, V)>() + 1)
+                + map.keys().map(String::capacity).sum::<usize>()
+        }
+
+        2 * size_of::<usize>()
+            + size_of::<HashMap<String, OutlineKind>>()
+            + map_weight(&self.globals)
+            + map_weight(&self.first_globals)
+            + map_weight(&self.first_methods)
+            + self.first_methods.values().map(map_weight).sum::<usize>()
+            + map_weight(&self.direct_fields)
+            + self
+                .direct_fields
+                .values()
+                .map(|fields| {
+                    fields.capacity().saturating_mul(2) * (size_of::<String>() + 1)
+                        + fields.iter().map(String::capacity).sum::<usize>()
+                })
+                .sum::<usize>()
+            + self.paths.capacity() * size_of::<PathBuf>()
+            + self.paths.iter().map(PathBuf::capacity).sum::<usize>()
+    }
+}
+
 fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
+    #[cfg(test)]
+    if !crate::semantic::package_index::enabled() {
+        let outline = crate::symbols::collect_diagnostic_outline(
+            &analysis.source.tree,
+            &analysis.source.text,
+            analysis.cancelled,
+        )?;
+        return package_declarations_linear(analysis, &outline);
+    }
+
+    let current = analysis
+        .resolver
+        .indexes
+        .indexed_declarations(analysis.source)?;
+    let Some(index) = analysis
+        .resolver
+        .indexes
+        .prepare_package_index(analysis.package)?
+    else {
+        return package_declarations_linear(analysis, &current.outline);
+    };
+
+    let key = path_key(&analysis.source.path);
+    let names = &index.diagnostics;
+    analysis.locals.globals = names.globals.clone();
+    analysis.locals.incomplete_package = names.incomplete;
+    let mut seen = HashSet::new();
+    for (i, symbol) in current.outline.declarations.iter().enumerate() {
+        if i & 255 == 0 {
+            checkpoint(analysis.cancelled)?;
+        }
+        let name = symbol.name.as_str();
+        if name == "_" || (name == "init" && symbol.kind == OutlineKind::Function) {
+            continue;
+        }
+        let receiver = symbol.receiver.as_deref();
+        if receiver.is_some_and(|owner| names.has_direct_field(owner, name))
+            || names
+                .first_declaration_file(receiver, name)
+                .is_some_and(|first| first < key.as_path())
+            || !seen.insert((receiver, name))
+        {
+            analysis.error_bytes(
+                DiagnosticCode::NameRedeclared,
+                symbol.selection_range.clone(),
+                format!("{name} redeclared in this package"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn package_declarations_linear(
+    analysis: &mut Analysis<'_, '_, '_>,
+    outline: &DiagnosticOutline,
+) -> Result<()> {
     let key = path_key(&analysis.source.path);
     let mut seen = HashSet::new();
     let mut fields = HashSet::new();
-    let tree = &analysis.source.tree;
-    let methods =
-        symbols::diagnostic_method_names(tree, &analysis.source.text, analysis.cancelled)?;
-    let outline = symbols::collect_diagnostic_outline(
-        tree,
-        &analysis.source.text,
-        &methods,
-        analysis.cancelled,
-    )?;
+    let mut methods = HashMap::<&str, HashSet<&str>>::new();
+    let mut globals = HashMap::new();
+    for (i, declaration) in outline.declarations.iter().enumerate() {
+        if i & 255 == 0 {
+            checkpoint(analysis.cancelled)?;
+        }
+        if let Some(receiver) = declaration.receiver.as_deref() {
+            methods
+                .entry(receiver)
+                .or_default()
+                .insert(&declaration.name);
+        }
+    }
     let mut files = analysis
         .resolver
         .indexes
@@ -646,67 +874,57 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
     for file in &files {
         checkpoint(analysis.cancelled)?;
         let path = path_key(file);
-        let other_outline;
+        let sibling;
         let file_outline = if path == key {
-            &outline
+            outline
         } else {
-            let Some(source) = analysis.resolver.indexes.reference_source(file)? else {
+            let Some(declarations) = analysis.resolver.indexes.declaration_source(file)? else {
                 analysis.locals.incomplete_package = true;
                 continue;
             };
-            let source = source.as_ref();
-            if !syntax::has_reliable_declarations(source.tree.root_node(), analysis.cancelled)? {
+            if !declarations.reliable_declarations {
                 analysis.locals.incomplete_package = true;
                 continue;
             }
-            other_outline = symbols::collect_diagnostic_outline(
-                &source.tree,
-                &source.text,
-                &methods,
-                analysis.cancelled,
-            )?;
-            &other_outline
+            sibling = declarations;
+            &sibling.outline
         };
         if file_outline.package.as_deref() != Some(analysis.package.name.as_str()) {
             analysis.locals.incomplete_package = true;
             continue;
         }
-        for (i, symbol) in file_outline.symbols.iter().enumerate() {
+        for (i, symbol) in file_outline.declarations.iter().enumerate() {
             if i & 255 == 0 {
                 checkpoint(analysis.cancelled)?;
             }
-            let owner = symbol.receiver.as_ref().map(|r| r.base.clone());
+            let owner = symbol.receiver.clone();
             if owner.is_none() {
-                analysis
-                    .locals
-                    .globals
-                    .insert(symbol.name.clone(), symbol.kind);
+                globals.insert(symbol.name.clone(), symbol.kind);
             }
             if path < key {
                 seen.insert((owner, symbol.name.clone()));
             }
-            if symbol.kind == OutlineKind::Struct {
-                fields.extend(
-                    symbol
-                        .children()
-                        .iter()
-                        .filter(|s| s.kind == OutlineKind::Field)
-                        .map(|field| (Some(symbol.name.clone()), field.name.clone())),
-                );
+            if let Some(names) = methods.get(symbol.name.as_str()) {
+                for (i, field) in symbol.direct_fields.iter().enumerate() {
+                    if i & 255 == 0 {
+                        checkpoint(analysis.cancelled)?;
+                    }
+                    if names.contains(field.as_str()) {
+                        fields.insert((Some(symbol.name.clone()), field.clone()));
+                    }
+                }
             }
         }
     }
-    for (i, symbol) in outline.symbols.iter().enumerate() {
+    analysis.locals.globals = Arc::new(globals);
+    for (i, symbol) in outline.declarations.iter().enumerate() {
         if i & 255 == 0 {
             checkpoint(analysis.cancelled)?;
         }
         if symbol.name == "_" || (symbol.name == "init" && symbol.kind == OutlineKind::Function) {
             continue;
         }
-        let member = (
-            symbol.receiver.as_ref().map(|r| r.base.clone()),
-            symbol.name.clone(),
-        );
+        let member = (symbol.receiver.clone(), symbol.name.clone());
         if fields.contains(&member) || !seen.insert(member) {
             analysis.error_bytes(
                 DiagnosticCode::NameRedeclared,

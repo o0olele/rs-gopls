@@ -11,20 +11,22 @@ use tree_sitter::{Node, Parser};
 use super::completion::{InferredMemo, prefilter::FileNames};
 use super::diagnostics::DiagnosticKeys;
 use super::index::{
-    CachedNavigationText, CompletionRead, DiskIndex, IndexReader, IndexedSource, active_package,
-    draft_files,
+    CachedNavigationText, CompletionRead, DiskIndex, FileIndex, IndexReader, IndexedSource,
+    active_package, draft_files,
 };
 use super::navigation_trace::{NavigationProbe, record};
 use super::open_overlay::PendingOpen;
 use super::query::QueryProgress;
 use super::resolver::{Resolver, TypeIdentity};
-use super::shared_disk::SharedDiskCache;
+use super::shared_disk::{FileReadTicket, QueryReadMemo, SharedDiskCache};
 use super::source::{EditorNames, Import, Source, is_test_source, node_text};
 use super::{Engine, EngineState, GraphChanges};
 use crate::go_environment::GoEnvironment;
 use crate::scope::{Binding, lexical_binding};
 use crate::symbols::{FileOutline, FileSymbols};
 use crate::workspace::{DiagnosticFileObservation, Package, Workspace, WorkspaceLoad, path_key};
+
+static UNCANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// A query's view of the open documents and the installed package graph.
 /// The parser and disk indexes are borrowed for lazy reads.
@@ -38,12 +40,17 @@ pub(crate) struct EngineSnapshot<'a> {
     new_documents: &'a HashSet<PathBuf>,
     disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
     shared_disk: &'a Arc<SharedDiskCache>,
+    foreground: Option<&'a QueryReadMemo>,
+    completion_cancelled: Option<&'a AtomicBool>,
+    hover_docs: &'a RefCell<super::hover::HoverDocCache>,
     navigation_texts: &'a mut HashMap<PathBuf, CachedNavigationText>,
     disk_names: &'a mut HashMap<PathBuf, FileNames>,
     inferred_weights: &'a mut HashMap<InferredMemo, i32>,
     parser: &'a mut Parser,
     load: WorkspaceLoad,
+    #[cfg(test)]
     completion_source_generation: u64,
+    installed_graph_generation: u64,
     diagnostic_file_changes: &'a HashMap<PathBuf, DiagnosticFileObservation>,
     diagnostic_keys: &'a RefCell<DiagnosticKeys>,
 }
@@ -51,6 +58,7 @@ pub(crate) struct EngineSnapshot<'a> {
 pub(crate) struct DocumentSnapshot<'a> {
     path: &'a Path,
     source: DocumentSource<'a>,
+    disk_ticket: Option<FileReadTicket>,
 }
 
 enum DocumentSource<'a> {
@@ -78,6 +86,9 @@ impl EngineState {
             new_documents: &self.new_documents,
             disk_index: &mut self.disk_index,
             shared_disk: &self.shared_disk,
+            foreground: None,
+            completion_cancelled: None,
+            hover_docs: &self.hover_docs,
             navigation_texts: &mut self.navigation_texts,
             disk_names: &mut self.completion_names,
             inferred_weights: &mut self.completion_weights,
@@ -86,7 +97,9 @@ impl EngineState {
                 generation: self.generation,
                 include_tests,
             },
+            #[cfg(test)]
             completion_source_generation: self.completion_source_generation,
+            installed_graph_generation: self.completion_graph_generation,
             diagnostic_file_changes: &self.diagnostic_file_changes,
             diagnostic_keys: &self.diagnostic_keys,
         }
@@ -94,6 +107,43 @@ impl EngineState {
 }
 
 impl<'a> EngineSnapshot<'a> {
+    pub(super) fn with_completion_cancelled(mut self, cancelled: &'a AtomicBool) -> Self {
+        self.completion_cancelled = Some(cancelled);
+        self
+    }
+
+    pub(super) fn completion_cancelled(&self) -> Option<&'a AtomicBool> {
+        self.completion_cancelled
+    }
+
+    pub(super) fn with_foreground(mut self, memo: &'a QueryReadMemo) -> Self {
+        self.foreground = Some(memo);
+        self
+    }
+
+    pub(super) fn hover_doc_cache(&self) -> &'a RefCell<super::hover::HoverDocCache> {
+        self.hover_docs
+    }
+
+    pub(super) fn installed_graph_generation(&self) -> u64 {
+        self.installed_graph_generation
+    }
+
+    pub(super) fn shared_disk(&self) -> &'a Arc<SharedDiskCache> {
+        self.shared_disk
+    }
+
+    pub(super) fn navigation_symbols(&mut self, source: &IndexedSource) -> Result<Arc<FileIndex>> {
+        if let Some(index) = source.cached_file_index() {
+            return Ok(index.clone());
+        }
+        if let Some(memo) = self.foreground {
+            self.shared_disk
+                .source_declarations_foreground(source, memo)?;
+        }
+        source.declaration_index(&UNCANCELLED)
+    }
+
     pub(crate) fn environment(&self) -> &'a GoEnvironment {
         self.environment
     }
@@ -114,6 +164,9 @@ impl<'a> EngineSnapshot<'a> {
         'a: 'd,
     {
         let key = path_key(path);
+        if let Some(memo) = self.foreground {
+            super::index::track_overlay(memo, &key, self.documents, Some(self.pending_documents));
+        }
         if let Some(pending) = self.pending_documents.get(&key) {
             return Err(pending.ready.pending().into());
         }
@@ -131,9 +184,15 @@ impl<'a> EngineSnapshot<'a> {
             counts.scanned_files += 1;
             counts.ast_access(false);
         });
-        let source = self.shared_disk.load(self.parser, path, None, probe)?;
+        let source = match self.foreground {
+            Some(memo) => self.shared_disk.load_foreground(path, memo, probe)?,
+            None => self
+                .shared_disk
+                .load(self.parser, path, self.completion_cancelled, probe)?,
+        };
         Ok(Some(DocumentSnapshot {
             path,
+            disk_ticket: source.text.read_ticket.clone(),
             source: DocumentSource::Disk(source.into_indexed()),
         }))
     }
@@ -261,6 +320,7 @@ impl<'a> EngineSnapshot<'a> {
         self.roots
     }
 
+    #[cfg(test)]
     pub(super) fn completion_source_generation(&self) -> u64 {
         self.completion_source_generation
     }
@@ -308,7 +368,7 @@ impl<'a> EngineSnapshot<'a> {
         workspace: &'a Workspace,
         completion: Option<&'s mut CompletionRead>,
     ) -> Resolver<'a, 's> {
-        self.resolver_for(workspace, completion, None, false)
+        self.resolver_for(workspace, completion, self.completion_cancelled, false)
     }
 
     pub(super) fn diagnostic_resolver<'s>(
@@ -330,7 +390,9 @@ impl<'a> EngineSnapshot<'a> {
             workspace,
             parser: self.parser,
             shared_disk: self.shared_disk,
+            foreground: self.foreground,
             documents: self.documents,
+            pending_documents: Some(self.pending_documents),
             disk_index: self.disk_index,
             navigation_texts: self.navigation_texts,
             owned_reference: None,
@@ -342,7 +404,12 @@ impl<'a> EngineSnapshot<'a> {
             completion,
             inferred_weights: self.inferred_weights,
             cancelled,
-            diagnostic_types: diagnostics.then(HashMap::new),
+            diagnostic_types: (diagnostics || self.foreground.is_some()).then(HashMap::new),
+            diagnostic_observations: (diagnostics && self.foreground.is_none())
+                .then(Default::default),
+            package_indexes: Default::default(),
+            request_declarations: Default::default(),
+            use_captured_disk: false,
         };
         Resolver::new(workspace, indexes, diagnostics)
     }
@@ -357,6 +424,10 @@ impl<'a> EngineSnapshot<'a> {
 }
 
 impl<'a> DocumentSnapshot<'a> {
+    pub(super) fn read_ticket(&self) -> Option<&FileReadTicket> {
+        self.disk_ticket.as_ref()
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.path
     }
@@ -403,6 +474,19 @@ impl<'a> DocumentSnapshot<'a> {
         Self {
             path,
             source: DocumentSource::Borrowed(source),
+            disk_ticket: None,
+        }
+    }
+
+    pub(super) fn pinned_disk(
+        path: &'a Path,
+        source: &'a IndexedSource,
+        ticket: FileReadTicket,
+    ) -> Self {
+        Self {
+            path,
+            source: DocumentSource::Borrowed(source),
+            disk_ticket: Some(ticket),
         }
     }
 
@@ -413,9 +497,9 @@ impl<'a> DocumentSnapshot<'a> {
         }
     }
 
-    pub(super) fn into_disk(self) -> Option<IndexedSource> {
+    pub(super) fn into_disk(self) -> Option<(IndexedSource, FileReadTicket)> {
         match self.source {
-            DocumentSource::Disk(source) => Some(source),
+            DocumentSource::Disk(source) => Some((source, self.disk_ticket?)),
             DocumentSource::Borrowed(_) => None,
         }
     }

@@ -137,7 +137,7 @@ impl ReferenceWorkerSnapshot {
         let text = text.or_else(|| self.observations.cached_text(&self.shared_disk, path, key));
         if let Some(source) = text
             .as_ref()
-            .and_then(|text| self.shared_disk.cached_parse(path, text, false))
+            .and_then(|text| self.shared_disk.cached_parse(path, text))
         {
             record(probe, |counts| counts.text_hits += 1);
             return Ok(Some(source));
@@ -191,9 +191,13 @@ impl ReferenceWorkerSnapshot {
             workspace: &self.workspace,
             parser,
             shared_disk: &self.shared_disk,
+            foreground: None,
             drafts: draft_files(&self.workspace, &documents, &self.new_documents),
             documents: &documents,
+            pending_documents: None,
             disk_index: &mut disk_index,
+            request_declarations: Default::default(),
+            use_captured_disk: false,
             navigation_texts: &mut HashMap::new(),
             owned_reference: owned.as_ref().map(|source| (key, source.clone())),
             navigation: probe,
@@ -204,6 +208,8 @@ impl ReferenceWorkerSnapshot {
             inferred_weights: &mut HashMap::new(),
             cancelled: Some(cancelled),
             diagnostic_types: None,
+            diagnostic_observations: None,
+            package_indexes: Default::default(),
         };
         let mut resolver = Resolver::new(&self.workspace, indexes, true);
         let result = operation(&mut resolver, source, &self.root, &self.new_documents)?;

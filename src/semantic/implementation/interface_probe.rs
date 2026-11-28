@@ -1,10 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use super::super::source::decoded_import_path;
+use tree_sitter::Node;
+
+use super::super::{
+    presentation::syntax_text,
+    source::{Source, decoded_import_path},
+};
 
 pub(super) type Arity = (usize, usize, bool);
 
-#[derive(Default)]
+#[derive(Default, Eq, PartialEq)]
 pub(super) struct InterfaceSpellings {
     pub(super) receiver_methods: Vec<ReceiverMethod>,
     pub(super) interface_methods: Vec<ReceiverMethod>,
@@ -15,19 +20,57 @@ pub(super) struct InterfaceSpellings {
     pub(super) default_imports: HashSet<String>,
     pub(super) alias_imports: HashMap<String, String>,
     pub(super) dot_imports: HashSet<String>,
+    local_declarations: Vec<String>,
 }
 
+#[derive(Eq, PartialEq)]
 pub(super) struct ReceiverMethod {
     pub(super) receiver: String,
     pub(super) name: String,
     pub(super) arity: Option<Arity>,
 }
 
+#[derive(Eq, PartialEq)]
 pub(super) struct TypeReference {
     pub(super) owner: String,
     pub(super) qualifier: Option<String>,
     pub(super) target: String,
     pub(super) alias: bool,
+}
+
+impl InterfaceSpellings {
+    pub(super) fn for_overlay(source: &Source) -> Option<Self> {
+        let root = source.tree.root_node();
+        if root.has_error() {
+            return None;
+        }
+        let mut spellings = interface_spellings(&source.text)?;
+        if spellings.has_local_types {
+            // Postings only need the presence of local types. Comparing edits
+            // also needs their spelling because declaration summaries omit bodies.
+            spellings.local_declarations = local_type_declarations(root, &source.text);
+        }
+        Some(spellings)
+    }
+}
+
+fn local_type_declarations(root: Node<'_>, text: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "type_declaration" && node.parent() != Some(root) {
+            declarations.push(syntax_text(node, text));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return declarations;
+            }
+        }
+    }
 }
 
 pub(super) fn interface_spellings(text: &str) -> Option<InterfaceSpellings> {

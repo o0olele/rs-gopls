@@ -77,6 +77,13 @@ struct PackageSpellings {
 }
 
 impl InterfaceSources {
+    pub(in crate::semantic) fn same_overlay_spellings(&self, key: &Path, source: &Source) -> bool {
+        self.files
+            .get(key)
+            .and_then(Option::as_deref)
+            .is_some_and(|before| InterfaceSpellings::for_overlay(source).as_ref() == Some(before))
+    }
+
     pub(in crate::semantic) fn invalidate(&mut self, key: &Path) {
         let owners = self
             .owners
@@ -185,8 +192,7 @@ impl InterfaceSources {
                     .entry(key.clone())
                     .or_insert_with(|| {
                         let spellings = match overlay {
-                            Some(document) if document.tree.root_node().has_error() => None,
-                            Some(document) => interface_spellings(&document.text),
+                            Some(document) => InterfaceSpellings::for_overlay(document),
                             None => {
                                 let disk = resolver
                                     .indexes

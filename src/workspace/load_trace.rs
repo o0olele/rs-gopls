@@ -127,6 +127,7 @@ pub(crate) struct CommandTrace {
     pid: Option<u32>,
     exit: Option<(ExitStatus, f64)>,
     counts: Option<(usize, usize, usize)>,
+    cancelled: bool,
 }
 
 impl CommandTrace {
@@ -139,6 +140,7 @@ impl CommandTrace {
             pid: None,
             exit: None,
             counts: None,
+            cancelled: false,
         })
     }
 
@@ -174,6 +176,10 @@ impl CommandTrace {
         self.exit = Some((status, telemetry::elapsed(self.started)));
     }
 
+    pub(super) fn cancelled(&mut self) {
+        self.cancelled = true;
+    }
+
     pub(crate) fn parsed(&mut self, packages: usize, project_files: usize, errors: usize) {
         self.counts = Some((packages, project_files, errors));
     }
@@ -186,8 +192,8 @@ impl Drop for CommandTrace {
             .exit
             .map_or_else(|| telemetry::elapsed(self.started), |(_, ms)| ms);
         let (packages, project_files, errors) = self.counts.unwrap_or_default();
-        let failed =
-            self.counts.is_none() || !self.exit.is_some_and(|(status, _)| status.success());
+        let failed = !self.cancelled
+            && (self.counts.is_none() || !self.exit.is_some_and(|(status, _)| status.success()));
         emit(
             "workspace_load_cmd",
             json!({
@@ -197,6 +203,7 @@ impl Drop for CommandTrace {
                 "directory": self.directory,
                 "cmd_ms": cmd_ms,
                 "exit_code": code,
+                "cancelled": self.cancelled,
                 "package_count": packages,
                 "project_file_count": project_files,
                 "error_count": errors + usize::from(failed),

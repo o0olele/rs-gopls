@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
-use super::path_key;
+use super::{check_load_cancelled, path_key};
 use crate::go_environment::GoEnvironment;
 
 // A rename needs a complete reference set even when the editor supplies no
@@ -20,13 +21,18 @@ pub(super) struct PackageInputs {
 impl PackageInputs {
     // Module and work files can live above an editor folder. Take their
     // fingerprints before discovering the build groups and Go project roots.
-    pub(super) fn configuration(folders: &[PathBuf], environment: &GoEnvironment) -> Result<Self> {
+    pub(super) fn configuration(
+        folders: &[PathBuf],
+        environment: &GoEnvironment,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self> {
         let folders = folders
             .iter()
             .map(std::path::absolute)
             .collect::<std::io::Result<Vec<_>>>()?;
         let mut configuration = BTreeMap::new();
         for dir in folders.iter().flat_map(|folder| folder.ancestors()) {
+            check_load_cancelled(cancelled)?;
             for name in ["go.work", "go.work.sum", "go.mod", "go.sum"] {
                 let path = dir.join(name);
                 if path.is_file() {
@@ -53,16 +59,22 @@ impl PackageInputs {
         })
     }
 
-    pub(super) fn with_sources(mut self, roots: &[PathBuf]) -> Result<Self> {
+    pub(super) fn with_sources(
+        mut self,
+        roots: &[PathBuf],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self> {
         let mut pending = roots.to_vec();
         let mut seen = HashSet::new();
         while let Some(dir) = pending.pop() {
+            check_load_cancelled(cancelled)?;
             if !seen.insert(path_key(&dir)) {
                 continue;
             }
             let entries =
                 fs::read_dir(&dir).with_context(|| format!("listing {}", dir.display()))?;
             for entry in entries {
+                check_load_cancelled(cancelled)?;
                 let entry = entry?;
                 let path = entry.path();
                 let filename = entry.file_name();
@@ -89,9 +101,9 @@ impl PackageInputs {
     }
 
     pub(super) fn current(&self, roots: &[PathBuf], environment: &GoEnvironment) -> Result<bool> {
-        let current = Self::configuration(&self.folders, environment)?;
+        let current = Self::configuration(&self.folders, environment, None)?;
         Ok(current.configuration == self.configuration
-            && current.with_sources(roots)?.files == self.files)
+            && current.with_sources(roots, None)?.files == self.files)
     }
 }
 

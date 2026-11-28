@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use lsp_types::{
@@ -13,10 +14,11 @@ use tree_sitter::Node;
 use crate::protocol::path_uri;
 use crate::semantic::{
     actions::{ImportOperation, import_edits},
-    index::{CompletionRead, text_fingerprint},
+    index::CompletionRead,
     presentation::{documentation, function_signature, syntax_text},
+    shared_disk::SharedDeclarations,
     snapshot::{DocumentSnapshot, EngineSnapshot},
-    source::{Source, node_at_range, node_text},
+    source::{Source, check_optional_cancelled, node_at_range, node_text},
 };
 use crate::workspace::path_key;
 
@@ -24,10 +26,24 @@ use super::CompletionClientCapabilities;
 use super::cursor::{Edit, ancestors};
 use super::ranking::{Candidate, Insert, rank};
 
+pub(in crate::semantic) use crate::semantic::index::SourceRev;
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Target {
     pub(super) file: PathBuf,
     pub(super) range: Range,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) revision: Option<SourceRev>,
+}
+
+impl SourceRev {
+    pub(super) fn document(document: &DocumentSnapshot<'_>) -> Option<Self> {
+        Self::overlay(document.indexed()).or_else(|| {
+            document
+                .read_ticket()
+                .map(|ticket| Self::Disk(ticket.source_revision()))
+        })
+    }
 }
 
 impl Target {
@@ -51,6 +67,8 @@ pub(super) struct ItemData {
     pub(super) uri: Uri,
     pub(super) document_version: Option<i32>,
     pub(super) document_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) document_revision: Option<SourceRev>,
     pub(super) graph_generation: Option<u64>,
     pub(super) target: Option<Target>,
     pub(super) detail: Option<String>,
@@ -59,11 +77,24 @@ pub(super) struct ItemData {
 
 #[derive(Clone)]
 pub(in crate::semantic) struct Description {
-    pub(super) kind: CompletionItemKind,
-    pub(super) detail: Option<String>,
-    pub(super) label_suffix: Option<String>,
-    pub(super) deprecated: bool,
-    pub(super) has_parameters: bool,
+    pub(in crate::semantic) kind: CompletionItemKind,
+    pub(in crate::semantic) detail: Option<String>,
+    pub(in crate::semantic) label_suffix: Option<String>,
+    pub(in crate::semantic) deprecated: bool,
+    pub(in crate::semantic) has_parameters: bool,
+}
+
+pub(in crate::semantic) fn describe_with_docs(
+    source: &Source,
+    range: Range,
+    name: &str,
+    default_kind: CompletionItemKind,
+) -> (Description, String) {
+    let owner = node_at_range(source, range).and_then(owner);
+    let mut description = describe_owner(owner, &source.text, name, default_kind);
+    let docs = owner.map_or_else(String::new, |node| documentation(node, &source.text));
+    description.deprecated = docs.contains("Deprecated:");
+    (description, docs)
 }
 
 fn owner(token: Node<'_>) -> Option<Node<'_>> {
@@ -98,21 +129,19 @@ pub(in crate::semantic) fn describe(
     default_kind: CompletionItemKind,
     detect_deprecation: bool,
 ) -> Description {
-    describe_token(
-        node_at_range(source, range),
-        &source.text,
-        name,
-        default_kind,
-        detect_deprecation,
-    )
+    let owner = node_at_range(source, range).and_then(owner);
+    let mut description = describe_owner(owner, &source.text, name, default_kind);
+    if detect_deprecation && let Some(owner) = owner {
+        description.deprecated = documentation(owner, &source.text).contains("Deprecated:");
+    }
+    description
 }
 
-fn describe_token(
-    token: Option<Node<'_>>,
+fn describe_owner(
+    owner: Option<Node<'_>>,
     text: &str,
     name: &str,
     default_kind: CompletionItemKind,
-    detect_deprecation: bool,
 ) -> Description {
     let mut description = Description {
         kind: default_kind,
@@ -121,7 +150,7 @@ fn describe_token(
         deprecated: false,
         has_parameters: false,
     };
-    let Some(owner) = token.and_then(owner) else {
+    let Some(owner) = owner else {
         return description;
     };
     let ty = owner.child_by_field_name("type");
@@ -170,9 +199,6 @@ fn describe_token(
             |ty| format!("{prefix} {name} {}", syntax_text(ty, text)),
         ));
     }
-    if detect_deprecation {
-        description.deprecated = documentation(owner, text).contains("Deprecated:");
-    }
     description
 }
 
@@ -193,20 +219,32 @@ pub(super) fn response(
     graph_generation: Option<u64>,
     request: &mut CompletionRead,
 ) -> Result<CompletionResponse> {
+    let cancelled = snapshot.completion_cancelled();
+    let candidates = {
+        let _phase = request.trace.as_ref().map(|trace| trace.phase("rank"));
+        rank(candidates, cancelled)?
+    };
     let _phase = request.trace.as_ref().map(|trace| trace.phase("render"));
+    #[cfg(test)]
+    if let Some(trace) = &request.trace {
+        trace.checkpoint("render", cancelled);
+    }
+    check_optional_cancelled(cancelled)?;
     let mut items = Vec::new();
     let mut import_edits = HashMap::new();
     let mut docs = HashMap::new();
-    let mut resolver = snapshot
-        .workspace()
-        .map(|workspace| snapshot.resolver_with_completion(workspace, Some(request)));
     let uri = path_uri(document.path())?;
     let version = document.version();
-    let fingerprint = format!("{:016x}", text_fingerprint(document.text()));
+    let fingerprint = format!(
+        "{:016x}",
+        document.indexed().fingerprint_cancellable(cancelled)?
+    );
+    let document_revision = SourceRev::document(document);
     let defer_detail = caps.resolve_detail && version.is_some();
     let defer_docs = caps.resolve_documentation && version.is_some();
     let defer_import = caps.resolve_additional_text_edits && version.is_some();
-    for (sort_text, candidate) in rank(candidates) {
+    for candidate in candidates {
+        let (sort_text, candidate) = candidate?;
         if candidate
             .replace_start
             .is_some_and(|start| document.text()[start..edit.replace.start].contains('\n'))
@@ -232,22 +270,23 @@ pub(super) fn response(
         let documentation = if defer_docs {
             None
         } else if let Some(target) = &candidate.target {
-            docs.entry((path_key(&target.file), target.range))
-                .or_insert_with(|| {
-                    if path_key(&target.file) == path_key(document.path()) {
-                        return markup(document.indexed(), target.range, caps);
-                    }
-                    target_markup(&mut resolver.as_mut()?.indexes, target, caps)
-                })
-                .clone()
+            docs.entry((
+                path_key(&target.file),
+                target.range,
+                target.revision.clone(),
+            ))
+            .or_insert_with(|| eager_target_markup(snapshot, document, target, caps, request))
+            .clone()
         } else {
             None
         };
+        check_optional_cancelled(cancelled)?;
         let detail = candidate.detail.or_else(|| candidate.import_path.clone());
         let data = ItemData {
             uri: uri.clone(),
             document_version: version,
             document_fingerprint: fingerprint.clone(),
+            document_revision: document_revision.clone(),
             graph_generation,
             target: candidate.target,
             detail: defer_detail.then(|| detail.clone()).flatten(),
@@ -286,6 +325,7 @@ pub(super) fn response(
             ..CompletionItem::default()
         });
     }
+    check_optional_cancelled(cancelled)?;
     Ok(CompletionResponse::Array(items))
 }
 
@@ -388,13 +428,54 @@ pub(super) fn markup(
     (!value.is_empty()).then(|| documentation_markup(value, caps))
 }
 
-pub(super) fn target_markup(
-    indexes: &mut crate::semantic::index::IndexReader<'_>,
+fn eager_target_markup(
+    snapshot: &mut EngineSnapshot<'_>,
+    document: &DocumentSnapshot<'_>,
     target: &Target,
     caps: &CompletionClientCapabilities,
+    request: &mut CompletionRead,
 ) -> Option<Documentation> {
-    let source = indexes.declaration_source(&target.file).ok()??;
-    markup(source.as_ref(), target.range, caps)
+    let key = path_key(&target.file);
+    if key == path_key(document.path()) && target.revision == SourceRev::document(document) {
+        return markup(document.indexed(), target.range, caps);
+    }
+    if let Some(source) = snapshot.docs().get(&key) {
+        return (target.revision == SourceRev::overlay(source))
+            .then(|| markup(source, target.range, caps))
+            .flatten();
+    }
+    let Some(SourceRev::Disk(expected)) = &target.revision else {
+        return None;
+    };
+    let disk = Arc::clone(snapshot.shared_disk());
+    if let Some(source) = request.declarations(&key)
+        && source
+            .text
+            .read_ticket
+            .as_ref()
+            .is_some_and(|ticket| ticket.source_revision() == *expected)
+        && disk.validates_read(&target.file, &source.text)
+    {
+        return declaration_markup(&source.declarations, target.range, caps);
+    }
+    let cancelled = snapshot.completion_cancelled();
+    let source = disk
+        .load_documentation(snapshot.parser(), &target.file, None, cancelled, None)
+        .ok()?;
+    let actual = source.text.read_ticket.as_ref()?.source_revision();
+    if actual != *expected {
+        return None;
+    }
+    declaration_markup(&source.declarations, target.range, caps)
+}
+
+pub(super) fn declaration_markup(
+    source: &SharedDeclarations,
+    range: Range,
+    caps: &CompletionClientCapabilities,
+) -> Option<Documentation> {
+    let value = source.presentation.get(&range)?.documentation.as_deref()?;
+    Some(documentation_markup(value.to_owned(), caps))
 }
 
 fn documentation_markup(value: String, caps: &CompletionClientCapabilities) -> Documentation {
