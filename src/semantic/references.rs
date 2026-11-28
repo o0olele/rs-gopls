@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use lsp_types::{Position, Range};
@@ -10,14 +10,14 @@ use tree_sitter::Node;
 
 use super::Engine;
 use super::index::{
-    DeferredReferenceRead, IndexReader, ReferenceReadRequest, active_package, draft_package,
-    missing_source,
+    CachedNavigationText, IndexReader, NavigationText, active_package, draft_package,
 };
 use super::navigation_trace::{
     NavigationKind, NavigationProbe, active, file_sample, record, sample, verification,
 };
 use super::query::{QueryProgress, SemanticTask};
 use super::resolver::{Resolver, is_exported};
+use super::shared_disk::SharedDiskCache;
 use super::source::{ReferenceQuery, Source, is_declaration_name, node_text};
 use crate::scope::reference_binding;
 use crate::workspace::{Package, path_key};
@@ -28,29 +28,103 @@ mod large_file;
 mod tests;
 mod worker;
 
-use candidates::{CandidateInput, CandidateList, ReferenceScope};
-use large_file::{LargeFileVerification, LargeReferenceAnchor, verify_reference};
-pub(super) use worker::ReferenceWorker;
-use worker::{PendingWork, Preparation, Work, WorkOutput, WorkResult};
+use candidates::{CandidateInput, CandidateList, OverlayTopology, ReferenceScope};
+pub(super) use large_file::contains_spelling;
+use large_file::{AnchorWork, CandidateDiscovery, CandidateWork, ReferenceWorkerSnapshot};
+use worker::{BATCH_SIZE, PendingWork, Work, WorkOutput};
+pub(super) use worker::{DependencySource, ReferenceDependencies, ReferenceWorker};
 
-const SEARCH_BUDGET: Duration = Duration::from_millis(2);
 const PREFILTER_CHUNK_BYTES: usize = 32 * 1024;
-const PREFILTER_CHUNK_OFFSETS: usize = 256;
-const READ_AHEAD_FILES: usize = 32;
 const LARGE_FILE_BYTES: usize = 128 * 1024;
 
 pub(crate) struct ReferenceSearch {
+    origin: ReferenceAnchor,
     anchor: Option<ReferenceAnchor>,
     plan: Option<ReferencePlan>,
-    target: Option<ReferenceTarget>,
-    files: Arc<[Arc<ReferenceCandidate>]>,
+    target: Option<Arc<ReferenceTarget>>,
+    files: Vec<Arc<ReferenceCandidate>>,
     next_file: usize,
+    deferred: VecDeque<Arc<ReferenceCandidate>>,
+    processing_deferred: bool,
     matches: Vec<(PathBuf, Range)>,
-    current: Option<FileScan>,
-    unreadable: HashMap<PathBuf, anyhow::Error>,
-    dependency: DeferredReferenceRead,
+    verified: BTreeMap<PathBuf, (PathBuf, Vec<Range>)>,
+    verified_count: usize,
     work: Option<PendingWork>,
-    revision: u64,
+    source_revision: u64,
+    observations: Arc<ReferenceObservations>,
+    snapshot: Option<Arc<ReferenceWorkerSnapshot>>,
+    disk_retries: usize,
+}
+
+#[derive(Default)]
+pub(super) struct ReferenceObservations(Mutex<ObservedFiles>);
+
+#[derive(Default)]
+struct ObservedFiles {
+    files: HashMap<PathBuf, Option<CachedNavigationText>>,
+    changed: bool,
+}
+
+impl ReferenceObservations {
+    pub(super) fn remember(&self, key: &Path, text: Option<&NavigationText>) {
+        let mut observed = self.0.lock().unwrap();
+        if let Some(previous) = observed.files.get(key) {
+            let matches = match (previous, text) {
+                (Some(previous), Some(text)) => previous.same_revision(text),
+                (None, None) => true,
+                _ => false,
+            };
+            observed.changed |= !matches;
+        } else {
+            observed
+                .files
+                .insert(key.to_owned(), text.map(NavigationText::downgrade));
+        }
+    }
+
+    pub(super) fn cached_text(
+        &self,
+        cache: &SharedDiskCache,
+        path: &Path,
+        key: &Path,
+    ) -> Option<NavigationText> {
+        if let Some(text) = self
+            .0
+            .lock()
+            .unwrap()
+            .files
+            .get(key)
+            .and_then(Option::as_ref)
+            .and_then(CachedNavigationText::upgrade)
+        {
+            return Some(text);
+        }
+        let text = cache.cached_read(path, key)?;
+        self.remember(key, Some(&text));
+        Some(text)
+    }
+
+    fn changed(&self) -> bool {
+        self.0.lock().unwrap().changed
+    }
+
+    fn mark_changed(&self) {
+        self.0.lock().unwrap().changed = true;
+    }
+
+    fn current(&self) -> bool {
+        let observed = self.0.lock().unwrap();
+        !observed.changed
+            && observed.files.iter().all(|(key, text)| {
+                text.as_ref().map_or_else(
+                    || {
+                        std::fs::metadata(key)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    },
+                    |text| text.matches_disk(key),
+                )
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +141,8 @@ struct ReferenceTarget {
     path: PathBuf,
     range: Range,
     include_declaration: bool,
+    direct_import: Option<String>,
+    container: Option<String>,
 }
 
 struct ReferencePlan {
@@ -77,223 +153,66 @@ struct ReferencePlan {
 
 #[derive(Default)]
 pub(super) struct ReferenceCandidates {
-    revision: u64,
+    revisions: Option<(u64, u64)>,
+    overlays: Arc<OverlayTopology>,
     scopes: HashMap<ReferenceScope, CandidateList>,
     total_files: usize,
 }
 
 impl ReferenceCandidates {
-    fn get(&self, revision: u64, scope: &ReferenceScope) -> Option<CandidateList> {
-        if self.revision != revision {
-            return None;
+    fn refresh(
+        &mut self,
+        graph_revision: u64,
+        declaration_revision: u64,
+        indexes: &IndexReader<'_>,
+        new_documents: &HashSet<PathBuf>,
+    ) {
+        let revisions = (graph_revision, declaration_revision);
+        if self.revisions == Some(revisions) {
+            return;
         }
+        let next = OverlayTopology::capture(indexes.workspace, indexes.documents, new_documents);
+        if self
+            .revisions
+            .is_some_and(|(graph, _)| graph == graph_revision)
+        {
+            self.scopes
+                .retain(|_, list| list.same_scope_inputs(&self.overlays, &next));
+        } else {
+            self.scopes.clear();
+        }
+        self.total_files = self.scopes.values().map(|list| list.files.len()).sum();
+        self.overlays = Arc::new(next);
+        self.revisions = Some(revisions);
+    }
+
+    fn get(&self, scope: &ReferenceScope) -> Option<CandidateList> {
         self.scopes.get(scope).cloned()
     }
 
-    fn insert(&mut self, revision: u64, scope: &ReferenceScope, candidates: CandidateList) {
+    fn insert(&mut self, scope: &ReferenceScope, candidates: CandidateList) {
         const MAX_CACHED_FILES: usize = 8192;
         const MAX_CACHED_SCOPES: usize = 16;
-        if candidates.files.len() > MAX_CACHED_FILES || self.get(revision, scope).is_some() {
+        if candidates.files.len() > MAX_CACHED_FILES || self.scopes.contains_key(scope) {
             return;
         }
-        if self.revision != revision
-            || self.total_files + candidates.files.len() > MAX_CACHED_FILES
+        if self.total_files + candidates.files.len() > MAX_CACHED_FILES
             || self.scopes.len() >= MAX_CACHED_SCOPES
         {
             self.scopes.clear();
             self.total_files = 0;
-            self.revision = revision;
         }
         self.total_files += candidates.files.len();
         self.scopes.insert(scope.clone(), candidates);
     }
 }
 
+#[derive(Clone)]
 struct ReferenceCandidate {
     key: PathBuf,
     path: PathBuf,
     package_id: String,
-}
-
-struct FileScan {
-    candidate: Arc<ReferenceCandidate>,
-    started: Option<Instant>,
-    text: Option<Arc<String>>,
-    cursor: usize,
-    offsets: VecDeque<usize>,
-    hot_index: usize,
-    had_spelling: bool,
-    cached_offsets: bool,
-}
-
-enum FileProgress {
-    Continue,
-    Done,
-    NeedText,
-    Work(Work),
-    VerifyLarge,
-}
-
-impl FileScan {
-    fn new(candidate: Arc<ReferenceCandidate>, probe: Option<&NavigationProbe>) -> Self {
-        Self {
-            candidate,
-            started: probe.map(|_| Instant::now()),
-            text: None,
-            cursor: 0,
-            offsets: VecDeque::new(),
-            hot_index: 0,
-            had_spelling: false,
-            cached_offsets: false,
-        }
-    }
-
-    fn record_completion(&self, probe: Option<&NavigationProbe>) {
-        if let Some(started) = self.started {
-            record(probe, |counts| {
-                counts.file_elapsed(&self.candidate.path, started.elapsed())
-            });
-        }
-    }
-
-    fn scan_chunk(&mut self, spelling: &str, probe: Option<&NavigationProbe>) {
-        let text = self.text.as_ref().unwrap().as_str();
-        let start = self.cursor;
-        let mut end = (start + PREFILTER_CHUNK_BYTES).min(text.len());
-        // A chunk owns match starts before its end, and can read a full
-        // spelling across that boundary without enqueuing the next start.
-        let overlap = text.ceil_char_boundary(end.saturating_add(spelling.len() - 1));
-        let mut next = text.ceil_char_boundary(start);
-        while let Some(found) = text[next..overlap].find(spelling) {
-            let offset = next + found;
-            if offset >= end {
-                break;
-            }
-            self.offsets.push_back(offset);
-            next = text.ceil_char_boundary(offset + 1);
-            if self.offsets.len() == PREFILTER_CHUNK_OFFSETS {
-                end = end.min(next);
-                break;
-            }
-        }
-        self.had_spelling |= !self.offsets.is_empty();
-        self.cursor = end;
-        record(probe, |counts| counts.prefilter_bytes += end - start);
-    }
-
-    fn step(
-        &mut self,
-        resolver: &mut Resolver<'_, '_>,
-        target: &ReferenceTarget,
-        root: &Path,
-        matches: &mut Vec<(PathBuf, Range)>,
-        unreadable: &HashMap<PathBuf, anyhow::Error>,
-    ) -> Result<FileProgress> {
-        let key = &self.candidate.key;
-        let path = &self.candidate.path;
-        let Some(package) = resolver.workspace.package(&self.candidate.package_id) else {
-            return Ok(FileProgress::Done);
-        };
-        let probe = resolver.indexes.navigation;
-        let parsed = resolver.indexes.cached_reference_source(key);
-        let source = parsed.as_ref().map(AsRef::as_ref);
-        let large = source.is_some_and(|source| source.text.len() >= LARGE_FILE_BYTES);
-        // Keep a scan on one route even if an intervening query builds a table.
-        let hot = source.and_then(|source| {
-            self.text
-                .is_none()
-                .then(|| source.ready_name_offsets(&target.spelling))
-                .flatten()
-        });
-        let (source, candidate) = if let Some(offsets) = hot {
-            if !self.cached_offsets {
-                self.cached_offsets = true;
-                record(probe, |counts| counts.cached_offset_files += 1);
-            }
-            let Some(&offset) = offsets.get(self.hot_index) else {
-                return Ok(FileProgress::Done);
-            };
-            if large {
-                return Ok(FileProgress::VerifyLarge);
-            }
-            let source = source.unwrap();
-            (source, source.reference_at_offset(offset))
-        } else {
-            if self.text.is_none() {
-                self.text = resolver.indexes.cached_reference_text(key);
-                if self.text.is_none() {
-                    return match unreadable.get(key) {
-                        Some(error) if missing_source(error) => Ok(FileProgress::Done),
-                        Some(error) => anyhow::bail!("{error:#}"),
-                        None => Ok(FileProgress::NeedText),
-                    };
-                }
-                record(probe, |counts| counts.text_hits += 1);
-            }
-            let Some(&offset) = self.offsets.front() else {
-                if self.cursor < self.text.as_ref().unwrap().len() {
-                    self.scan_chunk(&target.spelling, probe);
-                    return Ok(FileProgress::Continue);
-                }
-                if !self.had_spelling {
-                    record(probe, |counts| counts.prefilter_skipped += 1);
-                }
-                return Ok(FileProgress::Done);
-            };
-            let Some(source) = source else {
-                return Ok(FileProgress::Work(Work::PrepareDisk {
-                    key: key.clone(),
-                    path: path.clone(),
-                    text: self.text.clone(),
-                    preparation: Preparation::Candidate,
-                }));
-            };
-            if large {
-                return Ok(FileProgress::VerifyLarge);
-            }
-            (
-                source,
-                source.reference_at_spelling(offset, &target.spelling),
-            )
-        };
-        let _verify = verification(probe);
-        if let Some(candidate) = candidate {
-            let resolved =
-                verify_reference(resolver, package, source, key, candidate, target, root);
-            if let Some(request) = resolver.indexes.deferred_reference.unwrap().take_pending() {
-                return Ok(FileProgress::Work(dependency_work(
-                    request,
-                    &resolver.indexes,
-                )));
-            }
-            if let Some(range) = resolved?
-                && matches
-                    .last()
-                    .is_none_or(|(file, found)| file != &source.path || *found != range)
-            {
-                matches.push((source.path.clone(), range));
-            }
-        }
-        record(probe, |counts| counts.ident_offsets_checked += 1);
-        if hot.is_some() {
-            self.hot_index += 1;
-        } else {
-            self.offsets.pop_front();
-        }
-        Ok(FileProgress::Continue)
-    }
-}
-
-fn dependency_work(request: ReferenceReadRequest, indexes: &IndexReader<'_>) -> Work {
-    match request {
-        ReferenceReadRequest::Disk { key, path } => Work::PrepareDisk {
-            text: indexes.cached_reference_text(&key),
-            key,
-            path,
-            preparation: Preparation::Dependency,
-        },
-        ReferenceReadRequest::OpenDeclarations { revision } => Work::PrepareOpen(revision),
-    }
+    priority: u8,
 }
 
 impl Engine {
@@ -307,7 +226,7 @@ impl Engine {
         let probe = probe.as_deref();
         let _exec = sample(probe, |counts| &mut counts.exec);
         let key = path_key(path);
-        let revision = self.state.completion_source_generation;
+        let source_revision = self.state.completion_source_generation;
         let mut snapshot = self.state.snapshot(self.include_tests);
         let load = match snapshot.active_graph(true) {
             QueryProgress::Ready(_) => None,
@@ -352,30 +271,45 @@ impl Engine {
             record(probe, |counts| counts.workspace_wait());
             return Ok(QueryProgress::Pending(load));
         }
-        Ok(QueryProgress::Searching(ReferenceSearch {
-            anchor: Some(ReferenceAnchor {
+        Ok(QueryProgress::Searching(ReferenceSearch::new(
+            ReferenceAnchor {
                 key,
                 path: path.to_owned(),
                 position,
                 include_declaration,
-            }),
+            },
+            source_revision,
+            0,
+        )))
+    }
+}
+
+impl ReferenceSearch {
+    fn new(origin: ReferenceAnchor, source_revision: u64, disk_retries: usize) -> Self {
+        Self {
+            anchor: Some(origin.clone()),
+            origin,
             plan: None,
             target: None,
-            files: Arc::default(),
+            files: Vec::new(),
             next_file: 0,
+            deferred: VecDeque::new(),
+            processing_deferred: false,
             matches: Vec::new(),
-            current: None,
-            unreadable: HashMap::new(),
-            dependency: DeferredReferenceRead::default(),
+            verified: BTreeMap::new(),
+            verified_count: 0,
             work: None,
-            revision,
-        }))
+            source_revision,
+            observations: Arc::default(),
+            snapshot: None,
+            disk_retries,
+        }
     }
 }
 
 impl SemanticTask<Vec<(PathBuf, Range)>> for ReferenceSearch {
     fn ready(&self, engine: &Engine) -> bool {
-        self.revision != engine.state.completion_source_generation
+        self.source_revision != engine.state.completion_source_generation
             || self
                 .work
                 .as_ref()
@@ -388,32 +322,48 @@ impl SemanticTask<Vec<(PathBuf, Range)>> for ReferenceSearch {
         let _exec = sample(probe, |counts| &mut counts.exec);
         let started = Instant::now();
         record(probe, |counts| counts.batches += 1);
-        let result = self.step(engine, probe, started);
+        let result = self.step(engine, probe).and_then(|done| {
+            if !done || self.observations.current() {
+                return Ok(done);
+            }
+            ensure!(
+                self.disk_retries < 2,
+                "disk sources kept changing during reference search"
+            );
+            *self = Self::new(
+                self.origin.clone(),
+                self.source_revision,
+                self.disk_retries + 1,
+            );
+            Ok(false)
+        });
         record(probe, |counts| {
-            counts.matches_count = self.matches.len();
+            counts.matches_count = self.matches.len() + self.verified_count;
             counts.reference_max_step = counts.reference_max_step.max(started.elapsed());
         });
         result
     }
 
-    fn finish(self) -> Vec<(PathBuf, Range)> {
+    fn finish(mut self) -> Vec<(PathBuf, Range)> {
+        self.matches.reserve(self.verified_count);
+        for (path, ranges) in self.verified.into_values() {
+            self.matches
+                .extend(ranges.into_iter().map(|range| (path.clone(), range)));
+        }
         self.matches
     }
 }
 
 impl ReferenceSearch {
-    fn step(
-        &mut self,
-        engine: &mut Engine,
-        probe: Option<&NavigationProbe>,
-        started: Instant,
-    ) -> Result<bool> {
+    fn step(&mut self, engine: &mut Engine, probe: Option<&NavigationProbe>) -> Result<bool> {
         ensure!(
-            self.revision == engine.state.completion_source_generation,
+            self.source_revision == engine.state.completion_source_generation,
             "sources changed during reference search"
         );
         let worker = &mut engine.reference_worker;
         let cache = &mut engine.reference_candidates;
+        let graph_revision = engine.state.completion_graph_generation;
+        let declaration_revision = engine.state.declaration_generation;
         let graph = engine
             .state
             .workspace
@@ -432,223 +382,198 @@ impl ReferenceSearch {
         let root = snapshot.root();
         let mut resolver = snapshot.resolver(workspace);
         resolver.indexes.navigation = probe;
-        if let Some(work) = &mut self.work {
-            let Some(result) = work.poll(worker)? else {
-                return Ok(false);
-            };
-            self.work = None;
-            self.install_work(&mut resolver, cache, result)?;
-        }
-        if let Some(anchor) = &self.anchor {
-            let work = match resolver.indexes.cached_reference_source(&anchor.key) {
-                None => Work::PrepareDisk {
-                    key: anchor.key.clone(),
-                    path: anchor.path.clone(),
-                    text: resolver.indexes.cached_reference_text(&anchor.key),
-                    preparation: Preparation::Anchor,
-                },
-                Some(source) if source.as_ref().text.len() >= LARGE_FILE_BYTES => {
-                    let input = LargeReferenceAnchor::capture(
-                        graph.clone(),
-                        &resolver.indexes,
-                        new_documents,
-                        root,
-                        anchor.clone(),
-                        source.as_ref(),
-                    );
-                    Work::PlanLarge(Box::new(input))
-                }
-                Some(source) => {
-                    resolver.indexes.deferred_reference = Some(&self.dependency);
-                    let result = anchor.plan(&mut resolver, source.as_ref(), root, new_documents);
-                    if let Some(request) = self.dependency.take_pending() {
-                        dependency_work(request, &resolver.indexes)
-                    } else {
-                        self.install_anchor(result?);
-                        return Ok(self.plan.is_none());
-                    }
-                }
-            };
-            let work = self.work.insert(PendingWork::new(work));
-            work.poll(worker)?;
-            return Ok(false);
-        }
-        if let Some(plan) = &self.plan {
-            if let Some(candidates) = cache.get(self.revision, &plan.scope) {
-                self.install_candidates(candidates, probe);
-                record(probe, |counts| counts.reference_scope_cache_hit = true);
-            } else {
-                let input = CandidateInput::capture(
+        let worker_snapshot = self
+            .snapshot
+            .get_or_insert_with(|| {
+                ReferenceWorkerSnapshot::capture(
                     graph.clone(),
                     &resolver.indexes,
                     new_documents,
-                    plan.scope.clone(),
-                );
-                let work = self.work.insert(PendingWork::new(Work::Candidates(input)));
-                work.poll(worker)?;
+                    root,
+                    self.observations.clone(),
+                )
+            })
+            .clone();
+        if let Some(work) = &mut self.work {
+            let Some(outputs) = work.poll(worker)? else {
+                return Ok(false);
+            };
+            self.work = None;
+            let verifies = self.install_work(&mut resolver, cache, outputs)?;
+            if self.observations.changed() {
+                return Ok(true);
+            }
+            if !verifies.is_empty() {
+                self.work = Some(PendingWork::new(verifies));
+                return Ok(false);
+            }
+        }
+        if let Some(anchor) = self.anchor.clone() {
+            self.work = Some(PendingWork::new([Work::Anchor(AnchorWork {
+                snapshot: worker_snapshot,
+                anchor,
+            })]));
+            return Ok(false);
+        }
+        if let Some(plan) = &self.plan {
+            cache.refresh(
+                graph_revision,
+                declaration_revision,
+                &resolver.indexes,
+                new_documents,
+            );
+            if let Some(candidates) = cache.get(&plan.scope) {
+                self.install_candidates(candidates, probe);
+                record(probe, |counts| counts.reference_scope_cache_hit = true);
+            } else {
+                let input = CandidateInput::new(graph, cache.overlays.clone(), plan.scope.clone());
+                self.work = Some(PendingWork::new([Work::Candidates(input)]));
                 return Ok(false);
             }
         }
         let Some(target) = &self.target else {
             return Ok(true);
         };
-        resolver.indexes.deferred_reference = Some(&self.dependency);
-        let mut completed = 0;
-        while completed < 8 && started.elapsed() < SEARCH_BUDGET {
-            if self.current.is_none() {
-                let Some(candidate) = self.files.get(self.next_file).cloned() else {
-                    return Ok(true);
-                };
-                self.next_file += 1;
-                self.current = Some(FileScan::new(candidate, probe));
-                record(probe, |counts| counts.processed_files += 1);
-            }
-            let scan = self.current.as_mut().unwrap();
-            match scan.step(
-                &mut resolver,
-                target,
-                root,
-                &mut self.matches,
-                &self.unreadable,
-            )? {
-                FileProgress::Continue => {}
-                FileProgress::Done => {
-                    scan.record_completion(probe);
-                    self.current = None;
-                    completed += 1;
-                }
-                FileProgress::NeedText => {
-                    let files = std::iter::once(&scan.candidate)
-                        .chain(
-                            self.files[self.next_file..]
-                                .iter()
-                                .take(READ_AHEAD_FILES - 1),
-                        )
-                        .filter(|file| {
-                            !self.unreadable.contains_key(&file.key)
-                                && resolver.indexes.cached_reference_text(&file.key).is_none()
-                        })
-                        .map(|file| (file.key.clone(), file.path.clone()))
-                        .collect();
-                    self.work = Some(PendingWork::new(Work::Read(files)));
-                }
-                FileProgress::Work(work) => self.work = Some(PendingWork::new(work)),
-                FileProgress::VerifyLarge => {
-                    let scan = self.current.take().unwrap();
-                    let source = resolver
-                        .indexes
-                        .cached_reference_source(&scan.candidate.key)
-                        .unwrap();
-                    let verification = LargeFileVerification::capture(
-                        graph.clone(),
-                        &resolver.indexes,
-                        new_documents,
-                        root,
-                        target.clone(),
-                        scan,
-                        source.as_ref(),
-                    );
-                    self.work = Some(PendingWork::new(Work::VerifyLarge(Box::new(verification))));
-                }
-            }
-            if let Some(work) = &mut self.work {
-                work.poll(worker)?;
-                return Ok(false);
-            }
+
+        let batch = if self.next_file == self.files.len() {
+            self.processing_deferred = true;
+            self.deferred
+                .drain(..self.deferred.len().min(BATCH_SIZE))
+                .collect()
+        } else {
+            let end = (self.next_file + BATCH_SIZE).min(self.files.len());
+            let batch = &self.files[self.next_file..end];
+            let same_priority =
+                batch.partition_point(|candidate| candidate.priority == batch[0].priority);
+            self.next_file += same_priority;
+            record(probe, |counts| counts.processed_files += same_priority);
+            batch[..same_priority].to_vec()
+        };
+        if batch.is_empty() {
+            return Ok(true);
         }
-        Ok(self.current.is_none() && self.next_file == self.files.len())
+        let work = batch.into_iter().map(|candidate| {
+            Work::Discover(CandidateDiscovery {
+                snapshot: worker_snapshot.clone(),
+                candidate,
+                target: target.clone(),
+            })
+        });
+        self.work = Some(PendingWork::new(work));
+        Ok(false)
     }
 
     fn install_work(
         &mut self,
         resolver: &mut Resolver<'_, '_>,
         cache: &mut ReferenceCandidates,
-        result: WorkResult,
-    ) -> Result<()> {
+        outputs: Vec<WorkOutput>,
+    ) -> Result<Vec<Work>> {
         let probe = resolver.indexes.navigation;
-        let WorkResult { output, stats } = result;
-        record(probe, |counts| {
-            counts.disk_reads += stats.reads;
-            counts.text_misses += stats.reads;
-            counts.read += stats.read;
-            counts.parse += stats.parse;
-            counts.ast_parses += usize::from(stats.parsed);
-        });
-        match output {
-            WorkOutput::Candidates(candidates) => {
-                let plan = self.plan.as_ref().expect("prepared reference scope");
-                cache.insert(self.revision, &plan.scope, candidates.clone());
-                self.install_candidates(candidates, probe);
-            }
-            WorkOutput::Texts(texts) => {
-                record(probe, |counts| counts.prefilter_reads += stats.reads);
-                for (key, text) in texts {
-                    match text {
-                        Ok(text) => {
-                            resolver.indexes.navigation_texts.entry(key).or_insert(text);
-                        }
-                        Err(error) => {
-                            self.unreadable.insert(key, error);
-                        }
+        let mut discovered = Vec::new();
+        for output in outputs {
+            match output {
+                WorkOutput::Candidates(candidates) => {
+                    let plan = self.plan.as_ref().expect("prepared reference scope");
+                    cache.insert(&plan.scope, candidates.clone());
+                    self.install_candidates(candidates, probe);
+                }
+                WorkOutput::Discovered(scan) => {
+                    let candidate = &scan.input.candidate;
+                    if (scan.missing && candidate.path.is_file())
+                        || scan.text.as_ref().is_some_and(|text| {
+                            !resolver
+                                .indexes
+                                .shared_disk
+                                .validates_read(&candidate.path, text)
+                        })
+                    {
+                        self.observations.mark_changed();
+                        continue;
                     }
-                }
-            }
-            WorkOutput::Disk {
-                key,
-                text,
-                source,
-                preparation,
-            } => {
-                record(probe, |counts| {
-                    counts.ast_misses += 1;
-                    match preparation {
-                        Preparation::Dependency => {
-                            counts.reference_dependency_parses += usize::from(stats.parsed)
-                        }
-                        Preparation::Candidate => {
-                            counts.reference_candidate_parses += usize::from(stats.parsed)
-                        }
-                        Preparation::Anchor => {
-                            counts.reference_anchor_parses += usize::from(stats.parsed)
-                        }
+                    if let Some(text) = &scan.text {
+                        resolver
+                            .indexes
+                            .navigation_texts
+                            .insert(candidate.key.clone(), text.downgrade());
                     }
-                });
-                if let Some(text) = text {
-                    resolver
-                        .indexes
-                        .navigation_texts
-                        .entry(key.clone())
-                        .or_insert(text);
-                }
-                match source {
-                    Ok(prepared) => resolver.indexes.install_reference_source(key, prepared),
-                    Err(error) if preparation == Preparation::Dependency => {
-                        self.dependency.fail(key, &error)
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            WorkOutput::Open(result) => result?,
-            WorkOutput::Large(mut result) => {
-                self.matches.append(&mut result.matches);
-                if let Some(work) = result.counts {
-                    record(probe, |counts| counts.add_reference_verification(work));
-                }
-            }
-            WorkOutput::Anchor(result) => {
-                self.install_anchor(result.anchor);
-                if let Some(work) = result.counts {
                     record(probe, |counts| {
-                        counts.reference_target = work.reference_target;
-                        counts.candidate_packages = work.candidate_packages;
-                        counts.candidate_files = work.candidate_files;
-                        counts.processed_files += work.processed_files;
-                        counts.add_reference_verification(work);
+                        counts.add_reference_verification(scan.counts.clone())
                     });
+                    if scan.should_verify {
+                        if !self.processing_deferred
+                            && candidate.priority == 2
+                            && scan.input.target.container.is_some()
+                            && !scan.has_container
+                        {
+                            // Retain only the file identity while later container
+                            // hits run. The second pass checks the current ticket
+                            // and reuses resident text and token postings.
+                            self.deferred.push_back(candidate.clone());
+                        } else {
+                            discovered.push(scan);
+                        }
+                    }
+                }
+                WorkOutput::Verified(result) => {
+                    record(probe, |counts| {
+                        counts.add_reference_verification(result.counts)
+                    });
+                    let key = &result.candidate.key;
+                    let prepared = result.source;
+                    let source = prepared
+                        .as_ref()
+                        .map(|source| source.clone().into_indexed());
+                    if result.changed
+                        || (result.missing && result.candidate.path.is_file())
+                        || prepared.is_some_and(|source| {
+                            !resolver
+                                .indexes
+                                .install_reference_source(key.clone(), source)
+                        })
+                    {
+                        self.observations.mark_changed();
+                    } else if !result.matches.is_empty() {
+                        let source = source
+                            .as_ref()
+                            .or_else(|| resolver.indexes.documents.get(key))
+                            .context("missing verified reference source")?;
+                        let mut ranges: Vec<_> = result
+                            .matches
+                            .into_iter()
+                            .map(|range| source.byte_range(range))
+                            .collect();
+                        ranges.sort_unstable_by_key(|range| (range.start, range.end));
+                        ranges.dedup();
+                        self.verified_count += ranges.len();
+                        self.verified
+                            .insert(key.clone(), (source.path.clone(), ranges));
+                    }
+                }
+                WorkOutput::Anchor(result) => {
+                    record(probe, |counts| {
+                        counts.reference_target = result.counts.reference_target;
+                        counts.add_reference_verification(result.counts);
+                    });
+                    let anchor = self.anchor.as_ref().expect("reference anchor");
+                    if (result.missing && anchor.path.is_file())
+                        || result.source.is_some_and(|source| {
+                            !resolver
+                                .indexes
+                                .install_reference_source(anchor.key.clone(), source)
+                        })
+                    {
+                        self.observations.mark_changed();
+                        continue;
+                    }
+                    self.install_anchor(result.anchor);
                 }
             }
         }
-        Ok(())
+        Ok(discovered
+            .into_iter()
+            .map(|discovery| Work::Verify(CandidateWork { discovery }))
+            .collect())
     }
 
     fn install_anchor(&mut self, result: AnchorResult) {
@@ -671,10 +596,31 @@ impl ReferenceSearch {
                 .binary_search_by(|candidate| candidate.key.cmp(&plan.target.path))
                 .is_err()
         {
-            self.matches.push((plan.declaration, plan.target.range));
+            self.matches
+                .push((plan.declaration.clone(), plan.target.range));
         }
-        self.target = Some(plan.target);
-        self.files = candidates.files;
+        let declaration_directory = plan.target.path.parent();
+        self.files = candidates
+            .files
+            .iter()
+            .map(|candidate| {
+                let priority = if candidate.key == plan.target.path {
+                    0
+                } else if candidate.package_id == plan.scope.owner
+                    || candidate.key.parent() == declaration_directory
+                {
+                    1
+                } else {
+                    2
+                };
+                Arc::new(ReferenceCandidate {
+                    priority,
+                    ..candidate.as_ref().clone()
+                })
+            })
+            .collect();
+        self.files.sort_by_key(|candidate| candidate.priority);
+        self.target = Some(Arc::new(plan.target));
     }
 }
 
@@ -823,11 +769,10 @@ impl<'w> Resolver<'w, '_> {
         }) else {
             return Ok(None);
         };
-        let transitive = if is_exported(spelling) {
-            self.is_member_declaration(&target, target_range)?
-        } else {
-            false
-        };
+        let (member, top_level, container) = self.reference_owner(&target, target_range)?;
+        let transitive = is_exported(spelling) && member;
+        let direct_import =
+            (is_exported(spelling) && top_level).then(|| owner.import_path().to_owned());
         record(probe, |counts| {
             if transitive {
                 counts.reference_target = "member";
@@ -839,6 +784,9 @@ impl<'w> Resolver<'w, '_> {
                 path: target_key,
                 range: target_range,
                 include_declaration,
+                direct_import,
+                container: container
+                    .or_else(|| (!owner.name.is_empty()).then(|| owner.name.clone())),
             },
             scope: ReferenceScope {
                 owner: owner.id.clone(),
@@ -849,26 +797,60 @@ impl<'w> Resolver<'w, '_> {
         }))
     }
 
-    fn is_member_declaration(&mut self, path: &Path, range: Range) -> Result<bool> {
+    fn reference_owner(
+        &mut self,
+        path: &Path,
+        range: Range,
+    ) -> Result<(bool, bool, Option<String>)> {
         let Some(source) = self.indexes.reference_source(path)? else {
-            return Ok(false);
+            return Ok((false, false, None));
         };
         let source = source.as_ref();
         let Some(mut node) = source.reference_at(range.start).map(ReferenceQuery::name) else {
-            return Ok(false);
+            return Ok((false, false, None));
         };
+        let mut declaration = is_declaration_name(node);
+        let mut member = false;
         while let Some(owner) = node.parent() {
             match owner.kind() {
-                "method_declaration" | "method_elem" | "field_declaration" => return Ok(true),
-                "function_declaration"
-                | "type_spec"
-                | "type_alias"
-                | "var_spec"
-                | "const_spec"
-                | "source_file" => return Ok(false),
-                _ => node = owner,
+                "method_declaration" => {
+                    let container = owner
+                        .child_by_field_name("receiver")
+                        .and_then(|receiver| receiver.named_child(0))
+                        .and_then(|parameter| parameter.child_by_field_name("type"))
+                        .and_then(|receiver| {
+                            let mut cursor = receiver;
+                            loop {
+                                match cursor.kind() {
+                                    "type_identifier" => {
+                                        return Some(node_text(cursor, &source.text).to_owned());
+                                    }
+                                    "pointer_type" | "generic_type" => {
+                                        cursor = cursor.named_child(0)?
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                        });
+                    return Ok((true, false, container));
+                }
+                "method_elem" | "field_declaration" => member = true,
+                "function_declaration" | "var_spec" | "const_spec" => {
+                    return Ok((member, declaration && !member, None));
+                }
+                "type_spec" | "type_alias" => {
+                    let container = member
+                        .then(|| owner.child_by_field_name("name"))
+                        .flatten()
+                        .map(|name| node_text(name, &source.text).to_owned());
+                    return Ok((member, declaration && !member, container));
+                }
+                "function_type" | "func_literal" | "import_spec" => declaration = false,
+                "source_file" => break,
+                _ => {}
             }
+            node = owner;
         }
-        Ok(false)
+        Ok((member, false, None))
     }
 }

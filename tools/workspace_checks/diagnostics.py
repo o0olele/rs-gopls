@@ -91,7 +91,7 @@ def check_push_diagnostics(executable, root, timeout):
             expect_publications(client, {semantic: (1, [])})
             client.change_document(syntax, 2, clean)
             expect_publications(client, {syntax: (2, [])})
-        expect_publications(client, {syntax: (2, []), semantic: (1, codes)})
+        expect_publications(client, {semantic: (1, codes)})
 
         client.open_document(invalid, invalid.read_text(encoding="utf-8"))
         expect_publications(client, {invalid: (1, ["import.invalid", "package.load"])})
@@ -101,16 +101,16 @@ def check_push_diagnostics(executable, root, timeout):
         with gate.pause():
             new_file = write(semantic.parent / "value.go", "package sem\nconst Missing = 1\n")
             notify_changes(client, (new_file, 1))
-            expect_publications(client, {syntax: (2, []), semantic: (1, [])})
+            expect_publications(client, {semantic: (1, [])})
             gate.wait_for_snapshot()
-        complete = {syntax: (2, []), semantic: (1, ["import.unused", "var.unused"])}
+        complete = {semantic: (1, ["import.unused", "var.unused"])}
         expect_publications(client, complete)
 
         extra = root / "extra"
         write(extra / "go.mod", "module example.test/extra\n\ngo 1.22\n")
         write(extra / "extra.go", "package extra\n")
         client.notify("workspace/didChangeWorkspaceFolders", event={"added": [folder(extra)], "removed": []})
-        expect_publications(client, {syntax: (2, []), semantic: (1, [])})
+        expect_publications(client, {semantic: (1, [])})
         expect_publications(client, complete)
         client.close_document(syntax)
         client.close_document(semantic)

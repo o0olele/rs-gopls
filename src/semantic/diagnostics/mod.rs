@@ -4,6 +4,7 @@ mod imports;
 mod inputs;
 mod model;
 mod package_errors;
+mod retention;
 mod syntax;
 mod types;
 mod unresolved;
@@ -28,12 +29,14 @@ use crate::workspace::{Package, Workspace};
 
 pub(crate) use worker::{DiagnosticInput, DiagnosticsPreparation};
 
+pub(super) use syntax::has_reliable_package_scope;
+
 pub(crate) use cache::{DiagnosticKeys, DiagnosticsCache};
 use inputs::diagnostics_view;
 pub(crate) use inputs::snapshot_key_for_path;
 pub(crate) use model::{
-    DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticReport, DiagnosticSeverity,
-    DiagnosticSnapshotKey, DiagnosticTag,
+    ContextCompleteness, DiagnosticCode, DiagnosticFixData, DiagnosticItem, DiagnosticProvenance,
+    DiagnosticReport, DiagnosticSeverity, DiagnosticSnapshotKey, DiagnosticStage, DiagnosticTag,
 };
 
 pub(crate) fn snapshot_key(
@@ -49,7 +52,7 @@ pub(crate) fn analyze_document(
     document: &DocumentSnapshot<'_>,
 ) -> Result<DiagnosticReport> {
     let key = snapshot_key(snapshot, document)?;
-    analyze(snapshot, document, key, None)
+    analyze(snapshot, document, key, None, &mut None)
 }
 
 pub(super) fn analyze(
@@ -57,22 +60,28 @@ pub(super) fn analyze(
     document: &DocumentSnapshot<'_>,
     key: DiagnosticSnapshotKey,
     cancelled: Option<&AtomicBool>,
+    stages: &mut Option<Stages>,
 ) -> Result<DiagnosticReport> {
     checkpoint(cancelled)?;
-    let mut stages = crate::telemetry::enabled().then(Stages::default);
-    let mut items = timed(&mut stages, Stage::Syntax, || {
+    let mut items = timed(stages, Stage::Syntax, || {
         syntax::collect_syntax_diagnostics(document, cancelled)
     })?;
     let Some(view) = diagnostics_view(snapshot, document) else {
-        log_stages(document, stages, true);
         return Ok(DiagnosticReport::new(key, items, true));
     };
     let graph = view.graph;
     let group_id = view.group_id;
-    let package_errors = timed(&mut stages, Stage::PackageErrors, || {
-        package_errors::collect_package_errors(graph, document, view.package, group_id, &items)
+    let package_errors = timed(stages, Stage::PackageErrors, || {
+        package_errors::collect_package_errors(
+            graph,
+            document,
+            view.package,
+            group_id,
+            &items,
+            DiagnosticStage::Stage2,
+        )
     });
-    if syntax::has_reliable_declarations(document.root_node())
+    if syntax::has_reliable_declarations(document.root_node(), cancelled)?
         && let Some(package) = view.package
         && super::completion::render::package_name(document.indexed()) == Some(&package.name)
     {
@@ -85,18 +94,33 @@ pub(super) fn analyze(
                 .unwrap_or_else(|| package.group_id()),
             resolver: snapshot.diagnostic_resolver(graph, cancelled),
             locals: declarations::Locals::default(),
-            imports: timed(&mut stages, Stage::Imports, || {
+            imports: timed(stages, Stage::Imports, || {
                 imports::Bindings::new(source, graph, package)
             }),
             items: Vec::new(),
             cancelled,
         };
-        timed(&mut stages, Stage::Declarations, || {
+        timed(stages, Stage::Declarations, || {
             declarations::collect(&mut analysis)
         })?;
-        inspect(&mut analysis, &mut stages)?;
+        inspect(&mut analysis, stages)?;
+        if document.root_node().has_error() && !analysis.locals.incomplete_package {
+            let globals = std::mem::take(&mut analysis.locals.globals);
+            analysis.locals = declarations::Locals::default();
+            let filter = WalkMode::Recover {
+                dirty: None,
+                damaged_only: true,
+            };
+            declarations::collect_locals(&mut analysis, filter)?;
+            unresolved::inspect_bare(
+                &mut analysis,
+                filter,
+                |name| globals.contains_key(name),
+                &mut HashSet::new(),
+            )?;
+        }
         for (i, item) in analysis.items.into_iter().enumerate() {
-            if i & 1023 == 0 {
+            if i & 255 == 0 {
                 checkpoint(cancelled)?;
             }
             items.push(item.finish(source));
@@ -104,8 +128,100 @@ pub(super) fn analyze(
     }
     items.extend(package_errors);
     checkpoint(cancelled)?;
-    log_stages(document, stages, false);
-    Ok(DiagnosticReport::new(key, items, false))
+    let degraded = graph.total_load_failure().is_some();
+    Ok(DiagnosticReport::at_stage(
+        key,
+        items,
+        DiagnosticStage::Stage2,
+        if degraded {
+            ContextCompleteness::Partial
+        } else {
+            ContextCompleteness::Complete
+        },
+    ))
+}
+
+pub(super) fn analyze_stage1(
+    snapshot: &mut EngineSnapshot<'_>,
+    document: &DocumentSnapshot<'_>,
+    key: DiagnosticSnapshotKey,
+    dirty: Option<Bytes<usize>>,
+    verify: &mut HashSet<(usize, usize)>,
+    cancelled: Option<&AtomicBool>,
+    stages: &mut Option<Stages>,
+) -> Result<DiagnosticReport> {
+    checkpoint(cancelled)?;
+    let mut items = timed(stages, Stage::Syntax, || {
+        syntax::collect_syntax_diagnostics(document, cancelled)
+    })?;
+    let mut context = ContextCompleteness::Partial;
+    let view = diagnostics_view(snapshot, document);
+    if let Some(view) = &view {
+        let package_errors = timed(stages, Stage::PackageErrors, || {
+            package_errors::collect_package_errors(
+                view.graph,
+                document,
+                view.package,
+                view.group_id,
+                &items,
+                DiagnosticStage::Stage1,
+            )
+        });
+        items.extend(package_errors);
+    }
+    if let Some(view) = view
+        && let Some(package) = view.package
+        && let Some(summaries) = timed(stages, Stage::Declarations, || {
+            declarations::stage1_summaries(snapshot, document, &view, cancelled)
+        })?
+    {
+        let source = document.indexed();
+        let mut names = HashSet::new();
+        for summary in &summaries {
+            for (i, name) in summary.file_declarations().enumerate() {
+                if i & 255 == 0 {
+                    checkpoint(cancelled)?;
+                }
+                names.insert(name);
+            }
+        }
+        let filter = WalkMode::Recover {
+            dirty: dirty.as_ref(),
+            damaged_only: false,
+        };
+        let mut analysis = Analysis {
+            source,
+            package,
+            group_id: package.group_id(),
+            resolver: snapshot.diagnostic_resolver(view.graph, cancelled),
+            locals: declarations::Locals::default(),
+            imports: timed(stages, Stage::Imports, || {
+                imports::Bindings::new(source, view.graph, package)
+            }),
+            items: Vec::new(),
+            cancelled,
+        };
+        timed(stages, Stage::Declarations, || {
+            declarations::collect_locals(&mut analysis, filter)
+        })?;
+        timed(stages, Stage::Unresolved, || {
+            unresolved::inspect_bare(&mut analysis, filter, |name| names.contains(name), verify)
+        })?;
+        for (i, item) in analysis.items.into_iter().enumerate() {
+            if i & 255 == 0 {
+                checkpoint(cancelled)?;
+            }
+            items.push(item.finish(source));
+        }
+        context = ContextCompleteness::Complete;
+    }
+    checkpoint(cancelled)?;
+    Ok(DiagnosticReport::at_stage(
+        key,
+        items,
+        DiagnosticStage::Stage1,
+        context,
+    ))
 }
 
 #[cfg(test)]
@@ -116,7 +232,7 @@ pub(crate) fn get_or_compute<'c>(
 ) -> Result<&'c DiagnosticReport> {
     let key = snapshot_key(snapshot, document)?;
     if cache.get(&key).is_none() {
-        let report = analyze(snapshot, document, key.clone(), None)?;
+        let report = analyze(snapshot, document, key.clone(), None, &mut None)?;
         cache.insert(report);
     }
     Ok(cache.get(&key).expect("report for the current snapshot"))
@@ -228,49 +344,54 @@ fn inspect_with<const RECORD: bool>(
     let mut variables = HashSet::new();
     let mut imports = HashSet::new();
     let mut returns = Vec::new();
-    walk(root, analysis.cancelled, |node, kind, parents, entering| {
-        if !entering {
-            returns.pop();
-            return Ok(WalkControl::Children);
-        }
-        let function = is_function(kind);
-        if function {
-            returns.push(types::ReturnSlots::new(node));
-        }
-        if RECORD {
-            stages.inspected_nodes += 1;
-        }
-        let value_name = declarations::identifier_kind(kind)
-            && unused::value_name(analysis, node, kind, parents);
-        let local = value_name
-            .then(|| analysis.locals.lookup(node, analysis.text(node)))
-            .flatten();
-        let qualifier = value_name && imports::qualifier(node, parents);
-        if qualifier && local.is_none() {
-            imports.insert(analysis.text(node));
-        }
-        if track_variables && let Some(binding) = local {
-            stages.measure::<RECORD, _>(Stage::Unused, || {
-                unused::mark_read(analysis, parents, binding, &mut variables)
-            })?;
-        }
-        if value_name || matches!(kind, "qualified_type" | "selector_expression") {
-            stages.measure::<RECORD, _>(Stage::Unresolved, || {
-                unresolved::check(analysis, node, parents, value_name, local, qualifier)
-            })?;
-        }
-        if types::requires_check(kind, value_name && analysis.text(node) == "_") {
-            stages.measure::<RECORD, _>(Stage::Types, || {
-                declarations::check_assignable(analysis, node)?;
-                types::check(analysis, node, parents, value_name, returns.last())
-            })?;
-        }
-        Ok(if function {
-            WalkControl::Scoped
-        } else {
-            WalkControl::Children
-        })
-    })?;
+    walk(
+        root,
+        analysis.cancelled,
+        WalkMode::Intact,
+        |node, kind, parents, entering| {
+            if !entering {
+                returns.pop();
+                return Ok(WalkControl::Children);
+            }
+            let function = is_function(kind);
+            if function {
+                returns.push(types::ReturnSlots::new(node));
+            }
+            if RECORD {
+                stages.inspected_nodes += 1;
+            }
+            let value_name = declarations::identifier_kind(kind)
+                && unused::value_name(analysis, node, kind, parents);
+            let local = value_name
+                .then(|| analysis.locals.lookup(node, analysis.text(node)))
+                .flatten();
+            let qualifier = value_name && imports::qualifier(node, parents);
+            if qualifier && local.is_none() {
+                imports.insert(analysis.text(node));
+            }
+            if track_variables && let Some(binding) = local {
+                stages.measure::<RECORD, _>(Stage::Unused, || {
+                    unused::mark_read(analysis, parents, binding, &mut variables)
+                })?;
+            }
+            if value_name || matches!(kind, "qualified_type" | "selector_expression") {
+                stages.measure::<RECORD, _>(Stage::Unresolved, || {
+                    unresolved::check(analysis, node, parents, value_name, local, qualifier)
+                })?;
+            }
+            if types::requires_check(kind, value_name && analysis.text(node) == "_") {
+                stages.measure::<RECORD, _>(Stage::Types, || {
+                    declarations::check_assignable(analysis, node)?;
+                    types::check(analysis, node, parents, value_name, returns.last())
+                })?;
+            }
+            Ok(if function {
+                WalkControl::Scoped
+            } else {
+                WalkControl::Children
+            })
+        },
+    )?;
     stages.measure::<RECORD, _>(Stage::Imports, || imports::collect(analysis, &imports))?;
     stages.measure::<RECORD, _>(Stage::Unused, || unused::collect(analysis, &variables))
 }
@@ -310,9 +431,42 @@ enum WalkControl {
     Scoped,
 }
 
+#[derive(Clone, Copy)]
+enum WalkMode<'a> {
+    Intact,
+    Recover {
+        dirty: Option<&'a Bytes<usize>>,
+        damaged_only: bool,
+    },
+}
+
+impl WalkMode<'_> {
+    fn includes(self, node: Node<'_>, has_errors: bool, depth: usize) -> bool {
+        match self {
+            Self::Intact => !has_errors || depth == 0 || !node.has_error(),
+            Self::Recover {
+                dirty,
+                damaged_only,
+            } => {
+                !node.is_missing()
+                    && (depth != 1
+                        || ((!damaged_only || node.has_error())
+                            && dirty.is_none_or(|dirty| {
+                                node.start_byte() <= dirty.end && dirty.start <= node.end_byte()
+                            })))
+            }
+        }
+    }
+
+    fn recovers(self) -> bool {
+        matches!(self, Self::Recover { .. })
+    }
+}
+
 fn walk<'t>(
     root: Node<'t>,
     cancelled: Option<&AtomicBool>,
+    mode: WalkMode<'_>,
     mut visit: impl FnMut(Node<'t>, &'static str, Parents<'t, '_>, bool) -> Result<WalkControl>,
 ) -> Result<()> {
     let mut cursor = root.walk();
@@ -320,17 +474,22 @@ fn walk<'t>(
     let mut visited = 0_u32;
     let has_errors = root.has_error();
     loop {
-        if visited & 1023 == 0 {
+        let node = cursor.node();
+        if visited & 255 == 0 || parents.len() == 1 {
             checkpoint(cancelled)?;
         }
         visited = visited.wrapping_add(1);
-        let node = cursor.node();
-        if node.is_named() && !node.is_extra() && (!has_errors || !node.has_error() || node == root)
+        if node.is_named()
+            && (!node.is_extra() || mode.recovers() && node.is_error())
+            && mode.includes(node, has_errors, parents.len())
         {
             let kind = node.kind();
+            if is_function(kind) {
+                checkpoint(cancelled)?;
+            }
             let control = visit(node, kind, Parents(&parents), true)?;
             let on_exit = (control == WalkControl::Scoped).then_some(kind);
-            if control != WalkControl::Skip && cursor.goto_first_child() {
+            if control != WalkControl::Skip && !node.is_error() && cursor.goto_first_child() {
                 parents.push((node, on_exit));
                 continue;
             }
@@ -361,7 +520,7 @@ enum Stage {
 }
 
 #[derive(Default)]
-struct Stages {
+pub(crate) struct Stages {
     times: [Duration; 7],
     inspected_nodes: usize,
 }
@@ -377,6 +536,19 @@ impl Stages {
             run()
         }
     }
+
+    pub(crate) fn log(self, mut fields: serde_json::Value) {
+        let millis = |stage: Stage| crate::telemetry::millis(self.times[stage as usize]);
+        fields["syntax_ms"] = millis(Stage::Syntax).into();
+        fields["declarations_ms"] = millis(Stage::Declarations).into();
+        fields["imports_ms"] = millis(Stage::Imports).into();
+        fields["unused_ms"] = millis(Stage::Unused).into();
+        fields["unresolved_ms"] = millis(Stage::Unresolved).into();
+        fields["types_ms"] = millis(Stage::Types).into();
+        fields["package_errors_ms"] = millis(Stage::PackageErrors).into();
+        fields["inspected_nodes"] = self.inspected_nodes.into();
+        crate::telemetry::emit("diagnostic_stages", fields);
+    }
 }
 
 fn timed<T>(stages: &mut Option<Stages>, stage: Stage, run: impl FnOnce() -> T) -> T {
@@ -384,24 +556,6 @@ fn timed<T>(stages: &mut Option<Stages>, stage: Stage, run: impl FnOnce() -> T) 
         stages.measure::<true, _>(stage, run)
     } else {
         run()
-    }
-}
-
-fn log_stages(document: &DocumentSnapshot<'_>, stages: Option<Stages>, partial: bool) {
-    if let Some(stages) = stages {
-        let millis = |stage: Stage| crate::telemetry::millis(stages.times[stage as usize]);
-        crate::telemetry::event!("diagnostic_stages", {
-            "path": crate::telemetry::path(document.path()),
-            "partial": partial,
-            "syntax_ms": millis(Stage::Syntax),
-            "declarations_ms": millis(Stage::Declarations),
-            "imports_ms": millis(Stage::Imports),
-            "unused_ms": millis(Stage::Unused),
-            "unresolved_ms": millis(Stage::Unresolved),
-            "types_ms": millis(Stage::Types),
-            "package_errors_ms": millis(Stage::PackageErrors),
-            "inspected_nodes": stages.inspected_nodes,
-        });
     }
 }
 

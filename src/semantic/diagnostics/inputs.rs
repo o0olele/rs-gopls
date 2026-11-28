@@ -4,6 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::Path;
 
+use super::cache::SemanticInputs;
 use super::imports::import_error_evidence;
 use super::model::{DiagnosticDocumentRevision, DiagnosticSnapshotKey};
 use super::package_errors::PackageErrorContext;
@@ -66,7 +67,9 @@ pub(crate) fn snapshot_key_for_path(
             version: source
                 .document_version
                 .expect("an open document has a version"),
+            open_generation: source.open_generation,
             fingerprint: source.fingerprint(),
+            content_revision: source.content_revision,
         }
     } else {
         DiagnosticDocumentRevision::Disk {
@@ -76,23 +79,19 @@ pub(crate) fn snapshot_key_for_path(
                 .map_or(0, |change| change.epoch),
         }
     };
-    let epoch = snapshot.diagnostic_inputs_epoch();
-    if let Some(key) = snapshot
-        .diagnostic_keys()
-        .borrow()
-        .get(&path_key, revision, epoch)
-    {
-        return Ok(key.clone());
-    }
-
-    let inputs = DiagnosticView::for_path(snapshot, path, source)
-        .map(|view| semantic_inputs(snapshot, path, source, &view));
-    let key = DiagnosticSnapshotKey::new(path_key, revision, inputs);
-    snapshot
-        .diagnostic_keys()
-        .borrow_mut()
-        .insert(epoch, key.clone());
-    Ok(key)
+    let inputs = DiagnosticView::for_path(snapshot, path, source).map(|view| {
+        if let Some(fingerprint) = snapshot.diagnostic_keys().borrow().get(&path_key) {
+            return fingerprint;
+        }
+        let inputs = semantic_inputs(snapshot, path, source, &view);
+        let fingerprint = inputs.fingerprint;
+        snapshot
+            .diagnostic_keys()
+            .borrow_mut()
+            .insert(path_key.clone(), inputs);
+        fingerprint
+    });
+    Ok(DiagnosticSnapshotKey::new(path_key, revision, inputs))
 }
 
 fn semantic_inputs(
@@ -100,8 +99,9 @@ fn semantic_inputs(
     path: &Path,
     source: Option<&IndexedSource>,
     view: &DiagnosticView<'_>,
-) -> u64 {
+) -> SemanticInputs {
     let graph = view.graph;
+    let mut dependencies = SemanticInputs::default();
     let mut hasher = DefaultHasher::new();
     snapshot.environment().variables().hash(&mut hasher);
     snapshot
@@ -167,7 +167,13 @@ fn semantic_inputs(
             continue;
         }
         let mut inputs = DefaultHasher::new();
-        package.directory_and_name().hash(&mut inputs);
+        let (directory, name) = package.directory_and_name();
+        (directory, name).hash(&mut inputs);
+        dependencies
+            .draft_groups
+            .entry(directory.to_owned())
+            .or_default()
+            .insert(name.to_owned());
         package.private_name_owner().hash(&mut inputs);
         package.test_of().hash(&mut inputs);
         package.load_error.hash(&mut inputs);
@@ -183,13 +189,14 @@ fn semantic_inputs(
             let key = path_key(file);
             key.hash(&mut inputs);
             if let Some(overlay) = snapshot.docs().get(&key) {
-                (overlay.document_version, overlay.fingerprint()).hash(&mut inputs);
+                overlay.declaration_revision.hash(&mut inputs);
                 imports.extend(diagnostic_import_paths(overlay));
             } else {
                 graph
                     .diagnostic_disk_input(&key, snapshot.diagnostic_file_change(&key))
                     .hash(&mut inputs);
             }
+            dependencies.files.insert(key);
         }
         for import in imports {
             let target = graph.resolve_import(package, import);
@@ -199,7 +206,8 @@ fn semantic_inputs(
         views.insert(package.id.as_str(), inputs.finish());
     }
     views.hash(&mut hasher);
-    hasher.finish()
+    dependencies.fingerprint = hasher.finish();
+    dependencies
 }
 
 fn diagnostic_import_paths(source: &IndexedSource) -> impl Iterator<Item = &str> {

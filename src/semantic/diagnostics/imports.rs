@@ -60,6 +60,14 @@ impl<'w> Bindings<'w> {
         self.packages.get(name).copied()
     }
 
+    pub(super) fn possibly_binds_bare(&self, name: &str) -> bool {
+        self.packages.contains_key(name)
+            || self.explicit.contains(name)
+            || self.escaped.contains(name)
+            || self.unknown_qualifier
+            || (is_exported(name) && (self.unknown_dot || !self.dots.is_empty()))
+    }
+
     pub(super) fn can_bind(
         &self,
         resolver: &mut Resolver<'w, '_>,

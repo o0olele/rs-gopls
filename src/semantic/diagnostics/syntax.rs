@@ -6,19 +6,73 @@ use lsp_types::Range;
 
 use super::{DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DocumentSnapshot, checkpoint};
 
-pub(super) fn has_reliable_declarations(root: tree_sitter::Node<'_>) -> bool {
-    !root.has_error()
-        || (!root.is_error()
-            && root.children(&mut root.walk()).all(|decl| {
-                !decl.has_error()
-                    || (matches!(decl.kind(), "function_declaration" | "method_declaration")
-                        && decl.child_by_field_name("body").is_some_and(|body| {
-                            body.has_error()
-                                && decl
-                                    .children(&mut decl.walk())
-                                    .all(|part| part == body || !part.has_error())
-                        }))
-            }))
+pub(super) fn has_reliable_declarations(
+    root: tree_sitter::Node<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<bool> {
+    if !root.has_error() {
+        return Ok(true);
+    }
+    if root.is_error() {
+        return Ok(false);
+    }
+    for decl in root.children(&mut root.walk()) {
+        checkpoint(cancelled)?;
+        if !decl.has_error() {
+            continue;
+        }
+        let Some(body) = decl
+            .child_by_field_name("body")
+            .filter(|_| matches!(decl.kind(), "function_declaration" | "method_declaration"))
+        else {
+            return Ok(false);
+        };
+        let brace = |node: Option<tree_sitter::Node<'_>>, kind| {
+            node.is_some_and(|node| !node.is_missing() && node.kind() == kind)
+        };
+        if !brace(body.child(0), "{")
+            || !brace(body.child(body.child_count().saturating_sub(1)), "}")
+            || decl
+                .children(&mut decl.walk())
+                .any(|part| part != body && part.has_error())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(in crate::semantic) fn has_reliable_package_scope(
+    root: tree_sitter::Node<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<bool> {
+    if !has_reliable_declarations(root, cancelled)? {
+        return Ok(false);
+    }
+    let mut seen_package = false;
+    let mut seen_declaration = false;
+    for node in root
+        .named_children(&mut root.walk())
+        .filter(|node| !node.is_extra())
+    {
+        checkpoint(cancelled)?;
+        match node.kind() {
+            "package_clause" if !seen_package => seen_package = true,
+            "import_declaration" if seen_package && !seen_declaration => {}
+            "function_declaration"
+            | "method_declaration"
+            | "type_declaration"
+            | "var_declaration"
+            | "const_declaration"
+                if seen_package =>
+            {
+                seen_declaration = true
+            }
+            // The grammar also accepts snippets with statements at file scope.
+            _ => return Ok(false),
+        }
+    }
+    Ok(seen_package)
 }
 
 pub(super) fn collect_syntax_diagnostics(
@@ -35,7 +89,7 @@ pub(super) fn collect_syntax_diagnostics(
         checkpoint(cancelled)?;
         let before = pending.len();
         for (i, child) in node.children(&mut node.walk()).enumerate() {
-            if i & 1023 == 0 {
+            if i & 255 == 0 {
                 checkpoint(cancelled)?;
             }
             if child.has_error() {
@@ -58,7 +112,7 @@ pub(super) fn collect_syntax_diagnostics(
                 },
             )
         } else {
-            unexpected(node, document.text())
+            unexpected(node, document.text(), cancelled)?
         };
         if let Some((last, _)) = errors.last_mut()
             && bytes.start >= last.start
@@ -85,35 +139,42 @@ pub(super) fn collect_syntax_diagnostics(
         .collect())
 }
 
-fn unexpected(node: tree_sitter::Node<'_>, text: &str) -> (Bytes<usize>, String) {
+fn unexpected(
+    node: tree_sitter::Node<'_>,
+    text: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(Bytes<usize>, String)> {
     let mut closers = Vec::new();
-    for child in node.children(&mut node.walk()) {
+    for (i, child) in node.children(&mut node.walk()).enumerate() {
+        if i & 255 == 0 {
+            checkpoint(cancelled)?;
+        }
         match child.kind() {
             "(" => closers.push(")"),
             "[" => closers.push("]"),
             "{" => closers.push("}"),
             token @ (")" | "]" | "}") if closers.pop() != Some(token) => {
-                return (
+                return Ok((
                     child.byte_range(),
                     format!("Unexpected {token:?}, expected an expression or declaration"),
-                );
+                ));
             }
             _ => {}
         }
     }
     if let Some(token) = closers.last() {
         let end = node.start_byte() + text[node.byte_range()].trim_end().len();
-        return (end..end, format!("Missing {token:?}"));
+        return Ok((end..end, format!("Missing {token:?}")));
     }
     let fragment = text[node.byte_range()]
         .trim()
         .chars()
         .take(36)
         .collect::<String>();
-    (
+    Ok((
         node.byte_range(),
         format!("Unexpected Go syntax near {fragment:?}"),
-    )
+    ))
 }
 
 pub(super) fn visible_range(document: &DocumentSnapshot<'_>, bytes: Bytes<usize>) -> Range {

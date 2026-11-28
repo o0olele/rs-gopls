@@ -174,6 +174,8 @@ def check_async_refresh(executable_path, root, timeout):
         client.open_document(primary, graph_query.text)
         client.open_document(editable, editable_query.text)
         check_location(client, graph_query, targets["initial"])
+        # Establish the test-inclusive view before counting only watcher loads.
+        check_references(client, graph_query, (graph_query, editable_query))
         initial_calls = gate.calls()
 
         with gate.pause():

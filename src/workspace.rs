@@ -3,8 +3,7 @@ use std::fs::{self, Metadata};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
-use std::thread;
+use std::sync::{OnceLock, atomic::AtomicBool};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -15,13 +14,21 @@ use crate::workspace_roots::{folder_groups, use_module_auto};
 
 mod inputs;
 mod load_trace;
+mod process;
 use inputs::PackageInputs;
 pub(crate) use load_trace::{CommandTrace, LoadTrace};
+pub(crate) use process::{check_load_cancelled, command_output};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceLoad {
     pub generation: u64,
     pub include_tests: bool,
+}
+
+impl WorkspaceLoad {
+    pub(crate) fn covers(self, other: Self) -> bool {
+        self.generation == other.generation && (self.include_tests || !other.include_tests)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -87,19 +94,26 @@ pub(crate) struct DiagnosticFileStamp {
     len: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct DiagnosticFileObservation {
     pub(crate) epoch: u64,
     observed_at: Instant,
-    stamp: Option<DiagnosticFileStamp>,
+    pub(crate) stamp: Option<DiagnosticFileStamp>,
+    semantic: (Option<DiagnosticFileStamp>, u64),
 }
 
 impl DiagnosticFileObservation {
-    pub(crate) fn new(path: &Path, epoch: u64) -> Self {
+    pub(crate) fn new(stamp: Option<DiagnosticFileStamp>, epoch: u64) -> Self {
         Self {
             epoch,
             observed_at: Instant::now(),
-            stamp: fs::metadata(path).ok().map(Into::into),
+            stamp,
+            semantic: (stamp, epoch),
         }
+    }
+
+    pub(crate) fn retain_semantics(&mut self, previous: (Option<DiagnosticFileStamp>, u64)) {
+        self.semantic = previous;
     }
 }
 
@@ -133,7 +147,7 @@ impl Workspace {
         include_tests: bool,
         environment: &GoEnvironment,
     ) -> Result<Self> {
-        Self::load_graph(folders, include_tests, false, environment)
+        Self::load_graph(folders, include_tests, false, environment, None)
     }
 
     pub(crate) fn load_roots_for_rename(
@@ -141,7 +155,16 @@ impl Workspace {
         include_tests: bool,
         environment: &GoEnvironment,
     ) -> Result<Self> {
-        Self::load_graph(folders, include_tests, true, environment)
+        Self::load_graph(folders, include_tests, true, environment, None)
+    }
+
+    pub(crate) fn prewarm_tests(
+        folders: &[PathBuf],
+        environment: &GoEnvironment,
+        track_inputs: bool,
+        cancelled: &AtomicBool,
+    ) -> Result<Self> {
+        Self::load_graph(folders, true, track_inputs, environment, Some(cancelled))
     }
 
     fn load_graph(
@@ -149,10 +172,12 @@ impl Workspace {
         include_tests: bool,
         track_inputs: bool,
         environment: &GoEnvironment,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<Self> {
+        check_load_cancelled(cancelled)?;
         let configuration =
             track_inputs.then(|| PackageInputs::configuration(folders, environment));
-        let groups = folder_groups(folders, environment);
+        let groups = folder_groups(folders, environment, cancelled)?;
         load_trace::groups_discovered(groups.len());
         let inputs = configuration.map(|config| {
             let roots: Vec<_> = groups
@@ -169,6 +194,7 @@ impl Workspace {
         let mut scopes = Vec::with_capacity(groups.len());
         let mut listing = PackageListing::default();
         for group in groups {
+            check_load_cancelled(cancelled)?;
             let _trace = LoadTrace::group(scopes.len());
             let folder = &group.folders[0];
             let mut scope = GroupScope {
@@ -179,13 +205,15 @@ impl Workspace {
                     .map(|dir| path_key(dir))
                     .collect(),
             };
+            scope.folders.sort_unstable();
             let packages = group.roots.and_then(|directories| {
                 let keys: Vec<_> = directories
                     .iter()
                     .map(|dir| path_key(&dir.canonicalize().unwrap_or_else(|_| dir.clone())))
                     .collect();
                 scope.roots.extend(keys.iter().cloned());
-                let packages = list_packages(folder, &directories, include_tests, environment)?;
+                let packages =
+                    list_packages(folder, &directories, include_tests, environment, cancelled)?;
                 roots.extend(keys);
                 Ok(packages)
             });
@@ -197,6 +225,7 @@ impl Workspace {
             scope.roots.dedup();
             scopes.push(scope);
         }
+        check_load_cancelled(cancelled)?;
         let mut workspace = Self::from_listing(
             roots.into_iter().collect(),
             scopes,
@@ -205,6 +234,7 @@ impl Workspace {
             environment,
         );
         workspace.rename_inputs = inputs;
+        check_load_cancelled(cancelled)?;
         load_trace::graph_built(&workspace);
         Ok(workspace)
     }
@@ -301,8 +331,10 @@ impl Workspace {
             read_packages(listing.as_bytes()).unwrap(),
         );
         let keys: Vec<_> = roots.iter().map(|root| path_key(root)).collect();
+        let mut folders = keys.clone();
+        folders.sort_unstable();
         let scopes = vec![GroupScope {
-            folders: keys.clone(),
+            folders,
             roots: Vec::new(),
         }];
         let environment = GoEnvironment::capture();
@@ -356,17 +388,73 @@ impl Workspace {
         key: &Path,
         change: Option<&DiagnosticFileObservation>,
     ) -> (Option<DiagnosticFileStamp>, u64) {
-        let stamp = match change {
+        let stamp = self.diagnostic_disk_stamp(key, change);
+        change
+            .filter(|change| change.stamp == stamp)
+            .map_or((stamp, 0), |change| change.semantic)
+    }
+
+    pub(crate) fn diagnostic_disk_stamp(
+        &self,
+        key: &Path,
+        change: Option<&DiagnosticFileObservation>,
+    ) -> Option<DiagnosticFileStamp> {
+        match change {
             Some(change) if change.observed_at >= self.diagnostic_observed_at => change.stamp,
             _ => self.diagnostic_file_stamps.get(key).copied(),
-        };
-        (stamp, change.map_or(0, |change| change.epoch))
+        }
     }
 
     pub(crate) fn total_load_failure(&self) -> Option<&str> {
         let first = self.package_errors.first()?;
         (self.roots.is_empty() && first.kind == PackageErrorKind::Group)
             .then_some(first.message.as_str())
+    }
+
+    pub(crate) fn covers_production_groups(&self, previous: &Self) -> bool {
+        if self
+            .package_errors
+            .iter()
+            .any(|error| error.kind == PackageErrorKind::Group)
+        {
+            return false;
+        }
+        previous
+            .group_scopes
+            .iter()
+            .enumerate()
+            .all(|(index, scope)| {
+                if previous
+                    .package_errors
+                    .iter()
+                    .any(|error| error.group_id == index && error.kind == PackageErrorKind::Group)
+                {
+                    return true;
+                }
+                let Some(group) = self.group_scopes.iter().position(|candidate| {
+                    candidate.folders == scope.folders
+                        && scope
+                            .roots
+                            .iter()
+                            .all(|root| candidate.roots.contains(root))
+                }) else {
+                    return false;
+                };
+                previous.group_imports[index].iter().all(|(import, id)| {
+                    previous.package(id).is_none_or(|old| {
+                        !old.is_production()
+                            || old.load_error
+                            || self
+                                .package_in_group_by_import(group, import)
+                                .is_some_and(|new| {
+                                    new.is_production()
+                                        && !new.load_error
+                                        && new.directory == old.directory
+                                        && new.files == old.files
+                                })
+                    })
+                })
+            })
     }
 
     pub(crate) fn group_for_path(&self, path: &Path) -> Option<usize> {
@@ -558,10 +646,7 @@ impl Workspace {
         // compilation in this directory. The production selection excludes it.
         let only_tests = path
             .file_stem()
-            .is_some_and(|name| name.to_string_lossy().ends_with("_test"))
-            && self
-                .package_of_file(path)
-                .is_some_and(|package| !package.is_production());
+            .is_some_and(|name| name.to_string_lossy().ends_with("_test"));
         let mut queue: Vec<_> = self
             .packages
             .values()
@@ -570,7 +655,7 @@ impl Workspace {
             })
             .map(|package| package.id.as_str())
             .collect();
-        if queue.is_empty() {
+        if queue.is_empty() && !only_tests {
             return None;
         }
 
@@ -729,7 +814,9 @@ fn list_packages(
     directories: &[PathBuf],
     include_tests: bool,
     environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<ListedPackage>> {
+    check_load_cancelled(cancelled)?;
     let patterns = directories.iter().map(|directory| {
         if directory == root {
             "./...".to_owned()
@@ -739,11 +826,11 @@ fn list_packages(
     });
     let starting_go = || format!("starting go list in {}", root.display());
     let mut command = environment.command("go").with_context(starting_go)?;
-    if use_module_auto(root, environment)? {
+    if use_module_auto(root, environment, cancelled)? {
         command.env("GO111MODULE", "auto");
     }
     let mut trace = CommandTrace::new("go list", root);
-    let mut child = command
+    command
         .args([
             "list",
             "-e",
@@ -753,33 +840,15 @@ fn list_packages(
         .args(include_tests.then_some("-test"))
         .args(patterns)
         .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdin(Stdio::null());
+    let (status, packages, stderr) =
+        process::read_command(&mut command, trace.as_mut(), cancelled, |stdout| {
+            read_packages(BufReader::new(stdout))
+        })
         .with_context(starting_go)?;
-    if let Some(trace) = &mut trace {
-        trace.spawned(child.id());
+    if let (Some(trace), Ok(packages)) = (&mut trace, &packages) {
+        trace_listed_packages(trace, packages, directories);
     }
-    let stdout = child.stdout.take().expect("go list stdout is piped");
-    let mut stderr = child.stderr.take().expect("go list stderr is piped");
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes)?;
-        Ok::<_, std::io::Error>(bytes)
-    });
-    let packages = read_packages(BufReader::new(stdout));
-    let status = child.wait().context("waiting for go list")?;
-    if let Some(trace) = &mut trace {
-        trace.exited(status);
-        if let Ok(packages) = &packages {
-            trace_listed_packages(trace, packages, directories);
-        }
-    }
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| anyhow!("go list stderr reader panicked"))?
-        .context("reading go list stderr")?;
     if !status.success() {
         bail!(
             "go list failed in {} ({status}): {}",
@@ -1150,6 +1219,16 @@ pub(crate) fn is_symbol_source(key: &Path) -> bool {
             .any(|component| component.as_os_str() == "vendor")
 }
 
+pub(crate) fn is_go_manifest(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "go.mod" | "go.sum" | "go.work" | "go.work.sum"))
+}
+
+pub(crate) fn is_watched_go_file(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "go") || is_go_manifest(path)
+}
+
 pub(crate) fn path_key(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -1485,7 +1564,7 @@ mod tests {
             "package two\nimport _ \"example.test/two/missing\"\n",
         );
         let environment = GoEnvironment::capture();
-        let groups = folder_groups(&folders, &environment);
+        let groups = folder_groups(&folders, &environment, None).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].folders, folders);
         let workspace = Workspace::load_roots(&folders, false).unwrap();
@@ -1508,7 +1587,7 @@ mod tests {
         );
 
         let overlapping = [project.root.clone(), folders[0].clone()];
-        let groups = folder_groups(&overlapping, &environment);
+        let groups = folder_groups(&overlapping, &environment, None).unwrap();
         assert_eq!(groups[0].roots.as_ref().unwrap().len(), 3);
         let workspace = Workspace::load_roots(&overlapping, false).unwrap();
         assert_eq!(workspace.roots().len(), 3);

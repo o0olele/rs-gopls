@@ -1,3 +1,4 @@
+mod diagnostic_refresh;
 mod dispatch;
 mod go_environment;
 mod protocol;
@@ -19,10 +20,11 @@ use std::{
     collections::HashSet,
     env,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
-use crossbeam_channel::{bounded, never, select_biased, unbounded};
+use crossbeam_channel::{at, bounded, never, select_biased, unbounded};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request};
 use lsp_types::{
     CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
@@ -34,17 +36,16 @@ use lsp_types::{
     notification::{
         Cancel, DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles,
         DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-        Exit, Initialized, Notification as _, PublishDiagnostics,
+        Exit, Initialized, Notification as _,
     },
-    request::{Initialize, Request as _, Shutdown, WorkspaceDiagnosticRefresh},
+    request::{Initialize, Request as _, Shutdown},
 };
 use serde_json::Value;
 
+use diagnostic_refresh::DiagnosticRefresh;
 use go_environment::{EnvironmentOverrides, GoEnvironment, environment_overrides};
-use protocol::{
-    RequestResult, file_path, invalid_params, path_uri, send_notification, send_response,
-};
-use scheduler::{DiagnosticConsumer, Scheduler, WorkspaceResult};
+use protocol::{RequestResult, file_path, invalid_params, path_uri, send_response};
+use scheduler::{DiagnosticConsumer, DiagnosticMode, Scheduler, WorkspaceResult};
 use semantic::Engine;
 use workspace::path_key;
 
@@ -69,17 +70,38 @@ struct Running {
     engine: Engine,
     watch_files: bool,
     client_features: dispatch::ClientFeatures,
-    diagnostic_updates: DiagnosticUpdates,
+    diagnostic_mode: DiagnosticMode,
+    diagnostic_refresh: Option<DiagnosticRefresh>,
     scheduler: Scheduler,
 }
 
-enum DiagnosticUpdates {
-    None,
-    Publish,
-    Refresh { sequence: u64 },
-}
-
 impl Running {
+    fn large_document_parsed(
+        &mut self,
+        connection: &Connection,
+        result: semantic::OpenParseResult,
+    ) -> Result<()> {
+        if self.engine.complete_open_parse(result)?.is_some() {
+            self.scheduler
+                .revalidate_diagnostics(&mut self.engine, connection)?;
+        }
+        self.replay_open_requests(connection)
+    }
+
+    fn replay_open_requests(&mut self, connection: &Connection) -> Result<()> {
+        for request in self.scheduler.take_ready_open_requests(&self.engine) {
+            let _trace = rpc_telemetry::step(&request.id, false);
+            dispatch::handle(
+                connection,
+                &mut self.engine,
+                &mut self.scheduler,
+                self.client_features,
+                request,
+            )?;
+        }
+        Ok(())
+    }
+
     fn workspace_loaded(&mut self, connection: &Connection, update: WorkspaceResult) -> Result<()> {
         if self
             .scheduler
@@ -91,7 +113,8 @@ impl Running {
     }
 
     fn publish_document(&mut self, connection: &Connection, path: &Path, uri: Uri) -> Result<()> {
-        if matches!(self.diagnostic_updates, DiagnosticUpdates::Publish)
+        if !self.scheduler.watching_files()
+            && matches!(self.diagnostic_mode, DiagnosticMode::Push { .. })
             && self.engine.is_open(path)
         {
             self.scheduler.submit_diagnostics(
@@ -105,8 +128,30 @@ impl Running {
         Ok(())
     }
 
+    fn advance_watched_files(&mut self, connection: &Connection, now: Instant) -> Result<()> {
+        let Some(changes) = self.scheduler.take_watched_files(now) else {
+            return Ok(());
+        };
+        let before = self.engine.workspace_load();
+        self.engine.watched_files_changed(&changes);
+        for (path, _) in &changes {
+            if !self.engine.is_open(path) {
+                self.scheduler.watched_document_modified(connection, path)?;
+            }
+        }
+        let after = self.engine.workspace_load();
+        if after != before {
+            self.scheduler
+                .workspace_modified(connection, after, "watched_files")?;
+        }
+        self.scheduler
+            .revalidate_diagnostics(&mut self.engine, connection)?;
+        self.replay_open_requests(connection)?;
+        self.publish_open_documents(connection)
+    }
+
     fn publish_open_documents(&mut self, connection: &Connection) -> Result<()> {
-        if matches!(self.diagnostic_updates, DiagnosticUpdates::Publish) {
+        if matches!(self.diagnostic_mode, DiagnosticMode::Push { .. }) {
             for path in self.engine.open_document_paths() {
                 if let Err(error) = self.publish_document(connection, &path, path_uri(&path)?) {
                     eprintln!("rs-gopls: diagnostics for {}: {error:#}", path.display());
@@ -117,19 +162,50 @@ impl Running {
     }
 
     fn workspace_diagnostics_changed(&mut self, connection: &Connection) -> Result<()> {
-        if let DiagnosticUpdates::Refresh { sequence } = &mut self.diagnostic_updates {
-            *sequence += 1;
-            let id = format!("rs-gopls/diagnostic-refresh/{sequence}");
-            connection
-                .sender
-                .send(
-                    Request::new(id.into(), WorkspaceDiagnosticRefresh::METHOD.to_owned(), ())
-                        .into(),
-                )
-                .context("requesting a diagnostic refresh")
+        if let Some(refresh) = &mut self.diagnostic_refresh {
+            refresh.workspace_changed(self.engine.workspace_load().generation, Instant::now());
+            Ok(())
         } else {
             self.publish_open_documents(connection)
         }
+    }
+
+    fn diagnostic_deadline(&self) -> Option<Instant> {
+        self.scheduler
+            .diagnostic_deadline()
+            .into_iter()
+            .chain(
+                self.diagnostic_refresh
+                    .as_ref()
+                    .and_then(DiagnosticRefresh::deadline),
+            )
+            .min()
+    }
+
+    fn collect_diagnostic_refresh(&mut self, now: Instant) {
+        if let Some(refresh) = &mut self.diagnostic_refresh {
+            for mark in self.scheduler.drain_diagnostic_refresh() {
+                refresh.document_changed(mark, now);
+            }
+        }
+    }
+
+    fn advance_diagnostics(&mut self, connection: &Connection, now: Instant) -> Result<()> {
+        self.scheduler
+            .advance_diagnostics(&mut self.engine, connection, now)?;
+        self.collect_diagnostic_refresh(now);
+        if let Some(refresh) = &mut self.diagnostic_refresh {
+            refresh.advance(
+                connection,
+                now,
+                self.engine.workspace_load().generation,
+                |mark| {
+                    self.scheduler
+                        .diagnostic_refresh_is_current(&mut self.engine, mark)
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn advance_search(&mut self, connection: &Connection) -> Result<()> {
@@ -181,25 +257,46 @@ fn main() -> Result<()> {
 fn serve(connection: &Connection) -> Result<()> {
     let mut state = State::starting();
     let (load_sender, load_receiver) = unbounded();
+    let load_idle = never();
     let (search_token, search_ready) = bounded(1);
     let search_idle = never();
     let diagnostic_idle = never();
     let highlight_idle = never();
+    let open_parse_idle = never();
     search_token
         .send(())
         .context("scheduling navigation searches")?;
     loop {
+        let watching =
+            matches!(&state, State::Running(running) if running.scheduler.watching_files());
+        let graph_updates = if watching { &load_idle } else { &load_receiver };
+        let workspace_timer = match &state {
+            State::Running(running) => running
+                .scheduler
+                .workspace_deadline()
+                .map_or_else(never, at),
+            _ => never(),
+        };
+        let diagnostic_timer = match &state {
+            State::Running(running) if !watching => {
+                running.diagnostic_deadline().map_or_else(never, at)
+            }
+            _ => never(),
+        };
         let (
             search_receiver,
             completion_wake,
             reference_wake,
             implementation_wake,
+            shared_disk_wake,
+            open_parse_wake,
             diagnostic_receiver,
             highlight_receiver,
         ) = match &state {
             State::Running(running) => (
-                if running.scheduler.ready_search(&running.engine).is_some()
-                    || running.engine.implementation_index_ready()
+                if !watching
+                    && (running.scheduler.ready_search(&running.engine).is_some()
+                        || running.engine.implementation_index_ready())
                 {
                     &search_ready
                 } else {
@@ -208,20 +305,32 @@ fn serve(connection: &Connection) -> Result<()> {
                 running.engine.completion_wake(),
                 running.engine.reference_wake(),
                 running.engine.implementation_wake(),
-                running
-                    .scheduler
-                    .diagnostic_completions()
-                    .unwrap_or(&diagnostic_idle),
-                running
-                    .scheduler
-                    .highlight_completions()
-                    .unwrap_or(&highlight_idle),
+                running.engine.shared_disk_wake(),
+                running.engine.open_parse_wake(),
+                if watching {
+                    &diagnostic_idle
+                } else {
+                    running
+                        .scheduler
+                        .diagnostic_completions()
+                        .unwrap_or(&diagnostic_idle)
+                },
+                if watching {
+                    &highlight_idle
+                } else {
+                    running
+                        .scheduler
+                        .highlight_completions()
+                        .unwrap_or(&highlight_idle)
+                },
             ),
             _ => (
                 &search_idle,
                 &search_idle,
                 &search_idle,
                 &search_idle,
+                &search_idle,
+                &open_parse_idle,
                 &diagnostic_idle,
                 &highlight_idle,
             ),
@@ -256,18 +365,35 @@ fn serve(connection: &Connection) -> Result<()> {
                             }
                         }
                     }
-                    Message::Response(_) => {}
+                    Message::Response(response) => {
+                        if let State::Running(running) = &mut state
+                            && let Some(refresh) = &mut running.diagnostic_refresh
+                        {
+                            refresh.response(&response);
+                        }
+                    }
                 }
             }
-            recv(load_receiver) -> update => {
+            recv(graph_updates) -> update => {
                 if let State::Running(running) = &mut state {
                     running.workspace_loaded(connection, update.context("receiving Go package metadata")?)?;
+                }
+            }
+            recv(workspace_timer) -> _ => {}
+            recv(open_parse_wake) -> completed => {
+                if let State::Running(running) = &mut state {
+                    running.large_document_parsed(connection, completed.context("receiving opened Go document syntax")?)?;
                 }
             }
             recv(diagnostic_receiver) -> completed => {
                 if let State::Running(running) = &mut state {
                     let completed = completed.context("receiving Go diagnostics")?;
                     running.scheduler.complete_diagnostics(&mut running.engine, connection, completed)?;
+                }
+            }
+            recv(diagnostic_timer) -> _ => {
+                if let State::Running(running) = &mut state {
+                    running.advance_diagnostics(connection, Instant::now())?;
                 }
             }
             recv(highlight_receiver) -> completed => {
@@ -279,6 +405,7 @@ fn serve(connection: &Connection) -> Result<()> {
             recv(completion_wake) -> _ => {}
             recv(reference_wake) -> _ => {}
             recv(implementation_wake) -> _ => {}
+            recv(shared_disk_wake) -> _ => {}
             recv(search_receiver) -> ready => {
                 ready.context("receiving navigation search work")?;
                 if let State::Running(running) = &mut state {
@@ -292,6 +419,14 @@ fn serve(connection: &Connection) -> Result<()> {
             }
         }
         if let State::Running(running) = &mut state {
+            let now = Instant::now();
+            running.advance_watched_files(connection, now)?;
+            if !running.scheduler.watching_files() {
+                if let Some(update) = running.scheduler.take_deferred_test_view(&running.engine) {
+                    running.workspace_loaded(connection, update)?;
+                }
+                running.collect_diagnostic_refresh(now);
+            }
             running
                 .scheduler
                 .start_workspace_load(&mut running.engine, &load_sender)?;
@@ -381,9 +516,7 @@ fn initialize(
     let client_features = dispatch::ClientFeatures::from_initialize(&params);
     let document = params.capabilities.text_document.as_ref();
     let pull = document.and_then(|d| d.diagnostic.as_ref()).is_some();
-    let publish = document
-        .and_then(|d| d.publish_diagnostics.as_ref())
-        .is_some();
+    let publish = document.and_then(|d| d.publish_diagnostics.as_ref());
     let refresh = refresh_support.or_else(|| {
         params
             .capabilities
@@ -392,10 +525,12 @@ fn initialize(
             .and_then(|w| w.diagnostic.as_ref())
             .and_then(|d| d.refresh_support)
     }) == Some(true);
-    let diagnostic_updates = match (pull, refresh, publish) {
-        (true, true, _) => DiagnosticUpdates::Refresh { sequence: 0 },
-        (false, _, true) => DiagnosticUpdates::Publish,
-        _ => DiagnosticUpdates::None,
+    let diagnostic_mode = match (pull, publish) {
+        (true, _) => DiagnosticMode::Pull { refresh },
+        (false, Some(publish)) => DiagnosticMode::Push {
+            versioned: publish.version_support == Some(true),
+        },
+        (false, None) => DiagnosticMode::None,
     };
     if let Some(overrides) = overrides {
         environment = environment.with_overrides(overrides);
@@ -435,9 +570,10 @@ fn initialize(
         Running {
             watch_files,
             client_features,
-            diagnostic_updates,
+            diagnostic_mode,
+            diagnostic_refresh: (pull && refresh).then(DiagnosticRefresh::default),
             engine: Engine::with_environment(roots, environment),
-            scheduler: Scheduler::default(),
+            scheduler: Scheduler::with_diagnostic_mode(diagnostic_mode),
         },
         result,
     ))
@@ -572,30 +708,16 @@ fn handle_notification(
             telemetry::event!("notification", {
                 "method": DidChangeWatchedFiles::METHOD, "changed_file_count": changed_file_count,
             });
-            let before = running.engine.workspace_load();
+            let now = Instant::now();
+            running.advance_watched_files(connection, now)?;
             for change in params.changes {
-                if let Ok(path) = file_path(&change.uri) {
-                    running.engine.file_changed_from(
-                        &path,
-                        change.typ,
-                        "watched_files",
-                        changed_file_count,
-                    );
-                    if !running.engine.is_open(&path) {
-                        running.scheduler.document_modified(connection, &path)?;
-                    }
+                if let Ok(path) = file_path(&change.uri)
+                    && workspace::is_watched_go_file(&path)
+                {
+                    running.scheduler.watch_file(path, change.typ, now);
                 }
             }
-            let after = running.engine.workspace_load();
-            if after != before {
-                running
-                    .scheduler
-                    .workspace_modified(connection, after, "watched_files")?;
-            }
-            running
-                .scheduler
-                .revalidate_diagnostics(&mut running.engine, connection)?;
-            running.publish_open_documents(connection)
+            Ok(())
         }
         DidOpenTextDocument::METHOD => {
             let params: DidOpenTextDocumentParams = serde_json::from_value(params)?;
@@ -603,7 +725,7 @@ fn handle_notification(
             let path = file_path(&document.uri)?;
             telemetry::event!("notification", {
                 "method": DidOpenTextDocument::METHOD, "document": telemetry::path(&path),
-                "version": document.version,
+                "version": document.version, "doc_version": document.version,
             });
             running
                 .engine
@@ -612,6 +734,7 @@ fn handle_notification(
             running
                 .scheduler
                 .revalidate_diagnostics(&mut running.engine, connection)?;
+            running.replay_open_requests(connection)?;
             running.publish_document(connection, &path, document.uri)
         }
         DidChangeTextDocument::METHOD => {
@@ -619,11 +742,32 @@ fn handle_notification(
             let path = file_path(&params.text_document.uri)?;
             telemetry::event!("notification", {
                 "method": DidChangeTextDocument::METHOD, "document": telemetry::path(&path),
-                "version": params.text_document.version, "change_count": params.content_changes.len(),
+                "version": params.text_document.version, "doc_version": params.text_document.version,
+                "change_count": params.content_changes.len(),
             });
-            running
-                .engine
-                .edit(&path, &params.content_changes, params.text_document.version)?;
+            if params.content_changes.is_empty()
+                || running
+                    .engine
+                    .open_document_version(&path)
+                    .is_none_or(|version| params.text_document.version <= version)
+            {
+                return Ok(());
+            }
+            let received = Instant::now();
+            running.scheduler.interrupt_document_diagnostics(&path);
+            if let Err(error) =
+                running
+                    .engine
+                    .edit(&path, &params.content_changes, params.text_document.version)
+            {
+                running.scheduler.advance_diagnostics(
+                    &mut running.engine,
+                    connection,
+                    Instant::now(),
+                )?;
+                return Err(error);
+            }
+            running.scheduler.note_diagnostic_edit(&path, received);
             running.scheduler.document_modified(connection, &path)?;
             running
                 .scheduler
@@ -633,19 +777,42 @@ fn handle_notification(
         DidCloseTextDocument::METHOD => {
             let params: DidCloseTextDocumentParams = serde_json::from_value(params)?;
             let path = file_path(&params.text_document.uri)?;
+            let version = telemetry::enabled()
+                .then(|| running.engine.open_document_version(&path))
+                .flatten();
             telemetry::event!("notification", {
                 "method": DidCloseTextDocument::METHOD, "document": telemetry::path(&path),
+                "doc_version": version,
             });
             let was_open = running.engine.is_open(&path);
+            running.scheduler.interrupt_document_diagnostics(&path);
+            let before = running.engine.workspace_load();
             running.engine.close(&path);
-            running.scheduler.document_modified(connection, &path)?;
+            running.scheduler.document_closed(connection, &path)?;
+            let after = running.engine.workspace_load();
+            if after != before {
+                running.scheduler.record_workspace_file_event();
+                running
+                    .scheduler
+                    .workspace_modified(connection, after, "didClose")?;
+            }
             running
                 .scheduler
                 .revalidate_diagnostics(&mut running.engine, connection)?;
-            if was_open && matches!(running.diagnostic_updates, DiagnosticUpdates::Publish) {
-                send_notification::<PublishDiagnostics>(
+            running.replay_open_requests(connection)?;
+            if was_open && matches!(running.diagnostic_mode, DiagnosticMode::Push { .. }) {
+                rpc_telemetry::diagnostic_push(
                     connection,
                     PublishDiagnosticsParams::new(params.text_document.uri, Vec::new(), None),
+                    telemetry::enabled().then(|| {
+                        serde_json::json!({
+                            "document": telemetry::path(&path),
+                            "doc_version": version,
+                            "job": null, "run": null, "stage": null, "context_completeness": null,
+                            "lane": null, "result_id": null, "diagnostic_codes": {},
+                            "report_kind": "clear", "delivery": "delivered",
+                        })
+                    }),
                 )?;
             }
             Ok(())
@@ -655,7 +822,15 @@ fn handle_notification(
             let path = file_path(&params.text_document.uri)?;
             telemetry::event!("notification", {
                 "method": DidSaveTextDocument::METHOD, "document": telemetry::path(&path),
+                "doc_version": running.engine.open_document_version(&path),
             });
+            if workspace::is_watched_go_file(&path) {
+                if running.scheduler.watching_files() {
+                    running.scheduler.watch_save(path.clone());
+                    return running.scheduler.document_modified(connection, &path);
+                }
+                running.scheduler.record_workspace_file_event();
+            }
             let before = running.engine.workspace_load();
             running.engine.file_changed_from(
                 &path,

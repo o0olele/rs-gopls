@@ -4,8 +4,8 @@ use lsp_types::Position;
 
 use super::syntax::visible_range;
 use super::{
-    DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DocumentSnapshot, Package, Workspace,
-    is_test_source,
+    DiagnosticCode, DiagnosticItem, DiagnosticSeverity, DiagnosticStage, DocumentSnapshot, Package,
+    Workspace, is_test_source,
 };
 use crate::workspace::{PackageErrorKind, PackageLoadError, path_key};
 
@@ -99,7 +99,11 @@ pub(super) fn collect_package_errors(
     package: Option<&Package>,
     group_id: Option<usize>,
     syntax: &[DiagnosticItem],
+    stage: DiagnosticStage,
 ) -> Vec<DiagnosticItem> {
+    if graph.package_errors().is_empty() {
+        return Vec::new();
+    }
     let context = PackageErrorContext::new(graph, document.path(), package, group_id);
     let root = document.root_node();
     let fallback = root
@@ -113,11 +117,10 @@ pub(super) fn collect_package_errors(
             let positioned = context.position(graph, error, |name| {
                 document.outline().package.as_deref() == Some(name)
             })?;
-            if error.kind != PackageErrorKind::Group
+            let overlay_parse_error = error.kind != PackageErrorKind::Group
                 && document.version().is_some()
-                && syntax.is_empty()
-                && is_parse_error(&error.message)
-            {
+                && is_parse_error(&error.message);
+            if overlay_parse_error && syntax.is_empty() {
                 return None;
             }
             let line = if positioned { error.line } else { None };
@@ -133,10 +136,21 @@ pub(super) fn collect_package_errors(
                     Some(offset..offset)
                 })
                 .unwrap_or_else(|| fallback.clone());
+            let range = visible_range(document, bytes);
+            if stage == DiagnosticStage::Stage1
+                && overlay_parse_error
+                && (line.is_none()
+                    || !syntax
+                        .iter()
+                        .any(|item| item.range.start <= range.end && range.start <= item.range.end))
+            {
+                // An unrelated syntax error cannot confirm an old go-list position.
+                return None;
+            }
             Some(DiagnosticItem::new(
                 DiagnosticCode::PackageLoad,
                 DiagnosticSeverity::Error,
-                visible_range(document, bytes),
+                range,
                 error.message.clone(),
             ))
         })

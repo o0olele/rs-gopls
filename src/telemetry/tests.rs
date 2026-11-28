@@ -21,10 +21,10 @@ fn configured_sessions_emit_private_jsonl() {
     project.write("go.mod", "module example.test/telemetry\n\ngo 1.22\n");
     project.write("caller.go", SOURCE);
     project.write("dep/target.go", "package dep\nfunc Target() {}\n");
-    for (mode, source, redact) in [
-        ("disabled", None, false),
-        ("process", Some("process_env"), false),
-        ("options", Some("initialization_options"), true),
+    for (mode, source) in [
+        ("disabled", None),
+        ("process", Some("process_env")),
+        ("options", Some("initialization_options")),
     ] {
         let log = project.root.join(mode).join("diagnostics.jsonl");
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -54,6 +54,7 @@ fn configured_sessions_emit_private_jsonl() {
         let raw = fs::read_to_string(&log).unwrap();
         assert!(raw.ends_with('\n'));
         assert!(!raw.contains(SOURCE_CANARY));
+        assert!(!raw.contains("Undefined Name"));
         assert!(!raw.contains(project.root.file_name().unwrap().to_str().unwrap()));
         let rows: Vec<Value> = raw
             .lines()
@@ -61,6 +62,7 @@ fn configured_sessions_emit_private_jsonl() {
             .collect();
         assert_eq!(rows[0]["event"], "session_start");
         assert_eq!(rows[0]["source"], source);
+        assert_eq!(rows[0]["redact"], true);
         assert!(
             rows.windows(2).all(
                 |pair| pair[0]["ts_ms"].as_f64().unwrap() <= pair[1]["ts_ms"].as_f64().unwrap()
@@ -91,14 +93,37 @@ fn configured_sessions_emit_private_jsonl() {
         assert_eq!(definition["found_count"], 1);
         assert_eq!(definition["hit_path"], "cross_package");
         let document = definition["document"].as_str().unwrap();
-        if redact {
-            assert!(document.starts_with("h:"));
-            assert_eq!(document.len(), 18);
-            assert!(!raw.contains("caller.go"));
-            assert!(!raw.contains("target.go"));
-        } else {
-            assert_eq!(document, "caller.go");
+        assert!(document.starts_with("h:"));
+        assert_eq!(document.len(), 18);
+        assert!(!raw.contains("caller.go"));
+        assert!(!raw.contains("target.go"));
+        assert!(!raw.contains("go.mod"));
+        let diagnostic = |id| {
+            rows.iter()
+                .find(|row| row["event"] == "rpc_done" && row["req_id"] == id)
+                .unwrap()
+        };
+        let full = diagnostic(10);
+        let unchanged = diagnostic(11);
+        assert_eq!(full["doc_version"], 2);
+        assert_eq!(full["stage"], "stage2");
+        assert_eq!(full["context_completeness"], "full");
+        assert_eq!(full["delivery"], "delivered");
+        assert_eq!(full["report_kind"], "full");
+        assert_eq!(full["diagnostic_codes"], json!({"name.unresolved": 1}));
+        assert_eq!(unchanged["delivery"], "cache_hit");
+        assert_eq!(unchanged["report_kind"], "unchanged");
+        assert_eq!(full["document"], document);
+        for field in ["job", "run", "document", "doc_version", "result_id", "lane"] {
+            assert!(!full[field].is_null(), "missing {field}");
+            assert_eq!(full[field], unchanged[field], "changed {field}");
         }
+        assert!(
+            rows.iter()
+                .any(|row| row["event"] == "diagnostic_worker_done"
+                    && row["job"] == full["job"]
+                    && row["doc_version"] == full["doc_version"])
+        );
     }
 }
 
@@ -119,7 +144,7 @@ fn session_worker() {
         Value::Null
     };
     let initialize = json!({
-        "capabilities": {},
+        "capabilities": {"textDocument": {"diagnostic": {}}},
         "rootUri": path_uri(&root).unwrap(),
         "initializationOptions": options,
     });
@@ -155,6 +180,30 @@ fn session_worker() {
         json!({"textDocument": {"uri": manifest_uri}}),
     );
     assert!(request(&client, 5, "textDocument/definition", params).is_object());
+    notify(
+        &client,
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{
+            "text": format!("package sample\nfunc use() {{ {SOURCE_CANARY}() }}\n")
+        }]}),
+    );
+    let full = request(
+        &client,
+        10,
+        "textDocument/diagnostic",
+        json!({"textDocument": {"uri": uri}}),
+    );
+    assert_eq!(full["kind"], "full");
+    assert_eq!(full["items"][0]["code"], "name.unresolved");
+    let unchanged = request(
+        &client,
+        11,
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": {"uri": uri}, "previousResultId": full["resultId"]
+        }),
+    );
+    assert_eq!(unchanged["kind"], "unchanged");
     if mode == "disabled" {
         notify(
             &client,
@@ -204,8 +253,6 @@ fn full_queue_reports_drops_on_shutdown() {
         dropped: Arc::new(AtomicU64::new(0)),
         origin: Instant::now(),
         source: "test",
-        redact: false,
-        roots: Mutex::new(Vec::new()),
     };
     logger.send("kept", json!({}));
     logger.send("dropped", json!({}));

@@ -5,6 +5,65 @@ use crate::semantic::resolver::{
 };
 use crate::symbols::OutlineKind;
 
+pub(super) fn inspect_bare(
+    analysis: &mut Analysis<'_, '_, '_>,
+    walk_mode: WalkMode<'_>,
+    known_file_or_package_name: impl Fn(&str) -> bool,
+    verify: &mut HashSet<(usize, usize)>,
+) -> Result<()> {
+    walk(
+        analysis.source.tree.root_node(),
+        analysis.cancelled,
+        walk_mode,
+        |node, kind, parents, _| {
+            if kind == "identifier"
+                && unused::value_name(analysis, node, kind, parents)
+                && reliable_bare_use(node, parents)
+                && !analysis.locals.may_have_recovered_binding(node)
+            {
+                let name = analysis.text(node);
+                if name == "_"
+                    || is_predeclared(name)
+                    || analysis.locals.lookup(node, name).is_some()
+                    || known_file_or_package_name(name)
+                {
+                    verify.remove(&(node.start_byte(), node.end_byte()));
+                } else if !analysis.imports.possibly_binds_bare(name) {
+                    analysis.error(
+                        DiagnosticCode::NameUnresolved,
+                        node,
+                        format!("Undefined {name}"),
+                    );
+                }
+            }
+            Ok(WalkControl::Children)
+        },
+    )
+}
+
+fn reliable_bare_use(node: Node<'_>, parents: Parents<'_, '_>) -> bool {
+    if node.has_error() || imports::qualifier(node, parents) {
+        return false;
+    }
+    let mut statement = true;
+    for parent in parents.iter().rev() {
+        match parent.kind() {
+            "statement_list" | "block" | "source_file" => statement = false,
+            "qualified_type" | "selector_expression" => return false,
+            "keyed_element"
+                if parent.child_by_field_name("key").is_some_and(|key| {
+                    key.start_byte() <= node.start_byte() && node.end_byte() <= key.end_byte()
+                }) =>
+            {
+                return false;
+            }
+            _ if statement && parent.has_error() => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 fn type_annotation(node: Node<'_>, parents: Parents<'_, '_>) -> bool {
     parents.at(1).is_some_and(|parent| match parent.kind() {
         "var_spec"
