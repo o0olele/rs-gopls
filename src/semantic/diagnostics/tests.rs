@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lsp_types::{Position, Range};
+use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 use serde_json::json;
 
 use super::*;
@@ -159,7 +159,11 @@ fn real_workspace_matches_every_diagnostics_fixture() {
         let path = root.join(file);
         let text = fs::read_to_string(&path).unwrap();
         let report = analyze_file(&mut engine, &path);
-        assert!(!report.is_partial, "{file}");
+        assert_eq!(
+            report.context_completeness,
+            ContextCompleteness::Complete,
+            "{file}"
+        );
         if expected.is_empty() {
             assert!(report.items.is_empty(), "{file}: {:#?}", report.items);
         }
@@ -262,18 +266,19 @@ fn partial_reports_upgrade_and_cache_checks_all_snapshot_fields() {
         let mut s = engine.snapshot();
         let d = s.document(&path).unwrap().unwrap();
         let report = get_or_compute(&mut cache, &mut s, &d).unwrap();
-        assert!(report.is_partial && report.items.is_empty());
+        assert_eq!(report.context_completeness, ContextCompleteness::Partial);
+        assert!(report.items.is_empty());
         (report.result_id.clone(), report.snapshot.clone())
     };
     engine.install_workspace(
         engine.workspace_load(),
         project.workspace(&["sample.go"], false),
     );
-    {
+    let original = {
         let mut s = engine.snapshot();
         let d = s.document(&path).unwrap().unwrap();
         let report = get_or_compute(&mut cache, &mut s, &d).unwrap();
-        assert!(!report.is_partial);
+        assert_eq!(report.context_completeness, ContextCompleteness::Complete);
         assert_ne!(partial, report.result_id);
         item_at(report, text, NameUnresolved, "missing", "missing");
         let address = std::ptr::from_ref(report);
@@ -282,31 +287,220 @@ fn partial_reports_upgrade_and_cache_checks_all_snapshot_fields() {
             std::ptr::from_ref(get_or_compute(&mut cache, &mut s, &d).unwrap())
         );
         assert!(cache.get(&snapshot_key(&s, &d).unwrap()).is_some());
-        assert!(cache.get(&partial_key).unwrap().is_partial);
-    }
+        assert_eq!(
+            cache.get(&partial_key).unwrap().context_completeness,
+            ContextCompleteness::Partial
+        );
+        snapshot_key(&s, &d).unwrap()
+    };
     for (version, content) in [(5, text), (4, "package sample\nvar X = 1\n")] {
         engine.open(path.clone(), content.into(), version).unwrap();
         assert!(cache.get(&current_key(&mut engine, &path)).is_none());
     }
     engine.open(path.clone(), text.into(), 4).unwrap();
     let key = current_key(&mut engine, &path);
-    let report = cache.get(&key).unwrap().clone();
-    cache.invalidate_document(&path_key(&path));
     assert!(cache.get(&key).is_none());
+    let report = cache.get(&original).unwrap().clone();
+    cache.invalidate_document(&path_key(&path));
+    assert!(cache.get(&original).is_none());
     cache.insert(report.clone());
     for i in 0..256 {
         let mut another = report.clone();
         another.snapshot.path_key = PathBuf::from(format!("doc{i}.go"));
         cache.insert(another);
     }
-    assert!(cache.get(&key).is_none());
+    assert!(cache.get(&original).is_none());
     cache.insert(report);
     cache.clear();
-    assert!(cache.get(&key).is_none());
+    assert!(cache.get(&original).is_none());
 }
 
 fn current_key(engine: &mut Engine, path: &Path) -> DiagnosticSnapshotKey {
     snapshot_key_for_path(&engine.snapshot(), path).unwrap()
+}
+
+fn replace(engine: &mut Engine, path: &Path, text: &str, version: i32) {
+    engine
+        .edit(
+            path,
+            &[TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: text.into(),
+            }],
+            version,
+        )
+        .unwrap();
+}
+
+#[test]
+fn body_edits_reuse_semantic_inputs_and_refresh_the_edited_report() {
+    let project = TestProject::new();
+    let original = "package sample\nfunc Use() { _ = \"🙂\"; _ = 10 }\nvar Value = 1\n";
+    let path = project.write("sample.go", original);
+    let same_package = project.write("peer.go", "package sample\nvar _ int = Value\n");
+    let dependent = project.write(
+        "app/app.go",
+        "package app\nimport \"sample\"\nvar _ int = sample.Value\n",
+    );
+    let graph = format!(
+        "{}\n{}",
+        json!({"Dir": project.root, "ImportPath": "sample", "Name": "sample", "GoFiles": ["sample.go", "peer.go"]}),
+        json!({"Dir": project.root.join("app"), "ImportPath": "app", "Name": "app", "GoFiles": ["app.go"], "Imports": ["sample"]}),
+    );
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(std::slice::from_ref(&project.root), &graph, false),
+    ));
+    engine.open(path.clone(), original.into(), 1).unwrap();
+    let own = engine.diagnostics_report(&path).unwrap().0.clone();
+    let peer = engine.diagnostics_report(&same_package).unwrap().0.clone();
+    let caller = engine.diagnostics_report(&dependent).unwrap().0.clone();
+    for report in [&own, &peer, &caller] {
+        assert_eq!(report.context_completeness, ContextCompleteness::Complete);
+        assert!(report.items.is_empty(), "{:?}", report.items);
+    }
+    let computations = engine.state.diagnostic_keys.borrow().computations();
+    let generation = engine.state.declaration_generation;
+    engine
+        .edit(
+            &path,
+            &[TextDocumentContentChangeEvent {
+                range: Some(occurrence(original, "_ = 10", "10")),
+                range_length: None,
+                text: "missing\n".into(),
+            }],
+            2,
+        )
+        .unwrap();
+    let edited = original.replace("10", "missing\n");
+    let changed = engine.diagnostics_report(&path).unwrap().0.clone();
+    assert_ne!(changed.snapshot.revision, own.snapshot.revision);
+    assert_eq!(
+        changed.snapshot.semantic_inputs,
+        own.snapshot.semantic_inputs
+    );
+    item_at(&changed, &edited, NameUnresolved, "_ = missing", "missing");
+    assert_eq!(engine.diagnostics_report(&same_package).unwrap().0, &peer);
+    assert_eq!(engine.diagnostics_report(&dependent).unwrap().0, &caller);
+    assert_eq!(engine.state.declaration_generation, generation);
+    assert_eq!(
+        engine.state.diagnostic_keys.borrow().computations(),
+        computations
+    );
+
+    replace(&mut engine, &path, original, 3);
+    let restored = engine.diagnostics_report(&path).unwrap().0;
+    assert!(restored.items.is_empty(), "{:?}", restored.items);
+    assert_ne!(restored.snapshot.revision, own.snapshot.revision);
+    assert_eq!(
+        engine.state.diagnostic_keys.borrow().computations(),
+        computations
+    );
+}
+
+#[test]
+fn declaration_edits_invalidate_dependent_memos_and_keep_unrelated_memos() {
+    let project = TestProject::new();
+    let original = "package sample\nimport alias \"dep\"\nfunc F(int) {}\nfunc local() {}\nvar Value = alias.Number()\n";
+    let path = project.write("sample.go", original);
+    let peer = project.write("peer.go", "package sample\nvar _ int = Value\n");
+    project.write(
+        "dep/dep.go",
+        "package dep\nfunc Number() int { return 7 }\nfunc Text() string { return \"text\" }\n",
+    );
+    let other = project.write("other/other.go", "package other\n");
+    let graph = [
+        json!({"Dir": project.root, "ImportPath": "sample", "Name": "sample", "GoFiles": ["sample.go", "peer.go"], "Imports": ["dep"]}),
+        json!({"Dir": project.root.join("dep"), "ImportPath": "dep", "Name": "dep", "GoFiles": ["dep.go"]}),
+        json!({"Dir": project.root.join("other"), "ImportPath": "other", "Name": "other", "GoFiles": ["other.go"]}),
+    ].map(|package| package.to_string()).join("\n");
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(std::slice::from_ref(&project.root), &graph, false),
+    ));
+    engine.open(path.clone(), original.into(), 1).unwrap();
+    let clean = engine.diagnostics_report(&peer).unwrap().0.clone();
+    assert!(clean.items.is_empty(), "{:?}", clean.items);
+    let unrelated = engine.diagnostics_report(&other).unwrap().0.clone();
+    let edits = [
+        original
+            .replace("import alias", "import another")
+            .replace("alias.Number", "another.Number"),
+        original.replace("F(int)", "F(string)"),
+        original.replace("local()", "local(int)"),
+        original.replace("alias.Number()", "alias.Text()"),
+        format!("//go:build custom\n\n{original}"),
+        format!("{original}var Broken = )\n"),
+    ];
+    let mut previous = clean.snapshot;
+    let mut computations = engine.state.diagnostic_keys.borrow().computations();
+    for (version, edit) in (2..).zip(&edits) {
+        let generation = engine.state.declaration_generation;
+        replace(&mut engine, &path, edit, version);
+        let key = current_key(&mut engine, &peer);
+        assert_ne!(key.semantic_inputs, previous.semantic_inputs);
+        assert_eq!(engine.state.declaration_generation, generation + 1);
+        assert_eq!(engine.diagnostics_report(&other).unwrap().0, &unrelated);
+        computations += 1;
+        assert_eq!(
+            engine.state.diagnostic_keys.borrow().computations(),
+            computations
+        );
+        if version == 5 {
+            let report = engine.diagnostics_report(&peer).unwrap().0;
+            item_at(
+                report,
+                "package sample\nvar _ int = Value\n",
+                TypeMismatch,
+                "= Value",
+                "Value",
+            );
+        }
+        previous = key;
+    }
+    let recovered = original.replace("alias.Number()", "alias.Text()");
+    replace(&mut engine, &path, &recovered, 8);
+    assert_ne!(current_key(&mut engine, &peer), previous);
+    replace(&mut engine, &path, original, 9);
+    assert!(engine.diagnostics_report(&peer).unwrap().0.items.is_empty());
+}
+
+#[test]
+fn draft_membership_and_reopening_use_the_current_declarations() {
+    let project = TestProject::new();
+    let text = "package sample\nvar _ = Draft\n";
+    let path = project.write("sample.go", text);
+    let draft = project.root.join("draft.go");
+    let draft_text = "package sample\nvar Draft = 1\n";
+    let mut engine = Engine::new(project.root.clone());
+    assert!(engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], false)
+    ));
+    let initial = engine.diagnostics_report(&path).unwrap().0.clone();
+    item_at(&initial, text, NameUnresolved, "= Draft", "Draft");
+    engine.open(draft.clone(), draft_text.into(), 1).unwrap();
+    assert!(engine.diagnostics_report(&path).unwrap().0.items.is_empty());
+    let opened = current_key(&mut engine, &draft);
+    replace(
+        &mut engine,
+        &draft,
+        &format!("//go:build custom\n\n{draft_text}"),
+        2,
+    );
+    let excluded = engine.diagnostics_report(&path).unwrap().0.clone();
+    item_at(&excluded, text, NameUnresolved, "= Draft", "Draft");
+    replace(&mut engine, &draft, draft_text, 3);
+    assert!(engine.diagnostics_report(&path).unwrap().0.items.is_empty());
+    engine.close(&draft);
+    let closed = engine.diagnostics_report(&path).unwrap().0.clone();
+    item_at(&closed, text, NameUnresolved, "= Draft", "Draft");
+    engine.open(draft.clone(), draft_text.into(), 1).unwrap();
+    assert_ne!(current_key(&mut engine, &draft), opened);
+    assert!(engine.diagnostics_report(&path).unwrap().0.items.is_empty());
 }
 
 #[test]
@@ -326,7 +520,7 @@ fn production_report_keeps_its_result_id_when_test_view_is_installed() {
     ));
     let initial = engine.diagnostics_report(&path).unwrap().0.clone();
     let partial = engine.diagnostics_report(&test).unwrap().0.clone();
-    assert!(partial.is_partial);
+    assert_eq!(partial.context_completeness, ContextCompleteness::Partial);
     assert!(engine.install_workspace(
         engine.workspace_load(),
         Workspace::from_test_listing(roots, &format!("{listing}\n{variant}"), true),
@@ -335,7 +529,7 @@ fn production_report_keeps_its_result_id_when_test_view_is_installed() {
     let key = current_key(&mut engine, &path);
     assert_eq!(engine.diagnostics_cache.get(&key), Some(&initial));
     let report = engine.diagnostics_report(&test).unwrap().0.clone();
-    assert!(!report.is_partial);
+    assert_eq!(report.context_completeness, ContextCompleteness::Complete);
     assert_ne!(report.result_id, partial.result_id);
     assert!(report.items.iter().any(|item| item.code == NameUnresolved));
 
@@ -844,13 +1038,13 @@ func bad(){ number() }
 }
 
 #[test]
-fn syntax_recovery_skips_the_damaged_function_and_checks_intact_siblings() {
-    let text = "package sample\r\nfunc bad(){ _ = \"🙂\" + ) }\r\nfunc good() { _ = missing }\r\n";
+fn syntax_recovery_checks_intact_statements_within_a_damaged_function() {
+    let text = "package sample\r\nfunc bad(){ _ = \"🙂\" + ); _ = nearby }\r\nfunc good() { _ = missing }\r\n";
     let project = TestProject::new();
     let path = project.write("sample.go", text);
     let mut engine = Engine::new(project.root.clone());
     let partial = analyze_file(&mut engine, &path);
-    assert!(partial.is_partial);
+    assert_eq!(partial.context_completeness, ContextCompleteness::Partial);
     assert_eq!(partial.items.len(), 1, "{:#?}", partial.items);
     item_at(&partial, text, SyntaxError, "+ )", ")");
     engine.install_workspace(
@@ -859,7 +1053,185 @@ fn syntax_recovery_skips_the_damaged_function_and_checks_intact_siblings() {
     );
     let report = analyze_file(&mut engine, &path);
     item_at(&report, text, NameUnresolved, "= missing", "missing");
-    assert_eq!(report.items.len(), 2, "{:#?}", report.items);
+    item_at(&report, text, NameUnresolved, "= nearby", "nearby");
+    assert_eq!(report.items.len(), 3, "{:#?}", report.items);
+    let fast = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(fast.items, report.items);
+}
+
+fn first_stage(
+    engine: &mut Engine,
+    path: &Path,
+    dirty: Option<Bytes<usize>>,
+    verify: &mut HashSet<(usize, usize)>,
+) -> DiagnosticReport {
+    let mut snapshot = engine.snapshot();
+    let document = snapshot.document(path).unwrap().unwrap();
+    let key = snapshot_key(&snapshot, &document).unwrap();
+    analyze_stage1(
+        &mut snapshot,
+        &document,
+        key,
+        dirty,
+        verify,
+        None,
+        &mut None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn stage1_respects_lexical_shadowing_generics_and_literal_keys() {
+    let text = r#"package sample
+type record struct { Field int }
+type Box[T any] struct { Value T }
+func (box Box[P]) method(v P) { _ = v; _ = box }
+func f[T any](value T) {
+    value := value
+    if value := value; true { _ = value }
+    { local := value; _ = local }
+    _ = record{Field: 2}
+    _ = map[int]int{keyDeferred: 3}
+    _ = value.Deferred
+    _ = "🙂"; _ = missing
+}
+"#;
+    let project = TestProject::new();
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], false),
+    );
+    let fast = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(fast.diagnostic_stage, DiagnosticStage::Stage1);
+    assert_eq!(fast.context_completeness, ContextCompleteness::Complete);
+    assert_eq!(fast.items.len(), 1, "{:#?}", fast.items);
+    let missing = item_at(&fast, text, NameUnresolved, "= missing", "missing");
+    assert_eq!(missing.severity, DiagnosticSeverity::Error);
+    assert_eq!(missing.message, "Undefined missing");
+    let full = analyze_file(&mut engine, &path);
+    assert_eq!(full.diagnostic_stage, DiagnosticStage::Stage2);
+    assert!(full.items.contains(missing));
+    assert!(full.items.iter().any(|item| item.code == ShortVarNoNewVars));
+}
+
+#[test]
+fn stage1_uses_overlay_and_warm_package_names_without_loading_dot_imports() {
+    let project = TestProject::new();
+    let text =
+        "package sample\nimport . \"dot\"\nvar _ = samePackage\nvar _ = FromDot\nvar _ = missing\n";
+    let path = project.write("sample.go", text);
+    let sibling = project.write("other.go", "package sample\nconst samePackage = 1\n");
+    let dep = project.write("dot/dot.go", "package dot\nconst FromDot = 2\n");
+    let listing = format!(
+        "{}{}",
+        json!({"Dir":project.root,"ImportPath":"sample","Name":"sample","GoFiles":["sample.go", "other.go"],"Imports":["dot"]}),
+        json!({"Dir":dep.parent().unwrap(),"ImportPath":"dot","Name":"dot","GoFiles":["dot.go"]}),
+    );
+    let mut engine = Engine::new(project.root.clone());
+    engine.install_workspace(
+        engine.workspace_load(),
+        Workspace::from_test_listing(std::slice::from_ref(&project.root), &listing, false),
+    );
+    engine.open(path.clone(), text.into(), 1).unwrap();
+    let cold = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(cold.context_completeness, ContextCompleteness::Partial);
+    assert!(cold.items.is_empty());
+    assert_eq!(engine.state.shared_disk.counts(&sibling), (0, 0));
+    assert_eq!(engine.state.shared_disk.counts(&dep), (0, 0));
+
+    {
+        let mut snapshot = engine.snapshot();
+        assert!(snapshot.document(&sibling).unwrap().is_some());
+    }
+    let warm = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(warm.context_completeness, ContextCompleteness::Complete);
+    assert_eq!(warm.items.len(), 1, "{:#?}", warm.items);
+    item_at(&warm, text, NameUnresolved, "= missing", "missing");
+    assert_eq!(engine.state.shared_disk.counts(&sibling), (1, 1));
+    assert_eq!(engine.state.shared_disk.counts(&dep), (0, 0));
+
+    engine
+        .open(sibling, "package sample\nconst missing = 1\n".into(), 2)
+        .unwrap();
+    let overlay = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(overlay.items.len(), 1, "{:#?}", overlay.items);
+    item_at(
+        &overlay,
+        text,
+        NameUnresolved,
+        "= samePackage",
+        "samePackage",
+    );
+    assert_eq!(engine.state.shared_disk.counts(&dep), (0, 0));
+}
+
+#[test]
+fn stage1_defers_names_for_unreliable_top_level_signatures() {
+    let text = "package sample\nfunc bad(x @) {}\nfunc good() { _ = missing }\n";
+    let project = TestProject::new();
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], false),
+    );
+    let fast = first_stage(&mut engine, &path, None, &mut HashSet::new());
+    assert_eq!(fast.context_completeness, ContextCompleteness::Partial);
+    assert!(!fast.items.is_empty());
+    assert!(fast.items.iter().all(|item| item.code == SyntaxError));
+}
+
+#[test]
+fn stage1_limits_work_to_the_edited_function_and_verifies_a_fixed_binding() {
+    let text = "package sample\nfunc a() { _ = stillMissing }\nfunc b() { local := 1; _ = local; _ = newMissing }\n";
+    let project = TestProject::new();
+    let path = project.write("sample.go", text);
+    let mut engine = Engine::new(project.root.clone());
+    engine.install_workspace(
+        engine.workspace_load(),
+        project.workspace(&["sample.go"], false),
+    );
+    let start = text.find("local :=").unwrap();
+    let fixed = text.find("= local").unwrap() + 2;
+    let mut verify = HashSet::from([(fixed, fixed + "local".len())]);
+    let report = first_stage(&mut engine, &path, Some(start..start + 5), &mut verify);
+    assert!(verify.is_empty());
+    assert_eq!(report.items.len(), 1, "{:#?}", report.items);
+    item_at(&report, text, NameUnresolved, "= newMissing", "newMissing");
+}
+
+#[test]
+fn ast_walk_checks_cancellation_while_inside_a_large_declaration() {
+    let text = format!(
+        "package sample\nfunc f() {{\n{}}}\n",
+        "_ = 1 + 2\n".repeat(8192)
+    );
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(text, None).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let mut visited = 0;
+    let mut signalled = None;
+    let result = walk(
+        tree.root_node(),
+        Some(&cancelled),
+        WalkMode::Intact,
+        |_, _, _, _| {
+            visited += 1;
+            if visited == 100 {
+                signalled = Some(Instant::now());
+                cancelled.store(true, Relaxed);
+            }
+            Ok(WalkControl::Children)
+        },
+    );
+    assert!(result.is_err());
+    assert!((100..=356).contains(&visited), "{visited}");
+    assert!(signalled.unwrap().elapsed() <= Duration::from_millis(50));
 }
 
 #[test]

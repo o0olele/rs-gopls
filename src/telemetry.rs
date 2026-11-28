@@ -1,8 +1,9 @@
 use std::fs::OpenOptions;
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use serde_json::{Value, json};
 
 use crate::go_environment::{EnvironmentOverrides, GoEnvironment};
+use crate::semantic::diagnostics::{DiagnosticItem, DiagnosticReport};
 
 #[cfg(test)]
 mod tests;
@@ -21,6 +23,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 static SESSION_CLOCK: OnceLock<SessionClock> = OnceLock::new();
+static HASH_KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 struct SessionClock {
     origin: Instant,
@@ -52,8 +55,6 @@ struct Logger {
     dropped: std::sync::Arc<AtomicU64>,
     origin: Instant,
     source: &'static str,
-    redact: bool,
-    roots: Mutex<Vec<PathBuf>>,
 }
 
 #[inline]
@@ -76,11 +77,7 @@ impl Session {
     pub(super) fn start() -> Self {
         SESSION_CLOCK.get_or_init(SessionClock::capture);
         if let Some(file) = std::env::var_os(FILE_ENV).filter(|path| !path.is_empty()) {
-            start(
-                file.into(),
-                std::env::var_os(REDACT_ENV).is_some_and(|value| value == "1"),
-                "process_env",
-            );
+            start(file.into(), "process_env");
         }
         Self
     }
@@ -100,20 +97,17 @@ impl Drop for Session {
 
 pub(super) fn start_options(overrides: &mut EnvironmentOverrides) {
     let file = overrides.remove(FILE_ENV);
-    let redact = overrides.remove(REDACT_ENV);
+    overrides.remove(REDACT_ENV);
     if !enabled()
         && let Some(file) = file.filter(|value| !value.is_empty())
     {
-        let redact = redact
-            .map(|value| value == "1")
-            .unwrap_or_else(|| std::env::var_os(REDACT_ENV).is_some_and(|value| value == "1"));
-        start(file.into(), redact, "initialization_options");
+        start(file.into(), "initialization_options");
     }
 }
 
-fn start(file: PathBuf, redact: bool, source: &'static str) {
+fn start(file: PathBuf, source: &'static str) {
     let clock = SESSION_CLOCK.get_or_init(SessionClock::capture);
-    match Logger::spawn(file, clock.origin, redact, source, CAPACITY) {
+    match Logger::spawn(file, clock.origin, source, CAPACITY) {
         Ok(logger) => {
             logger.send(
                 "session_start",
@@ -122,7 +116,7 @@ fn start(file: PathBuf, redact: bool, source: &'static str) {
                     "version": env!("CARGO_PKG_VERSION"),
                     "started_at_unix_ms": clock.started_at_unix_ms,
                     "source": source,
-                    "redact": redact,
+                    "redact": true,
                 }),
             );
             if LOGGER.set(logger).is_ok() {
@@ -138,10 +132,6 @@ pub(super) fn session_config(roots: &[PathBuf], environment: &GoEnvironment) {
         return;
     }
     let logger = LOGGER.get().unwrap();
-    *logger.roots.lock().unwrap() = roots
-        .iter()
-        .map(|root| crate::workspace::path_key(root))
-        .collect();
     let module = environment
         .get("GO111MODULE")
         .and_then(|mode| mode.to_str());
@@ -181,41 +171,58 @@ pub(crate) fn elapsed(start: Instant) -> f64 {
     millis(start.elapsed())
 }
 
+pub(crate) fn timestamp(at: Instant) -> Option<f64> {
+    enabled().then(|| millis(at.saturating_duration_since(LOGGER.get().unwrap().origin)))
+}
+
 pub(super) fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
 pub(crate) fn path(path: &Path) -> String {
-    let key = crate::workspace::path_key(path);
-    let logger = LOGGER.get().unwrap();
-    let roots = logger.roots.lock().unwrap();
-    let relative = roots
-        .iter()
-        .filter_map(|root| key.strip_prefix(root).ok())
-        .min_by_key(|path| path.components().count());
-    let short = match relative {
-        Some(relative) => relative,
-        None if logger.redact => &key,
-        None => key
-            .file_name()
-            .map(Path::new)
-            .unwrap_or_else(|| Path::new("")),
-    };
-    let short = if short.as_os_str().is_empty() {
-        ".".to_owned()
-    } else {
-        short.to_string_lossy().replace('\\', "/")
-    };
-    if logger.redact { hash(&short) } else { short }
+    let canonical = path.canonicalize().unwrap_or_else(|_| {
+        // A watcher deletion or unsaved document can have a canonical parent only.
+        if let Some((parent, name)) = path.parent().zip(path.file_name())
+            && let Ok(parent) = parent.canonicalize()
+        {
+            return parent.join(name);
+        }
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    });
+    digest(("path", crate::workspace::path_key(&canonical)))
 }
 
 pub(super) fn hash(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    digest(("text", value))
+}
+
+fn digest(value: impl Hash) -> String {
+    format!("h:{:016x}", HASH_KEY.hash_one(value))
+}
+
+pub(crate) fn diagnostic_codes(items: &[DiagnosticItem]) -> Value {
+    let mut counts = std::collections::BTreeMap::new();
+    for item in items {
+        *counts.entry(item.code.as_str()).or_insert(0u32) += 1;
     }
-    format!("h:{hash:016x}")
+    json!(counts)
+}
+
+pub(crate) fn diagnostic_report_fields(
+    report: &DiagnosticReport,
+    job: Option<u64>,
+    lane: Option<&'static str>,
+) -> Value {
+    json!({
+        "document": path(&report.snapshot.path_key),
+        "job": job,
+        "doc_version": report.snapshot.version,
+        "stage": report.diagnostic_stage.as_str(),
+        "context_completeness": report.context_completeness.as_str(),
+        "lane": lane,
+        "result_id": hash(&report.result_id),
+        "diagnostic_codes": diagnostic_codes(&report.items),
+    })
 }
 
 pub(crate) struct LoopOp {
@@ -250,7 +257,6 @@ impl Logger {
     fn spawn(
         file: PathBuf,
         origin: Instant,
-        redact: bool,
         source: &'static str,
         capacity: usize,
     ) -> io::Result<Self> {
@@ -272,8 +278,6 @@ impl Logger {
             dropped,
             origin,
             source,
-            redact,
-            roots: Mutex::new(Vec::new()),
         })
     }
 

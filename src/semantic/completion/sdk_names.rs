@@ -16,6 +16,14 @@ pub(in crate::semantic) struct Names {
 /// A negative result is safe only if the lexer could follow the declarations.
 /// The recovering parser handles damaged headers, groups, and literals.
 pub(in crate::semantic) fn scan_names(text: &str) -> Option<Names> {
+    scan_declarations(text, true)
+}
+
+pub(in crate::semantic) fn scan_function_bodies(text: &str) -> Option<Vec<Range<usize>>> {
+    Some(scan_declarations(text, false)?.bodies)
+}
+
+fn scan_declarations(text: &str, elide_initializers: bool) -> Option<Names> {
     let mut tokens = Tokens::new(text).peekable();
     let mut exported = Vec::new();
     let mut private = Vec::new();
@@ -118,7 +126,7 @@ pub(in crate::semantic) fn scan_names(text: &str) -> Option<Names> {
                     && depth == delimiters.len()
                 {
                     initializer = None;
-                    if composite_literal_type(&text[start..offset]) {
+                    if elide_initializers && composite_literal_type(&text[start..offset]) {
                         body_start = Some((depth, offset + 1, 4096));
                     }
                 }

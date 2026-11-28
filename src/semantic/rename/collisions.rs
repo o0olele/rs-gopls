@@ -151,7 +151,7 @@ pub(super) fn check_collisions(
                             .context("cannot check names from an unresolved dot import")?;
                         resolver
                             .indexes
-                            .find(dependency, |idx| {
+                            .find(dependency, new_name, |idx| {
                                 idx.symbols.declaration(new_name).map(|s| s.range)
                             })?
                             .is_some()

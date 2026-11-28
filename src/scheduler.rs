@@ -1,30 +1,42 @@
 mod diagnostics;
 mod highlights;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
-use lsp_server::{Connection, ErrorCode, RequestId};
-use lsp_types::Position;
+use lsp_server::{Connection, ErrorCode, Request, RequestId};
+use lsp_types::{
+    FileChangeType, Position,
+    request::{Completion, Request as _},
+};
 
+use crate::dispatch::OpenRequestScope;
 use crate::protocol::{RequestResult, internal_error, send_response};
-use crate::semantic::{Engine, LoadedWorkspace, QueryProgress};
+use crate::semantic::{Engine, LoadedWorkspace, QueryProgress, SharedLoadPending};
 use crate::workspace::{LoadTrace, Workspace, WorkspaceLoad, path_key};
 use crate::{rpc_telemetry, telemetry};
 
 use self::diagnostics::Diagnostics;
 pub(super) use self::diagnostics::{
-    Completed as DiagnosticCompletion, Consumer as DiagnosticConsumer,
+    Completed as DiagnosticCompletion, Consumer as DiagnosticConsumer, Mode as DiagnosticMode,
+    RefreshMark as DiagnosticRefreshMark,
 };
 pub(super) use self::highlights::Completed as HighlightCompletion;
 use self::highlights::Highlights;
 
 const WORKSPACE_CHANGED: &str = "the workspace changed during search";
 const SHUTTING_DOWN: &str = "the server is shutting down";
+const WATCH_WINDOW: Duration = Duration::from_millis(75);
+const TEST_VIEW_IDLE_DELAY: Duration = Duration::from_millis(150);
+const TEST_VIEW_PREWARM: &str = "test_view_prewarm";
 
 pub(super) type RequestProgress = QueryProgress<RequestResult, Box<dyn SearchTask>>;
 
@@ -50,6 +62,10 @@ pub(super) trait DeferredQuery {
         false
     }
 
+    fn is_completion(&self) -> bool {
+        false
+    }
+
     fn load_failed(&self, _engine: &mut Engine, message: &str) -> RequestResult {
         Err((ErrorCode::RequestFailed, message.to_owned()))
     }
@@ -64,14 +80,56 @@ pub(super) struct Pending {
 }
 
 pub(super) struct Searching {
-    id: RequestId,
+    request: Pending,
     generation: u64,
-    task: Box<dyn SearchTask>,
+    task: SearchWork,
+}
+
+enum SearchWork {
+    Semantic(Box<dyn SearchTask>),
+    SharedSource(SharedLoadPending),
+}
+
+impl SearchWork {
+    fn ready(&self, engine: &Engine) -> bool {
+        match self {
+            Self::Semantic(task) => task.ready(engine),
+            Self::SharedSource(pending) => pending.ready(),
+        }
+    }
+}
+
+impl Searching {
+    fn discard(&mut self, code: ErrorCode) {
+        match &mut self.task {
+            SearchWork::Semantic(task) => task.discard(code),
+            SearchWork::SharedSource(_) => self.request.query.discard(code),
+        }
+    }
 }
 
 pub(super) struct WorkspaceResult {
     pub(super) load: WorkspaceLoad,
     pub(super) result: Result<LoadedWorkspace>,
+}
+
+#[derive(Default)]
+struct WatchedFiles {
+    deadline: Option<Instant>,
+    changes: BTreeMap<PathBuf, (PathBuf, FileChangeType)>,
+}
+
+struct PrewarmingTests {
+    cancelled: Arc<AtomicBool>,
+    promoted: bool,
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if let Some(warmup) = &self.prewarming_tests {
+            warmup.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -97,16 +155,161 @@ pub(super) struct Scheduler {
     pub(super) requested: Option<WorkspaceLoad>,
     requested_from: &'static str,
     load_trace: Option<(Instant, &'static str)>,
+    prewarm: Option<(WorkspaceLoad, Instant)>,
+    prewarming_tests: Option<PrewarmingTests>,
+    deferred_test_view: Option<WorkspaceResult>,
+    workspace_file_event: bool,
+    watched_files: WatchedFiles,
     diagnostics: Diagnostics,
     highlights: Highlights,
+    open_requests: Vec<(Request, OpenRequestScope)>,
 }
 
 impl Scheduler {
-    pub(super) fn request_workspace_from(&mut self, load: WorkspaceLoad, trigger: &'static str) {
-        if self.loading != Some(load) {
-            self.requested = Some(load);
-            self.requested_from = trigger;
+    pub(super) fn defer_open_request(
+        &mut self,
+        request: Request,
+        scope: OpenRequestScope,
+        reason: &'static str,
+    ) {
+        rpc_telemetry::wait(|| reason);
+        self.open_requests.push((request, scope));
+    }
+
+    pub(super) fn take_ready_open_requests(&mut self, engine: &Engine) -> Vec<Request> {
+        if self.watching_files() {
+            return Vec::new();
         }
+        self.open_requests
+            .extract_if(.., |(_, scope)| !scope.waiting(engine))
+            .map(|(request, _)| request)
+            .collect()
+    }
+
+    pub(super) fn watching_files(&self) -> bool {
+        self.watched_files.deadline.is_some()
+    }
+
+    pub(super) fn workspace_deadline(&self) -> Option<Instant> {
+        self.watched_files.deadline.or_else(|| {
+            self.prewarm
+                .filter(|_| self.loading.is_none())
+                .map(|(_, at)| at)
+        })
+    }
+
+    pub(super) fn watch_file(&mut self, path: PathBuf, change: FileChangeType, now: Instant) {
+        self.record_workspace_file_event();
+        self.watched_files
+            .deadline
+            .get_or_insert(now + WATCH_WINDOW);
+        self.watched_files
+            .changes
+            .insert(path_key(&path), (path, change));
+    }
+
+    pub(super) fn watch_save(&mut self, path: PathBuf) {
+        self.record_workspace_file_event();
+        self.watched_files
+            .changes
+            .entry(path_key(&path))
+            .or_insert((path, FileChangeType::CHANGED));
+    }
+
+    pub(super) fn record_workspace_file_event(&mut self) {
+        // Capture each arrival before coalescing. The loader could have read
+        // an intermediate state even if the last event leaves the graph clean.
+        if self.loading.is_some() {
+            self.workspace_file_event = true;
+            if let Some(warmup) = &self.prewarming_tests {
+                warmup.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn take_watched_files(
+        &mut self,
+        now: Instant,
+    ) -> Option<Vec<(PathBuf, FileChangeType)>> {
+        let deadline = self.watched_files.deadline?;
+        if now < deadline {
+            return None;
+        }
+        self.watched_files.deadline = None;
+        Some(
+            std::mem::take(&mut self.watched_files.changes)
+                .into_values()
+                .collect(),
+        )
+    }
+
+    pub(super) fn with_diagnostic_mode(mode: DiagnosticMode) -> Self {
+        let mut scheduler = Self::default();
+        scheduler.diagnostics.set_mode(mode);
+        scheduler
+    }
+
+    pub(super) fn note_diagnostic_edit(&mut self, path: &Path, now: Instant) {
+        self.diagnostics.note_edit(path, now);
+    }
+
+    pub(super) fn interrupt_document_diagnostics(&mut self, path: &Path) {
+        self.diagnostics.interrupt_for_edit(path);
+    }
+
+    pub(super) fn diagnostic_deadline(&self) -> Option<Instant> {
+        self.diagnostics.next_deadline()
+    }
+
+    pub(super) fn advance_diagnostics(
+        &mut self,
+        engine: &mut Engine,
+        connection: &Connection,
+        now: Instant,
+    ) -> Result<()> {
+        self.diagnostics.advance(engine, connection, now)
+    }
+
+    pub(super) fn drain_diagnostic_refresh(&mut self) -> Vec<DiagnosticRefreshMark> {
+        self.diagnostics.drain_refresh()
+    }
+
+    pub(super) fn diagnostic_refresh_is_current(
+        &self,
+        engine: &mut Engine,
+        mark: &DiagnosticRefreshMark,
+    ) -> bool {
+        self.diagnostics.refresh_is_current(engine, mark)
+    }
+
+    pub(super) fn request_workspace_from(&mut self, load: WorkspaceLoad, trigger: &'static str) {
+        if let Some(loading) = self.loading {
+            if !self.workspace_file_event && loading.covers(load) {
+                if let Some(warmup) = &mut self.prewarming_tests
+                    && !warmup.promoted
+                {
+                    warmup.promoted = true;
+                    telemetry::event!("workspace_load_promoted", {
+                        "trigger": trigger,
+                        "target_generation": load.generation,
+                        "include_tests": loading.include_tests,
+                    });
+                }
+                return;
+            }
+            if let Some(warmup) = &self.prewarming_tests {
+                warmup.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+        self.prewarm = None;
+        if self
+            .requested
+            .is_some_and(|requested| requested.covers(load))
+        {
+            return;
+        }
+        self.requested = Some(load);
+        self.requested_from = trigger;
     }
 
     pub(super) fn start_workspace_load(
@@ -114,19 +317,34 @@ impl Scheduler {
         engine: &mut Engine,
         results: &Sender<WorkspaceResult>,
     ) -> Result<()> {
-        if self.loading.is_some() {
+        let current = engine.workspace_load();
+        if let Some(loading) = self.loading {
+            if loading.generation != current.generation
+                && let Some(warmup) = &self.prewarming_tests
+            {
+                warmup.cancelled.store(true, Ordering::Relaxed);
+                if self.requested.is_none() {
+                    self.request_workspace_from(current, "workspace_changed");
+                }
+            }
             return Ok(());
         }
-        let Some(load) = self.requested.take() else {
+        if self.watching_files() {
+            return Ok(());
+        }
+        let Some((load, trigger)) = self.take_workspace_load(engine, Instant::now()) else {
             return Ok(());
         };
-        engine.prewarm_completion_sdk(true);
+        if trigger != TEST_VIEW_PREWARM {
+            engine.prewarm_completion_sdk(true);
+        }
         let roots = engine.roots().to_vec();
         let environment = engine.environment().clone();
         let track_rename_inputs = engine.track_rename_inputs;
         let cache_snapshot = engine.begin_workspace_cache_validation(load);
         let results = results.clone();
-        let trigger = self.requested_from;
+        let cancelled = (trigger == TEST_VIEW_PREWARM).then(|| Arc::new(AtomicBool::new(false)));
+        let worker_cancelled = cancelled.clone();
         let in_flight_generation = Some(load.generation);
         self.load_trace = telemetry::now().map(|start| {
             telemetry::emit(
@@ -144,7 +362,9 @@ impl Scheduler {
             .name("go-package-loader".into())
             .spawn(move || {
                 let _trace = LoadTrace::enter(trigger, load, in_flight_generation);
-                let result = if track_rename_inputs {
+                let result = if let Some(cancelled) = &worker_cancelled {
+                    Workspace::prewarm_tests(&roots, &environment, track_rename_inputs, cancelled)
+                } else if track_rename_inputs {
                     Workspace::load_roots_for_rename(&roots, load.include_tests, &environment)
                 } else {
                     Workspace::load_roots_in_environment(&roots, load.include_tests, &environment)
@@ -156,8 +376,56 @@ impl Scheduler {
             engine.discard_workspace_cache_validation(load);
             return Err(error).context("starting Go package loader");
         }
+        self.prewarming_tests = cancelled.map(|cancelled| PrewarmingTests {
+            cancelled,
+            promoted: false,
+        });
         self.loading = Some(load);
         Ok(())
+    }
+
+    fn take_workspace_load(
+        &mut self,
+        engine: &Engine,
+        now: Instant,
+    ) -> Option<(WorkspaceLoad, &'static str)> {
+        if let Some(load) = self.requested.take() {
+            self.prewarm = None;
+            Some((load, self.requested_from))
+        } else {
+            let (load, deadline) = self.prewarm?;
+            if now < deadline {
+                return None;
+            }
+            self.prewarm = None;
+            (engine.test_view_prewarm() == Some(load)).then_some((load, TEST_VIEW_PREWARM))
+        }
+    }
+
+    fn should_defer_test_view(&self, engine: &Engine, load: WorkspaceLoad) -> bool {
+        self.loading == Some(load)
+            && engine.workspace_load().generation == load.generation
+            && !self.workspace_file_event
+            && self
+                .prewarming_tests
+                .as_ref()
+                .is_some_and(|job| !job.promoted && !job.cancelled.load(Ordering::Relaxed))
+            && (self
+                .searches
+                .iter()
+                .any(|search| search.request.query.is_completion())
+                || self
+                    .open_requests
+                    .iter()
+                    .any(|(request, _)| request.method == Completion::METHOD))
+    }
+
+    pub(super) fn take_deferred_test_view(&mut self, engine: &Engine) -> Option<WorkspaceResult> {
+        let load = self.deferred_test_view.as_ref()?.load;
+        if self.watching_files() || self.should_defer_test_view(engine, load) {
+            return None;
+        }
+        self.deferred_test_view.take()
     }
 
     pub(super) fn workspace_loaded(
@@ -169,33 +437,62 @@ impl Scheduler {
         if self.loading.is_some() && self.loading != Some(update.load) {
             return Ok(false);
         }
-        if self.loading == Some(update.load) {
-            if let Some((start, trigger)) = self.load_trace.take() {
-                let current = engine.workspace_load();
-                let failure = match &update.result {
-                    Ok(loaded) => loaded.workspace.total_load_failure().is_some(),
-                    Err(_) => true,
-                };
-                telemetry::emit(
-                    "workspace_load_done",
-                    serde_json::json!({
-                        "trigger": trigger,
-                        "target_generation": update.load.generation,
-                        "in_flight_generation": update.load.generation,
-                        "include_tests": update.load.include_tests,
-                        "load_ms": telemetry::elapsed(start),
-                        "failed": failure,
-                        "stale": current.generation != update.load.generation || failure && current != update.load,
-                    }),
-                );
-            }
+        let loading = self.loading == Some(update.load);
+        let file_event = self.workspace_file_event;
+        if loading && let Some((start, trigger)) = self.load_trace.take() {
+            let current = engine.workspace_load();
+            let failure = match &update.result {
+                Ok(loaded) => loaded.workspace.total_load_failure().is_some(),
+                Err(_) => true,
+            };
+            telemetry::emit(
+                "workspace_load_done",
+                serde_json::json!({
+                    "trigger": trigger,
+                    "target_generation": update.load.generation,
+                    "in_flight_generation": update.load.generation,
+                    "include_tests": update.load.include_tests,
+                    "load_ms": telemetry::elapsed(start),
+                    "failed": failure,
+                    "cancelled": self.prewarming_tests.as_ref().is_some_and(|job| job.cancelled.load(Ordering::Relaxed)),
+                    "stale": file_event || current.generation != update.load.generation || failure && current != update.load,
+                }),
+            );
+        }
+        if update.result.is_ok() && self.should_defer_test_view(engine, update.load) {
+            self.deferred_test_view = Some(update);
+            return Ok(false);
+        }
+        self.workspace_file_event = false;
+        let warmup = if loading {
             self.loading = None;
+            self.prewarming_tests.take()
+        } else {
+            None
+        };
+        let background_only = warmup.as_ref().is_some_and(|job| !job.promoted);
+        if file_event {
+            engine.discard_workspace_cache_validation(update.load);
+            if self.requested.is_none() {
+                if background_only && let Some(load) = engine.test_view_prewarm() {
+                    self.prewarm = Some((load, Instant::now() + TEST_VIEW_IDLE_DELAY));
+                } else {
+                    self.request_workspace_from(engine.workspace_load(), "workspace_file_event");
+                }
+            }
+            return Ok(false);
+        }
+        if warmup.is_some_and(|job| job.cancelled.load(Ordering::Relaxed)) {
+            engine.discard_workspace_cache_validation(update.load);
+            return Ok(false);
         }
         let mut installed = false;
         match update.result {
             Ok(loaded) => {
                 let failure = loaded.workspace.total_load_failure().map(str::to_owned);
-                if (failure.is_none() || update.load == engine.workspace_load())
+                if (failure.is_none() || !background_only && update.load == engine.workspace_load())
+                    && (!background_only
+                        || engine.can_install_background_test_view(&loaded.workspace))
                     && engine.install_loaded_workspace(update.load, loaded)
                 {
                     installed = true;
@@ -219,7 +516,7 @@ impl Scheduler {
                             let _trace = rpc_telemetry::step(&id, true);
                             let progress = {
                                 let _navigation = rpc_telemetry::navigation_step();
-                                query.run(engine)
+                                run_query(query.as_ref(), engine)
                             };
                             self.resolve(engine, connection, id, progress, |id| Pending {
                                 id,
@@ -241,7 +538,7 @@ impl Scheduler {
                 }
                 engine.discard_workspace_cache_validation(update.load);
             }
-            Err(error) if update.load == engine.workspace_load() => {
+            Err(error) if !background_only && update.load == engine.workspace_load() => {
                 engine.discard_workspace_cache_validation(update.load);
                 self.fail_pending_load(engine, connection, &format!("{error:#}"))?;
             }
@@ -249,6 +546,11 @@ impl Scheduler {
         }
         if !self.pending.is_empty() {
             self.request_workspace_from(engine.workspace_load(), "pending_requests");
+        }
+        if installed && self.requested.is_none() {
+            self.prewarm = engine
+                .test_view_prewarm()
+                .map(|load| (load, Instant::now() + TEST_VIEW_IDLE_DELAY));
         }
         Ok(installed)
     }
@@ -347,7 +649,7 @@ impl Scheduler {
     ) -> Result<()> {
         let progress = {
             let _navigation = rpc_telemetry::navigation_step();
-            query.run(engine)
+            run_query(&query, engine)
         };
         self.resolve(engine, connection, id, progress, |id| Pending {
             id,
@@ -373,14 +675,24 @@ impl Scheduler {
             }
             Ok(QueryProgress::Searching(task)) => {
                 self.searches.push_back(Searching {
-                    id,
+                    request: defer(id),
                     generation: engine.workspace_load().generation,
-                    task,
+                    task: SearchWork::Semantic(task),
                 });
                 return Ok(());
             }
             Ok(QueryProgress::Ready(result)) => result,
-            Err(error) => Err(internal_error(error)),
+            Err(error) => match error.downcast::<SharedLoadPending>() {
+                Ok(pending) => {
+                    self.searches.push_back(Searching {
+                        request: defer(id),
+                        generation: engine.workspace_load().generation,
+                        task: SearchWork::SharedSource(pending),
+                    });
+                    return Ok(());
+                }
+                Err(error) => Err(internal_error(error)),
+            },
         };
         send_response(connection, id, result)
     }
@@ -394,34 +706,61 @@ impl Scheduler {
             return Ok(());
         };
         let mut search = self.searches.remove(next).unwrap();
-        let _trace = rpc_telemetry::step(&search.id, false);
-        let current_generation = engine.workspace_load().generation;
-        let result = if current_generation == search.generation {
-            let progress = {
-                let _navigation = rpc_telemetry::navigation_step();
-                search.task.advance(engine)
-            };
-            if engine.workspace_load().generation != search.generation {
-                search.task.discard(ErrorCode::ContentModified);
-                Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
-            } else {
-                match progress {
-                    Ok(false) => {
-                        self.searches.push_back(search);
-                        return Ok(());
-                    }
-                    Ok(true) => search.task.finish(),
-                    Err(error) => {
-                        search.task.discard(ErrorCode::InternalError);
-                        Err(internal_error(error))
+        let _trace = rpc_telemetry::step(&search.request.id, false);
+        let result = if engine.workspace_load().generation != search.generation {
+            search.discard(ErrorCode::ContentModified);
+            Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
+        } else {
+            match search.task {
+                SearchWork::SharedSource(_) => {
+                    let Pending {
+                        id,
+                        document_key,
+                        query,
+                    } = search.request;
+                    let progress = {
+                        let _navigation = rpc_telemetry::navigation_step();
+                        run_query(query.as_ref(), engine)
+                    };
+                    return self.resolve(engine, connection, id, progress, |id| Pending {
+                        id,
+                        document_key,
+                        query,
+                    });
+                }
+                SearchWork::Semantic(mut task) => {
+                    let progress = {
+                        let _navigation = rpc_telemetry::navigation_step();
+                        task.advance(engine)
+                    };
+                    if engine.workspace_load().generation != search.generation {
+                        task.discard(ErrorCode::ContentModified);
+                        Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
+                    } else {
+                        match progress {
+                            Ok(false) => {
+                                search.task = SearchWork::Semantic(task);
+                                self.searches.push_back(search);
+                                return Ok(());
+                            }
+                            Ok(true) => task.finish(),
+                            Err(error) => match error.downcast::<SharedLoadPending>() {
+                                Ok(pending) => {
+                                    search.task = SearchWork::SharedSource(pending);
+                                    self.searches.push_back(search);
+                                    return Ok(());
+                                }
+                                Err(error) => {
+                                    task.discard(ErrorCode::InternalError);
+                                    Err(internal_error(error))
+                                }
+                            },
+                        }
                     }
                 }
             }
-        } else {
-            search.task.discard(ErrorCode::ContentModified);
-            Err((ErrorCode::ContentModified, WORKSPACE_CHANGED.to_owned()))
         };
-        send_response(connection, search.id, result)
+        send_response(connection, search.request.id, result)
     }
 
     pub(super) fn ready_search(&self, engine: &Engine) -> Option<usize> {
@@ -439,10 +778,14 @@ impl Scheduler {
         message: &str,
     ) -> Result<()> {
         for mut search in std::mem::take(&mut self.searches) {
-            if matches(&search.id) {
-                search.task.discard(code);
+            if matches(&search.request.id) {
+                search.discard(code);
                 drop(search.task);
-                send_response(connection, search.id, Err((code, message.to_owned())))?;
+                send_response(
+                    connection,
+                    search.request.id,
+                    Err((code, message.to_owned())),
+                )?;
             } else {
                 self.searches.push_back(search);
             }
@@ -467,6 +810,12 @@ impl Scheduler {
 
     pub(super) fn cancel(&mut self, connection: &Connection, id: &RequestId) -> Result<()> {
         rpc_telemetry::cancelled(id);
+        self.cancel_open_requests(
+            connection,
+            |request, _| &request.id == id,
+            ErrorCode::RequestCanceled,
+            "the client cancelled the request",
+        )?;
         self.highlights.cancel(connection, id)?;
         self.diagnostics.cancel(connection, id)?;
         self.cancel_pending(
@@ -484,8 +833,25 @@ impl Scheduler {
     }
 
     pub(super) fn document_modified(&mut self, connection: &Connection, path: &Path) -> Result<()> {
+        self.invalidate_document_queries(connection, path)
+    }
+
+    fn invalidate_document_queries(&mut self, connection: &Connection, path: &Path) -> Result<()> {
+        self.cancel_open_requests(
+            connection,
+            |_, scope| scope.concerns(path),
+            ErrorCode::ContentModified,
+            "the document changed while parsing Go syntax",
+        )?;
+        self.watched_document_modified(connection, path)
+    }
+
+    pub(super) fn watched_document_modified(
+        &mut self,
+        connection: &Connection,
+        path: &Path,
+    ) -> Result<()> {
         self.highlights.document_modified(connection, path)?;
-        self.diagnostics.document_modified(connection, path)?;
         if !self.pending.is_empty() {
             let key = path_key(path);
             self.cancel_pending(
@@ -504,6 +870,11 @@ impl Scheduler {
             ErrorCode::ContentModified,
             "the document changed during search",
         )
+    }
+
+    pub(super) fn document_closed(&mut self, connection: &Connection, path: &Path) -> Result<()> {
+        self.diagnostics.document_closed(connection, path)?;
+        self.invalidate_document_queries(connection, path)
     }
 
     pub(super) fn workspace_modified(
@@ -531,6 +902,12 @@ impl Scheduler {
     pub(super) fn shutdown(&mut self, connection: &Connection) -> Result<()> {
         self.cancel_all(connection, ErrorCode::RequestFailed, SHUTTING_DOWN)?;
         self.requested = None;
+        self.prewarm = None;
+        self.deferred_test_view = None;
+        self.workspace_file_event = false;
+        if let Some(warmup) = self.prewarming_tests.take() {
+            warmup.cancelled.store(true, Ordering::Relaxed);
+        }
         self.loading = None;
         self.load_trace = None;
         Ok(())
@@ -552,15 +929,45 @@ impl Scheduler {
         code: ErrorCode,
         message: &str,
     ) -> Result<()> {
+        self.cancel_open_requests(connection, |_, _| true, code, message)?;
         self.cancel_pending(connection, |_| true, code, message)?;
         self.cancel_searches(connection, |_| true, code, message)?;
         self.highlights.cancel_all(connection, code, message)?;
         self.diagnostics.cancel_all(connection, code, message)
     }
+
+    fn cancel_open_requests(
+        &mut self,
+        connection: &Connection,
+        mut matches: impl FnMut(&Request, &OpenRequestScope) -> bool,
+        code: ErrorCode,
+        message: &str,
+    ) -> Result<()> {
+        for (request, _) in self
+            .open_requests
+            .extract_if(.., |(request, scope)| matches(request, scope))
+        {
+            send_response(connection, request.id, Err((code, message.to_owned())))?;
+        }
+        Ok(())
+    }
+}
+
+fn run_query(query: &dyn DeferredQuery, engine: &mut Engine) -> Result<RequestProgress> {
+    if let Some(pending) = query
+        .document_path()
+        .and_then(|path| engine.pending_open_dependency(path))
+    {
+        return Err(pending.into());
+    }
+    query.run(engine)
 }
 
 #[cfg(test)]
 mod tests {
+    mod diagnostic_protocol;
+    mod workspace_reload;
+
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -577,9 +984,9 @@ mod tests {
         },
         request::{
             CodeActionRequest, DocumentDiagnosticRequest, DocumentHighlightRequest,
-            FoldingRangeRequest, GotoImplementation, HoverRequest, Initialize, InlayHintRequest,
-            References, Request as _, SemanticTokensFullRequest, Shutdown, SignatureHelpRequest,
-            WorkspaceSymbolRequest,
+            FoldingRangeRequest, GotoDefinition, GotoImplementation, HoverRequest, Initialize,
+            InlayHintRequest, References, Request as _, SemanticTokensFullRequest, Shutdown,
+            SignatureHelpRequest, WorkspaceSymbolRequest,
         },
     };
     use serde_json::{Value, json};
@@ -686,6 +1093,18 @@ mod tests {
                     "changes": [{ "uri": path_uri(path).unwrap(), "type": change }]
                 }),
             );
+            self.flush_watches();
+        }
+
+        fn flush_watches(&mut self) {
+            let State::Running(running) = &mut self.state else {
+                panic!("expected a running session");
+            };
+            if let Some(deadline) = running.scheduler.watched_files.deadline {
+                running
+                    .advance_watched_files(&self.server, deadline)
+                    .unwrap();
+            }
         }
 
         fn deliver(&mut self, load: WorkspaceLoad, result: Result<Workspace>) {
@@ -727,12 +1146,19 @@ mod tests {
         }
 
         fn finish_diagnostic_job(&mut self) {
-            let completed = self
-                .scheduler()
+            let completed = self.take_diagnostic_completion();
+            self.complete_diagnostic(completed);
+        }
+
+        fn take_diagnostic_completion(&mut self) -> DiagnosticCompletion {
+            self.scheduler()
                 .diagnostic_completions()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(10))
-                .unwrap();
+                .unwrap()
+        }
+
+        fn complete_diagnostic(&mut self, completed: DiagnosticCompletion) {
             let State::Running(running) = &mut self.state else {
                 panic!("expected a running session");
             };
@@ -740,6 +1166,14 @@ mod tests {
                 .scheduler
                 .complete_diagnostics(&mut running.engine, &self.server, completed)
                 .unwrap();
+            running.collect_diagnostic_refresh(Instant::now());
+        }
+
+        fn advance_diagnostics(&mut self, now: Instant) {
+            let State::Running(running) = &mut self.state else {
+                panic!("expected a running session");
+            };
+            running.advance_diagnostics(&self.server, now).unwrap();
         }
 
         fn finish_searches(&mut self) {
@@ -755,6 +1189,7 @@ mod tests {
                 crossbeam_channel::select! {
                     recv(running.engine.reference_wake()) -> signal => signal.unwrap(),
                     recv(running.engine.completion_wake()) -> signal => signal.unwrap(),
+                    recv(running.engine.shared_disk_wake()) -> signal => signal.unwrap(),
                     default(Duration::from_secs(10)) => panic!("search worker did not wake"),
                 }
             }
@@ -762,7 +1197,10 @@ mod tests {
         }
 
         fn expect_next(&mut self, id: impl Into<RequestId>) {
-            assert_eq!(self.scheduler().searches.front().unwrap().id, id.into());
+            assert_eq!(
+                self.scheduler().searches.front().unwrap().request.id,
+                id.into()
+            );
         }
 
         fn collect(&mut self) {
@@ -800,6 +1238,99 @@ mod tests {
             "textDocument": { "uri": path_uri(path).unwrap() },
             "position": { "line": line, "character": character }
         })
+    }
+
+    fn task_request(id: i32) -> Pending {
+        struct NoReplay;
+
+        impl DeferredQuery for NoReplay {
+            fn run(&self, _: &mut Engine) -> Result<RequestProgress> {
+                panic!("the test task cannot be restarted");
+            }
+        }
+
+        Pending {
+            id: id.into(),
+            document_key: None,
+            query: Box::new(NoReplay),
+        }
+    }
+
+    #[test]
+    fn definition_retries_a_shared_read_without_blocking_other_requests() {
+        use crate::semantic::{CacheEvent, DefinitionKind};
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        struct LateRead(PathBuf);
+
+        impl DeferredQuery for LateRead {
+            fn run(&self, _: &mut Engine) -> Result<RequestProgress> {
+                Ok(QueryProgress::Searching(Box::new(Self(self.0.clone()))))
+            }
+        }
+
+        impl SearchTask for LateRead {
+            fn advance(&mut self, engine: &mut Engine) -> Result<bool> {
+                assert!(matches!(
+                    engine.definition(&self.0, Position::new(1, 5), DefinitionKind::Declaration)?,
+                    QueryProgress::Ready(Some(_))
+                ));
+                Ok(true)
+            }
+
+            fn finish(self: Box<Self>) -> RequestResult {
+                Ok(Value::Bool(true))
+            }
+        }
+
+        let project = TestProject::new();
+        let cold = project.write("cold.go", "package sample\nvar Cold int\n");
+        let other = project.write("other.go", "package sample\nvar Other int\n");
+        let mut session = Session::start(&project);
+        let engine = &mut session.running().engine;
+        let key = engine.diagnostic_key(&cold).unwrap();
+        let input = engine.capture_diagnostics(&cold, key);
+        let cold_key = path_key(&cold);
+        let (entered, started) = crossbeam_channel::bounded(1);
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        engine.set_shared_disk_hook(Some(Arc::new(move |path, event| {
+            if path == cold_key && event == CacheEvent::Read {
+                let _ = entered.try_send(());
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            }
+        })));
+        let producer = thread::spawn(move || input.analyze(&AtomicBool::new(false)));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        session.request(1, GotoDefinition::METHOD, position(&cold, 1, 5));
+        session.expect_next(1);
+        let State::Running(running) = &mut session.state else {
+            unreachable!()
+        };
+        running
+            .scheduler
+            .submit(
+                &mut running.engine,
+                &session.server,
+                3.into(),
+                LateRead(cold.clone()),
+            )
+            .unwrap();
+        session.step();
+        session.request(2, GotoDefinition::METHOD, position(&other, 1, 5));
+        assert_eq!(
+            session.reply(2).result.as_ref().unwrap()["uri"],
+            json!(path_uri(&other).unwrap())
+        );
+        session.count(2);
+        release.send(()).unwrap();
+        session.finish_searches();
+        assert_eq!(
+            session.reply(1).result.as_ref().unwrap()["uri"],
+            json!(path_uri(&cold).unwrap())
+        );
+        assert_eq!(session.reply(3).result, Some(Value::Bool(true)));
+        let _ = producer.join().unwrap().unwrap();
+        session.running().engine.set_shared_disk_hook(None);
     }
 
     fn reference(path: &Path, line: u32, character: u32) -> Value {
@@ -847,9 +1378,9 @@ mod tests {
         let old = session.begin_load();
         let discarded = Rc::new(Cell::new(0));
         session.scheduler().searches.push_back(Searching {
-            id: 2.into(),
+            request: task_request(2),
             generation: old.generation,
-            task: Box::new(CountingSearch(Rc::clone(&discarded))),
+            task: SearchWork::Semantic(Box::new(CountingSearch(Rc::clone(&discarded)))),
         });
 
         for params in [
@@ -926,8 +1457,9 @@ mod tests {
     #[test]
     fn configuration_reload_emits_diagnostics_only_for_the_installed_generation() {
         let project = TestProject::new();
-        let text = "package sample\nvar Ready int\n";
+        let text = "package sample\nvar _ = Ready\n";
         let path = project.write("api.go", text);
+        project.write("dep.go", "package sample\nvar Ready int\n");
         for (capabilities, pull) in [
             (
                 json!({ "textDocument": { "publishDiagnostics": {} } }),
@@ -942,15 +1474,24 @@ mod tests {
             ),
         ] {
             let mut session = Session::with_capabilities(&project, capabilities);
+            let initial = session.running().engine.workspace_load();
+            assert!(session.running().engine.install_workspace(
+                initial,
+                project.workspace(&["api.go"], initial.include_tests)
+            ));
             session.open(&path, text);
             if !pull {
                 session.finish_diagnostic_job();
-                assert!(matches!(
-                    session.client.receiver.try_recv().unwrap(),
-                    Message::Notification(_)
-                ));
+                let Message::Notification(notification) =
+                    session.client.receiver.try_recv().unwrap()
+                else {
+                    panic!("expected initial diagnostics");
+                };
+                assert_eq!(
+                    notification.params["diagnostics"][0]["code"],
+                    "name.unresolved"
+                );
             }
-            let initial = session.running().engine.workspace_load();
             session.scheduler().request_workspace_from(initial, "test");
             let old = session.begin_load();
             session.notify(
@@ -964,10 +1505,14 @@ mod tests {
             let current = session.begin_load();
             session.deliver(
                 current,
-                Ok(project.workspace(&["api.go"], current.include_tests)),
+                Ok(project.workspace(&["api.go", "dep.go"], current.include_tests)),
             );
             if !pull {
                 session.finish_diagnostic_job();
+            } else {
+                assert!(session.client.receiver.is_empty());
+                let deadline = session.running().diagnostic_deadline().unwrap();
+                session.advance_diagnostics(deadline);
             }
             match session.client.receiver.try_recv().unwrap() {
                 Message::Request(request) if pull => {
@@ -979,6 +1524,7 @@ mod tests {
                 Message::Notification(notification) if !pull => {
                     assert_eq!(notification.method, "textDocument/publishDiagnostics");
                     assert_eq!(notification.params["version"], 1);
+                    assert_eq!(notification.params["diagnostics"], json!([]));
                 }
                 other => panic!("unexpected diagnostics message: {other:?}"),
             }
@@ -1766,12 +2312,12 @@ mod tests {
         for (id, invalidate_before_step, expected_calls) in [(1, true, 0), (2, false, 1)] {
             let running = session.running();
             running.scheduler.searches.push_back(Searching {
-                id: id.into(),
+                request: task_request(id),
                 generation: running.engine.workspace_load().generation,
-                task: Box::new(InvalidatingTask {
+                task: SearchWork::Semantic(Box::new(InvalidatingTask {
                     calls: Rc::clone(&calls),
                     manifest: manifest.clone(),
-                }),
+                })),
             });
             if invalidate_before_step {
                 running

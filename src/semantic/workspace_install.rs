@@ -7,7 +7,7 @@ use crate::telemetry;
 use crate::workspace::{Workspace, WorkspaceLoad, path_key};
 
 use super::completion::prefilter::{FileNames, Stamp};
-use super::index::{DiskIndex, FileIndex, NavigationText};
+use super::index::{CachedNavigationText, DiskIndex, FileIndex};
 use super::{Engine, GraphChanges};
 
 pub(super) struct WorkspaceCacheChanges {
@@ -37,11 +37,11 @@ impl CacheObservation {
             && self.current_stamp == Some(names.stamp)
     }
 
-    fn text_current(&self, text: &NavigationText) -> bool {
+    fn text_current(&self, text: &CachedNavigationText) -> bool {
         text.stamp.is_some()
             && self.current_stamp == text.stamp
             && self.text.as_ref().is_some_and(|(stamp, previous)| {
-                *stamp == text.stamp && previous.as_ptr() == Arc::as_ptr(&text.text)
+                *stamp == text.stamp && Weak::ptr_eq(previous, &text.text)
             })
     }
 
@@ -103,14 +103,20 @@ impl WorkspaceCacheSnapshot {
 }
 
 impl Engine {
+    pub(crate) fn can_install_background_test_view(&self, workspace: &Workspace) -> bool {
+        self.state
+            .workspace
+            .as_ref()
+            .is_some_and(|production| workspace.covers_production_groups(production))
+    }
+
     pub(crate) fn workspace_cache_snapshot(&self, load: WorkspaceLoad) -> WorkspaceCacheSnapshot {
         let mut files = HashMap::<_, CacheObservation>::new();
         for (path, names) in &self.state.completion_names {
             files.entry(path.clone()).or_default().names = Some((names.stamp, names.fingerprint));
         }
         for (path, text) in &self.state.navigation_texts {
-            files.entry(path.clone()).or_default().text =
-                Some((text.stamp, Arc::downgrade(&text.text)));
+            files.entry(path.clone()).or_default().text = Some((text.stamp, text.text.clone()));
         }
         for (path, disk) in &self.state.disk_index {
             files.entry(path.clone()).or_default().disk =
@@ -167,7 +173,11 @@ impl Engine {
             self.discard_workspace_cache_validation(load);
             return false;
         }
-        self.install_validated_workspace(load, loaded)
+        let installed = self.install_validated_workspace(load, loaded);
+        if installed {
+            self.include_tests |= load.include_tests;
+        }
+        installed
     }
 
     fn install_validated_workspace(
@@ -235,6 +245,7 @@ impl Engine {
         self.state.workspace = Some(Arc::new(workspace));
         self.state.completion_graph_generation += 1;
         self.state.completion_sources_changed(None);
+        self.state.diagnostic_keys.get_mut().clear();
         self.state.graph_changes = GraphChanges::Clean;
         self.implementation_cache.clear();
         self.workspace_symbol_index.graph_changed();
@@ -260,6 +271,7 @@ mod tests {
     use crate::test_support::TestProject;
 
     use super::*;
+    use crate::semantic::index::NavigationText;
     use crate::semantic::source::Source;
 
     fn cache(engine: &mut Engine, path: &Path) {
@@ -279,7 +291,88 @@ mod tests {
             FileNames::new(text.stamp.unwrap(), &text.text, false),
         );
         engine.state.disk_index.insert(key.clone(), index);
-        engine.state.navigation_texts.insert(key, text);
+        engine.state.navigation_texts.insert(key, text.downgrade());
+    }
+
+    #[test]
+    fn adding_a_gap_after_legacy_build_tag_invalidates_selected_files() {
+        assert_legacy_build_gap_changes_selection(
+            "// +build rs_gopls_unset_build_tag\npackage sample\n",
+            "// +build rs_gopls_unset_build_tag\n\npackage sample\n",
+            true,
+        );
+    }
+
+    #[test]
+    fn removing_a_gap_after_legacy_build_tag_invalidates_excluded_files() {
+        assert_legacy_build_gap_changes_selection(
+            "// +build rs_gopls_unset_build_tag\n\npackage sample\n",
+            "// +build rs_gopls_unset_build_tag\npackage sample\n",
+            false,
+        );
+    }
+
+    fn assert_legacy_build_gap_changes_selection(before: &str, after: &str, selected: bool) {
+        let project = TestProject::new();
+        project.write("stable.go", "package sample\n");
+        let path = project.write("conditional.go", before);
+        let selected: &[&str] = if selected {
+            &["stable.go", "conditional.go"]
+        } else {
+            &["stable.go"]
+        };
+        let mut engine = Engine::new(project.root.clone());
+        let load = engine.workspace_load();
+        assert!(engine.install_workspace(load, project.workspace(selected, false)));
+        cache(&mut engine, &path);
+        project.write("conditional.go", after);
+        engine.file_changed(&path, FileChangeType::CHANGED);
+        assert_eq!(engine.workspace_load().generation, load.generation + 1);
+    }
+
+    #[test]
+    fn workspace_body_watch_keeps_declarations_and_graph_but_reads_new_disk_text() {
+        let project = TestProject::new();
+        let dependency = project.write("dep.go", "package sample\nfunc Value() int { return 1 }\n");
+        let text = "package sample\nvar _ = Value()\n";
+        let caller = project.write("api.go", text);
+        let mut engine = Engine::new(project.root.clone());
+        let load = engine.workspace_load();
+        let files = ["api.go", "dep.go"];
+        assert!(engine.install_workspace(load, project.workspace(&files, false)));
+        engine.open(caller.clone(), text.into(), 1).unwrap();
+        let initial = engine.diagnostics_report(&caller).unwrap().0.clone();
+        assert!(initial.items.is_empty());
+        engine
+            .state
+            .shared_disk
+            .load(&mut engine.state.parser, &dependency, None, None)
+            .unwrap();
+
+        let updated = "package sample\nfunc Value() int { return 1234 }\n";
+        project.write("dep.go", updated);
+        engine.watched_files_changed(&[(dependency.clone(), FileChangeType::CHANGED)]);
+        assert_eq!(engine.workspace_load(), load);
+        let disk = engine
+            .state
+            .shared_disk
+            .read(&dependency, None, None)
+            .unwrap();
+        assert_eq!(disk.text.as_str(), updated);
+        assert_eq!(
+            engine.diagnostics_report(&caller).unwrap().0.result_id,
+            initial.result_id,
+        );
+
+        let upgrade = WorkspaceLoad {
+            include_tests: true,
+            ..load
+        };
+        assert!(engine.install_workspace(upgrade, project.workspace(&files, true)));
+        assert_eq!(
+            engine.diagnostics_report(&caller).unwrap().0.result_id,
+            initial.result_id,
+        );
     }
 
     #[test]

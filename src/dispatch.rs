@@ -41,6 +41,7 @@ use crate::semantic::{
     DefinitionKind, EditorFoldingOptions, Engine, QueryProgress, SemanticTask,
     semantic_tokens_legend,
 };
+use crate::{rpc_telemetry, telemetry};
 
 type Handler = fn(&mut RequestContext<'_>, RequestId, Value) -> Result<()>;
 
@@ -273,6 +274,32 @@ pub(super) fn handle(
     client: ClientFeatures,
     request: Request,
 ) -> Result<()> {
+    if (scheduler.watching_files() || engine.has_pending_open_parses())
+        && client.supports(&request.method)
+        && telemetry_method(&request.method).is_some()
+        && let Some(scope) = OpenRequestScope::for_request(&request)
+    {
+        let reason = if scheduler.watching_files() {
+            Some("watched_files")
+        } else if request.method != DocumentDiagnosticRequest::METHOD && scope.waiting(engine) {
+            Some("open_document_parse")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if request.method == DocumentDiagnosticRequest::METHOD
+                && let OpenRequestScope::Document(path) = &scope
+                && telemetry::enabled()
+            {
+                rpc_telemetry::diagnostic_request_version(
+                    &request.id,
+                    engine.open_document_version(path),
+                );
+            }
+            scheduler.defer_open_request(request, scope, reason);
+            return Ok(());
+        }
+    }
     let Request { id, method, params } = request;
     let mut context = RequestContext {
         connection,
@@ -294,6 +321,65 @@ pub(super) fn handle(
             format!("unsupported request: {method}"),
         )),
     )
+}
+
+pub(super) enum OpenRequestScope {
+    Document(PathBuf),
+    Dependencies(PathBuf),
+    References(PathBuf),
+    Workspace(Option<PathBuf>),
+}
+
+impl OpenRequestScope {
+    fn for_request(request: &Request) -> Option<Self> {
+        let method = request.method.as_str();
+        let path = request
+            .params
+            .pointer("/textDocument/uri")
+            .or_else(|| request.params.pointer("/item/uri"))
+            .or_else(|| request.params.pointer("/data/uri"))
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.parse::<Uri>().ok())
+            .and_then(|uri| file_path(&uri).ok());
+        Some(match method {
+            WorkspaceSymbolRequest::METHOD
+            | GotoImplementation::METHOD
+            | PrepareRenameRequest::METHOD
+            | Rename::METHOD
+            | CallHierarchyIncomingCalls::METHOD
+            | TypeHierarchySubtypes::METHOD => Self::Workspace(path),
+            DocumentSymbolRequest::METHOD
+            | DocumentHighlightRequest::METHOD
+            | SemanticTokensFullRequest::METHOD
+            | InlayHintRequest::METHOD
+            | FoldingRangeRequest::METHOD
+            | DocumentDiagnosticRequest::METHOD
+            | Formatting::METHOD => Self::Document(path?),
+            References::METHOD => Self::References(path?),
+            _ => Self::Dependencies(path?),
+        })
+    }
+
+    pub(super) fn waiting(&self, engine: &Engine) -> bool {
+        match self {
+            Self::Document(path) => engine.document_parse_pending(path),
+            Self::Dependencies(path) => engine.pending_document_affects(path),
+            Self::References(path) => engine.pending_reference_document_affects(path),
+            Self::Workspace(_) => engine.has_pending_open_parses(),
+        }
+    }
+
+    pub(super) fn concerns(&self, path: &Path) -> bool {
+        let document = match self {
+            Self::Document(document)
+            | Self::Dependencies(document)
+            | Self::References(document) => Some(document),
+            Self::Workspace(document) => document.as_ref(),
+        };
+        document.is_some_and(|document| {
+            crate::workspace::path_key(document) == crate::workspace::path_key(path)
+        })
+    }
 }
 
 pub(super) fn telemetry_method(method: &str) -> Option<&'static str> {
@@ -713,16 +799,24 @@ fn document_diagnostics(
     params: Value,
 ) -> Result<()> {
     match document_params(params, |p: &DocumentDiagnosticParams| &p.text_document.uri) {
-        Ok((path, params)) => context.scheduler.submit_diagnostics(
-            context.engine,
-            context.connection,
-            path,
-            DiagnosticConsumer::Pull {
-                id,
-                previous: params.previous_result_id,
-            },
-            "textDocument/diagnostic",
-        ),
+        Ok((path, params)) => {
+            if telemetry::enabled() {
+                rpc_telemetry::diagnostic_request_version(
+                    &id,
+                    context.engine.open_document_version(&path),
+                );
+            }
+            context.scheduler.submit_diagnostics(
+                context.engine,
+                context.connection,
+                path,
+                DiagnosticConsumer::Pull {
+                    id,
+                    previous: params.previous_result_id,
+                },
+                "textDocument/diagnostic",
+            )
+        }
         Err(error) => context.respond(id, Err(invalid_params(error))),
     }
 }
@@ -866,6 +960,10 @@ struct CompletionQuery {
 impl DeferredQuery for CompletionQuery {
     fn document_path(&self) -> Option<&Path> {
         Some(&self.path)
+    }
+
+    fn is_completion(&self) -> bool {
+        true
     }
 
     fn run(&self, engine: &mut Engine) -> Result<RequestProgress> {

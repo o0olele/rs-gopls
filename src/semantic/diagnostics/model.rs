@@ -10,7 +10,9 @@ use crate::workspace::DiagnosticFileStamp;
 pub(super) enum DiagnosticDocumentRevision {
     Open {
         version: i32,
+        open_generation: u64,
         fingerprint: u64,
+        content_revision: u64,
     },
     Disk {
         stamp: DiagnosticFileStamp,
@@ -53,6 +55,23 @@ impl DiagnosticSnapshotKey {
 
     pub(crate) fn result_id(&self, content_hash: u64) -> String {
         format!("{:016x}", hash((self, content_hash)))
+    }
+
+    pub(crate) fn same_document(&self, other: &Self) -> bool {
+        self.path_key == other.path_key && self.revision == other.revision
+    }
+
+    pub(crate) fn open_generation(&self) -> Option<u64> {
+        match self.revision {
+            DiagnosticDocumentRevision::Open {
+                open_generation, ..
+            } => Some(open_generation),
+            DiagnosticDocumentRevision::Disk { .. } => None,
+        }
+    }
+
+    pub(super) fn same_semantic_inputs(&self, other: &Self) -> bool {
+        !self.partial && !other.partial && self.semantic_inputs == other.semantic_inputs
     }
 }
 
@@ -253,6 +272,64 @@ impl DiagnosticItem {
             &self.message,
         )
     }
+
+    pub(super) fn visible_identity(
+        &self,
+        range: Range,
+    ) -> (
+        Range,
+        DiagnosticCode,
+        DiagnosticSeverity,
+        &str,
+        &[DiagnosticTag],
+        &str,
+    ) {
+        (
+            range,
+            self.code,
+            self.severity,
+            &self.message,
+            &self.tags,
+            self.source,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DiagnosticStage {
+    Stage1,
+    Stage2,
+}
+
+impl DiagnosticStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Stage1 => "stage1",
+            Self::Stage2 => "stage2",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextCompleteness {
+    Partial,
+    Complete,
+}
+
+impl ContextCompleteness {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Complete => "full",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DiagnosticProvenance {
+    pub(crate) job: u64,
+    pub(crate) run: u64,
+    pub(crate) lane: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,14 +337,30 @@ pub(crate) struct DiagnosticReport {
     pub(crate) snapshot: DiagnosticSnapshotKey,
     pub(crate) result_id: String,
     pub(crate) items: Vec<DiagnosticItem>,
-    pub(crate) is_partial: bool,
+    pub(crate) diagnostic_stage: DiagnosticStage,
+    pub(crate) context_completeness: ContextCompleteness,
+    pub(crate) provenance: Option<DiagnosticProvenance>,
 }
 
 impl DiagnosticReport {
     pub(crate) fn new(
         snapshot: DiagnosticSnapshotKey,
-        mut items: Vec<DiagnosticItem>,
+        items: Vec<DiagnosticItem>,
         is_partial: bool,
+    ) -> Self {
+        let (stage, context) = if is_partial {
+            (DiagnosticStage::Stage1, ContextCompleteness::Partial)
+        } else {
+            (DiagnosticStage::Stage2, ContextCompleteness::Complete)
+        };
+        Self::at_stage(snapshot, items, stage, context)
+    }
+
+    pub(crate) fn at_stage(
+        snapshot: DiagnosticSnapshotKey,
+        mut items: Vec<DiagnosticItem>,
+        diagnostic_stage: DiagnosticStage,
+        context_completeness: ContextCompleteness,
     ) -> Self {
         items.sort_unstable_by(|left, right| {
             left.identity()
@@ -278,13 +371,27 @@ impl DiagnosticReport {
                 .then_with(|| left.source.cmp(right.source))
         });
         items.dedup_by(|left, right| left.identity() == right.identity());
-        let result_id = snapshot.result_id(hash((is_partial, &items)));
+        let mut visible_content = DefaultHasher::new();
+        items.len().hash(&mut visible_content);
+        for item in &items {
+            item.visible_identity(item.range).hash(&mut visible_content);
+        }
+        let result_id = snapshot.result_id(visible_content.finish());
         Self {
             snapshot,
             result_id,
             items,
-            is_partial,
+            diagnostic_stage,
+            context_completeness,
+            provenance: None,
         }
+    }
+
+    pub(crate) fn same_visible_content(&self, other: &Self) -> bool {
+        self.items.len() == other.items.len()
+            && self.items.iter().zip(&other.items).all(|(left, right)| {
+                left.visible_identity(left.range) == right.visible_identity(right.range)
+            })
     }
 
     pub(crate) fn to_lsp_diagnostics(&self) -> Vec<Diagnostic> {
@@ -318,7 +425,9 @@ mod tests {
             "sample.go".into(),
             DiagnosticDocumentRevision::Open {
                 version: 7,
+                open_generation: 1,
                 fingerprint: 1,
+                content_revision: 1,
             },
             Some(2),
         )
@@ -384,7 +493,8 @@ mod tests {
         let report = DiagnosticReport::new(snapshot.clone(), items.clone(), false);
 
         let partial = DiagnosticReport::new(snapshot.clone(), items.clone(), true);
-        assert_ne!(report.result_id, partial.result_id);
+        assert_eq!(report.result_id, partial.result_id);
+        assert_ne!(report.diagnostic_stage, partial.diagnostic_stage);
 
         let mut changed = items.clone();
         changed[0].severity = DiagnosticSeverity::Warning;

@@ -2230,6 +2230,16 @@ impl LspSession {
             });
     }
 
+    fn flush_watches(&mut self) {
+        let crate::State::Running(running) = &mut self.state else {
+            panic!("not initialized");
+        };
+        let deadline = running.scheduler.workspace_deadline().unwrap();
+        running
+            .advance_watched_files(self.session.server(), deadline)
+            .unwrap();
+    }
+
     fn replace(&mut self, text: &str, version: i32) {
         let running = match &mut self.state {
             crate::State::Running(running) => running,
@@ -2447,6 +2457,7 @@ fn lsp_resolve_rejects_stale_document_graph_and_closed_buffers() {
         "workspace/didChangeWatchedFiles",
         json!({"changes": [{"uri": go_mod, "type": 2}]}),
     );
+    lsp.flush_watches();
     assert_eq!(lsp.resolve(5, proposal).error.unwrap().code, -32801);
 
     install(
@@ -2574,6 +2585,7 @@ fn lsp_completion_uses_unsaved_edits_close_restores_disk_and_graph_refresh_adds_
         "workspace/didChangeWatchedFiles",
         json!({"changes": [{"uri": uri, "type": 1}]}),
     );
+    lsp.flush_watches();
     lsp.complete(5, position);
     assert_eq!(lsp.running().pending.len(), 1);
     let crate::State::Running(running) = &mut lsp.state else {

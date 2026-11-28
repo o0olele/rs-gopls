@@ -13,6 +13,66 @@ use crate::symbols::{self, FileOutline};
 
 use super::editor::HighlightCache;
 
+pub(super) const LARGE_OPEN_BYTES: usize = 512 * 1024;
+
+#[derive(Clone)]
+pub(super) struct OpenText {
+    pub(super) text: Arc<String>,
+    lines: LineIndex,
+}
+
+impl OpenText {
+    pub(super) fn new(text: String) -> Self {
+        let lines = LineIndex::new(&text);
+        Self {
+            text: Arc::new(text),
+            lines,
+        }
+    }
+
+    pub(super) fn edit(&mut self, changes: &[TextDocumentContentChangeEvent]) -> Result<()> {
+        let mut text = self.text.as_ref().clone();
+        let mut lines = self.lines.clone();
+        for change in changes {
+            let (start, end) = edit_offsets(&text, &lines, change)?;
+            lines.edit(start, end, &change.text);
+            text.replace_range(start..end, &change.text);
+        }
+        self.text = Arc::new(text);
+        self.lines = lines;
+        Ok(())
+    }
+
+    pub(super) fn parse(
+        self,
+        parser: &mut Parser,
+        path: PathBuf,
+        cancelled: &AtomicBool,
+    ) -> Result<Source> {
+        check_cancelled(cancelled)?;
+        let tree = parse_cancellable_tree(parser, &self.text, cancelled, || {})?;
+        Source::from_tree(path, self.text, self.lines, tree, Some(cancelled))
+    }
+}
+
+fn edit_offsets(
+    text: &str,
+    lines: &LineIndex,
+    change: &TextDocumentContentChangeEvent,
+) -> Result<(usize, usize)> {
+    let Some(range) = change.range else {
+        return Ok((0, text.len()));
+    };
+    let start = lines
+        .offset(text, range.start)
+        .context("invalid edit start")?;
+    let end = lines.offset(text, range.end).context("invalid edit end")?;
+    if start > end {
+        bail!("edit ends before it begins");
+    }
+    Ok((start, end))
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum ReferenceQuery<'tree> {
     Name(Node<'tree>),
@@ -40,47 +100,6 @@ pub(super) fn is_test_source(path: &Path) -> bool {
         .is_some_and(|filename| filename.ends_with("_test.go"))
 }
 
-pub(super) fn read_source(parser: &mut Parser, path: &Path) -> Result<Source> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Source::parse(parser, path.to_owned(), text, None)
-}
-
-pub(super) fn read_navigation_source(
-    parser: &mut Parser,
-    path: &Path,
-    probe: Option<&super::navigation_trace::NavigationProbe>,
-) -> Result<Source> {
-    use super::navigation_trace::{record, sample};
-
-    let Some(probe) = probe else {
-        return read_source(parser, path);
-    };
-    let text = {
-        let _read = sample(Some(probe), |counts| &mut counts.read);
-        record(Some(probe), |counts| {
-            counts.text_misses += 1;
-            counts.disk_reads += 1;
-        });
-        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
-    };
-    parse_navigation_source(parser, path, text, Some(probe))
-}
-
-pub(super) fn parse_navigation_source(
-    parser: &mut Parser,
-    path: &Path,
-    text: impl Into<Arc<String>>,
-    probe: Option<&super::navigation_trace::NavigationProbe>,
-) -> Result<Source> {
-    use super::navigation_trace::{record, sample};
-
-    record(probe, |counts| counts.ast_parses += 1);
-    let _parse = sample(probe, |counts| &mut counts.parse);
-    let text = text.into();
-    let lines = LineIndex::new(&text);
-    Source::parse_with_lines(parser, path.to_owned(), text, lines, None)
-}
-
 #[derive(Clone)]
 pub(super) struct Import {
     pub(super) alias: Option<String>,
@@ -103,6 +122,29 @@ enum FileName {
 }
 
 impl EditorNames {
+    pub(super) fn file_declarations(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    pub(super) fn cache_weight(&self) -> usize {
+        self.files.keys().map(|name| name.len() + 64).sum::<usize>()
+            + self
+                .methods
+                .iter()
+                .map(|name| name.len() + 48)
+                .sum::<usize>()
+            + self
+                .imports
+                .keys()
+                .map(|name| name.len() + 64)
+                .sum::<usize>()
+            + self
+                .raw_imports
+                .iter()
+                .map(|import| import.path.len() + import.alias.as_ref().map_or(0, String::len) + 72)
+                .sum::<usize>()
+    }
+
     pub(super) fn ambiguous(&self, name: &str) -> bool {
         matches!(self.files.get(name), Some(FileName::Ambiguous))
     }
@@ -114,9 +156,17 @@ impl EditorNames {
         }
     }
 
-    fn collect_declaration(&mut self, declaration: Node<'_>, text: &str) {
+    fn collect_declaration(
+        &mut self,
+        declaration: Node<'_>,
+        text: &str,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<()> {
+        if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled)?;
+        }
         if declaration.is_extra() || declaration.is_missing() {
-            return;
+            return Ok(());
         }
         let mut cursor = declaration.walk();
         match declaration.kind() {
@@ -127,16 +177,22 @@ impl EditorNames {
             }
             "var_declaration" | "var_spec_list" | "const_declaration" | "type_declaration" => {
                 for child in declaration.named_children(&mut cursor) {
-                    self.collect_declaration(child, text);
+                    self.collect_declaration(child, text, cancelled)?;
                 }
             }
             "function_declaration" | "type_spec" | "type_alias" | "var_spec" | "const_spec" => {
                 let complete = !is_type_declaration(declaration)
                     || declaration.child_by_field_name("type").is_some();
-                for name in declaration
+                for (index, name) in declaration
                     .children_by_field_name("name", &mut cursor)
                     .filter(Node::is_named)
+                    .enumerate()
                 {
+                    if index & 255 == 0
+                        && let Some(cancelled) = cancelled
+                    {
+                        check_cancelled(cancelled)?;
+                    }
                     let spelling = node_text(name, text);
                     let is_value = matches!(declaration.kind(), "var_spec" | "const_spec");
                     let file_name = if complete
@@ -159,6 +215,7 @@ impl EditorNames {
             }
             _ => {}
         }
+        Ok(())
     }
 }
 
@@ -198,6 +255,7 @@ pub(super) struct Source {
     fingerprint: OnceCell<u64>,
 }
 
+#[derive(Clone)]
 pub(super) struct SourceRevision {
     path: PathBuf,
     text: Arc<String>,
@@ -252,7 +310,7 @@ impl Source {
         let tree = parser
             .parse(text.as_bytes(), previous)
             .context("parsing Go source")?;
-        Ok(Self::from_tree(path, text, lines, tree))
+        Self::from_tree(path, text, lines, tree, None)
     }
 
     pub(super) fn parse_declarations(
@@ -262,44 +320,88 @@ impl Source {
         bodies: &[std::ops::Range<usize>],
     ) -> Result<(Self, bool)> {
         let lines = LineIndex::new(&text);
-        if !bodies.is_empty() {
-            // Keep both braces and all original byte/UTF-16 offsets. The
-            // declaration grammar and source text are otherwise unchanged.
-            let mut start = 0;
-            let mut included = Vec::with_capacity(bodies.len() + 1);
-            for body in bodies {
-                included.push(tree_sitter::Range {
-                    start_byte: start,
-                    end_byte: body.start,
-                    start_point: lines.point(start),
-                    end_point: lines.point(body.start),
-                });
-                start = body.end;
-            }
-            included.push(tree_sitter::Range {
-                start_byte: start,
-                end_byte: text.len(),
-                start_point: lines.point(start),
-                end_point: lines.point(text.len()),
-            });
-            if parser.set_included_ranges(&included).is_ok() {
-                let tree = parser.parse(&text, None);
-                parser
-                    .set_included_ranges(&[])
-                    .expect("resetting Tree-sitter input ranges");
-                if let Some(tree) = tree.filter(|tree| !tree.root_node().has_error()) {
-                    return Ok((Self::from_tree(path, Arc::new(text), lines, tree), true));
-                }
-            }
+        if let Some(tree) = Self::parse_without_bodies(parser, &text, &lines, bodies, None)? {
+            return Ok((
+                Self::from_tree(path, Arc::new(text), lines, tree, None)?,
+                true,
+            ));
         }
         Self::parse_with_lines(parser, path, Arc::new(text), lines, None)
             .map(|source| (source, false))
     }
 
-    fn from_tree(path: PathBuf, text: Arc<String>, lines: LineIndex, tree: Tree) -> Self {
+    pub(super) fn parse_dependency_declarations(
+        parser: &mut Parser,
+        path: &Path,
+        text: Arc<String>,
+        bodies: &[std::ops::Range<usize>],
+        cancelled: &AtomicBool,
+    ) -> Result<(Self, bool)> {
+        let lines = LineIndex::new_cancellable(&text, cancelled)?;
+        let elided = Self::parse_without_bodies(parser, &text, &lines, bodies, Some(cancelled))?;
+        let declarations_only = elided.is_some();
+        let tree = match elided {
+            Some(tree) => tree,
+            None => parse_cancellable_tree(parser, &text, cancelled, || {})?,
+        };
+        let source = Self::from_tree(path.to_owned(), text, lines, tree, Some(cancelled))?;
+        check_cancelled(cancelled)?;
+        Ok((source, declarations_only))
+    }
+
+    fn parse_without_bodies(
+        parser: &mut Parser,
+        text: &str,
+        lines: &LineIndex,
+        bodies: &[std::ops::Range<usize>],
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<Tree>> {
+        if bodies.is_empty() {
+            return Ok(None);
+        }
+        // Keep both braces and all original byte/UTF-16 offsets. The
+        // declaration grammar and source text are otherwise unchanged.
+        let mut start = 0;
+        let mut included = Vec::with_capacity(bodies.len() + 1);
+        for body in bodies {
+            included.push(tree_sitter::Range {
+                start_byte: start,
+                end_byte: body.start,
+                start_point: lines.point(start),
+                end_point: lines.point(body.start),
+            });
+            start = body.end;
+        }
+        included.push(tree_sitter::Range {
+            start_byte: start,
+            end_byte: text.len(),
+            start_point: lines.point(start),
+            end_point: lines.point(text.len()),
+        });
+        if parser.set_included_ranges(&included).is_ok() {
+            let tree = if let Some(cancelled) = cancelled {
+                parse_cancellable_tree(parser, text, cancelled, || {}).map(Some)
+            } else {
+                Ok(parser.parse(text, None))
+            };
+            parser
+                .set_included_ranges(&[])
+                .expect("resetting Tree-sitter input ranges");
+            return Ok(tree?.filter(|tree| !tree.root_node().has_error()));
+        }
+        Ok(None)
+    }
+
+    fn from_tree(
+        path: PathBuf,
+        text: Arc<String>,
+        lines: LineIndex,
+        tree: Tree,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self> {
         let (imports, diagnostic_imports, editor_names) =
-            source_names(tree.root_node(), &text, &lines);
-        Self {
+            source_names(tree.root_node(), &text, &lines, cancelled)?;
+        Ok(Self {
             path,
             text,
             lines,
@@ -312,7 +414,7 @@ impl Source {
             reference_names: Arc::default(),
             highlight_names: Arc::default(),
             fingerprint: OnceCell::new(),
-        }
+        })
     }
 
     pub(super) fn fingerprint(&self) -> u64 {
@@ -355,20 +457,10 @@ impl Source {
         cancelled: &AtomicBool,
     ) -> Result<Self> {
         check_cancelled(cancelled)?;
-        let mut progress = |_: &tree_sitter::ParseState| cancelled.load(Ordering::Relaxed);
-        let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
-        let tree = parser.parse_with_options(
-            &mut |offset, _| &text.as_bytes()[offset.min(text.len())..],
-            None,
-            Some(options),
-        );
-        if tree.is_none() {
-            parser.reset();
-        }
-        let tree = tree.context("parsing Go source")?;
+        let tree = parse_cancellable_tree(parser, &text, cancelled, || {})?;
         check_cancelled(cancelled)?;
-        let lines = LineIndex::new(&text);
-        let source = Self::from_tree(path.to_owned(), text, lines, tree);
+        let lines = LineIndex::new_cancellable(&text, cancelled)?;
+        let source = Self::from_tree(path.to_owned(), text, lines, tree, Some(cancelled))?;
         check_cancelled(cancelled)?;
         Ok(source)
     }
@@ -385,19 +477,7 @@ impl Source {
         let mut tree = self.tree.clone();
         let mut lines = self.lines.clone();
         for change in changes {
-            let (start, end) = if let Some(range) = change.range {
-                (
-                    lines
-                        .offset(&text, range.start)
-                        .context("invalid edit start")?,
-                    lines.offset(&text, range.end).context("invalid edit end")?,
-                )
-            } else {
-                (0, text.len())
-            };
-            if start > end {
-                bail!("edit ends before it begins");
-            }
+            let (start, end) = edit_offsets(&text, &lines, change)?;
 
             let start_position = lines.point(start);
             let new_end_position = match change.text.rfind('\n') {
@@ -787,15 +867,19 @@ fn source_names(
     root: Node<'_>,
     text: &str,
     lines: &LineIndex,
-) -> (Vec<Import>, Vec<DiagnosticImport>, EditorNames) {
+    cancelled: Option<&AtomicBool>,
+) -> Result<(Vec<Import>, Vec<DiagnosticImport>, EditorNames)> {
     let mut navigation = Vec::new();
     let mut diagnostics = Vec::new();
     let mut editor = EditorNames::default();
     let mut cursor = root.walk();
     for declaration in root.named_children(&mut cursor) {
         if declaration.kind() != "import_declaration" {
-            editor.collect_declaration(declaration, text);
+            editor.collect_declaration(declaration, text, cancelled)?;
             continue;
+        }
+        if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled)?;
         }
         let mut cursor = declaration.walk();
         let container = declaration
@@ -807,6 +891,9 @@ fn source_names(
             .named_children(&mut cursor)
             .filter(|node| node.kind() == "import_spec")
         {
+            if let Some(cancelled) = cancelled {
+                check_cancelled(cancelled)?;
+            }
             let Some(literal) = spec.child_by_field_name("path") else {
                 continue;
             };
@@ -858,7 +945,7 @@ fn source_names(
             });
         }
     }
-    (navigation, diagnostics, editor)
+    Ok((navigation, diagnostics, editor))
 }
 
 fn implicit_import_name(path: &str) -> Option<&str> {
@@ -927,6 +1014,54 @@ pub(super) fn check_cancelled(cancelled: &AtomicBool) -> Result<()> {
     Ok(())
 }
 
+fn parse_cancellable_tree(
+    parser: &mut Parser,
+    text: &str,
+    cancelled: &AtomicBool,
+    mut on_progress: impl FnMut(),
+) -> Result<Tree> {
+    let mut progress = |_: &tree_sitter::ParseState| {
+        on_progress();
+        cancelled.load(Ordering::Relaxed)
+    };
+    let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+    let tree = parser.parse_with_options(
+        &mut |offset, _| &text.as_bytes()[offset.min(text.len())..],
+        None,
+        Some(options),
+    );
+    if tree.is_none() {
+        parser.reset();
+    }
+    tree.context("parsing Go source")
+}
+
+#[cfg(test)]
+#[test]
+fn private_parse_cancellation_stops_at_the_progress_callback_and_resets_parser() {
+    use std::time::{Duration, Instant};
+
+    let text = format!(
+        "package sample\n{}",
+        "var identifier = 1 + 2\n".repeat(100_000)
+    );
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .unwrap();
+    let cancelled = AtomicBool::new(false);
+    let mut signalled = None;
+    let result = parse_cancellable_tree(&mut parser, &text, &cancelled, || {
+        signalled = Some(Instant::now());
+        cancelled.store(true, Ordering::Relaxed);
+    });
+    assert!(result.is_err());
+    assert!(signalled.unwrap().elapsed() <= Duration::from_millis(50));
+    let tree = parser.parse("package after\n", None).unwrap();
+    assert!(!tree.root_node().has_error());
+    assert_eq!(tree.root_node().end_byte(), "package after\n".len());
+}
+
 #[derive(Clone)]
 pub(super) struct LineIndex {
     starts: Arc<Vec<usize>>,
@@ -940,6 +1075,24 @@ impl LineIndex {
         Self {
             starts: Arc::new(starts),
         }
+    }
+
+    fn new_cancellable(text: &str, cancelled: &AtomicBool) -> Result<Self> {
+        let mut starts = vec![0];
+        let mut start = 0;
+        while start < text.len() {
+            check_cancelled(cancelled)?;
+            let end = text.floor_char_boundary((start + 64 * 1024).min(text.len()));
+            starts.extend(
+                text[start..end]
+                    .match_indices('\n')
+                    .map(|(index, _)| start + index + 1),
+            );
+            start = end;
+        }
+        Ok(Self {
+            starts: Arc::new(starts),
+        })
     }
 
     pub(super) fn offset(&self, text: &str, position: Position) -> Option<usize> {

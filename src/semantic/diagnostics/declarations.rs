@@ -1,7 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::*;
 use crate::scope::{initializer_at, receiver_type_parameters};
+use crate::semantic::completion::render::package_name;
+use crate::semantic::index::draft_files;
+use crate::semantic::source::EditorNames;
 use crate::symbols::{self, OutlineKind};
 use crate::workspace::path_key;
 
@@ -45,6 +49,7 @@ pub(super) struct Locals<'t> {
     pub(super) variables: Vec<Node<'t>>,
     pub(super) globals: HashMap<String, OutlineKind>,
     pub(super) incomplete_package: bool,
+    uncertain_bindings: Vec<Bytes<usize>>,
 }
 
 impl<'t> Locals<'t> {
@@ -82,6 +87,24 @@ impl<'t> Locals<'t> {
         None
     }
 
+    pub(super) fn may_have_recovered_binding(&self, node: Node<'_>) -> bool {
+        let offset = node.start_byte();
+        let index = self
+            .uncertain_bindings
+            .partition_point(|range| range.start <= offset);
+        index > 0 && self.uncertain_bindings[index - 1].contains(&offset)
+    }
+
+    fn record_uncertain_binding(&mut self, range: Bytes<usize>) {
+        if let Some(previous) = self.uncertain_bindings.last_mut()
+            && previous.end >= range.start
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            self.uncertain_bindings.push(range);
+        }
+    }
+
     fn push_scope(&mut self, node: Node<'_>) {
         let scope = self.scopes.len();
         self.scopes.push((node.id(), self.current_scope));
@@ -98,10 +121,19 @@ impl<'t> Locals<'t> {
 
 pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
     package_declarations(analysis)?;
+    collect_locals(analysis, WalkMode::Intact)
+}
+
+pub(super) fn collect_locals<'s>(
+    analysis: &mut Analysis<'s, '_, '_>,
+    mode: WalkMode<'_>,
+) -> Result<()> {
     let mut member_names = HashSet::new();
+    let detailed = !mode.recovers();
     walk(
         analysis.source.tree.root_node(),
         analysis.cancelled,
+        mode,
         |node, kind, parents, entering| {
             if !entering {
                 analysis.locals.pop_scope(node);
@@ -112,19 +144,39 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                 analysis.locals.push_scope(node);
             }
             match kind {
+                "ERROR" => {
+                    if let Some(scope) = block_scope(parents)
+                        && damaged_binding(node, analysis.cancelled)?
+                    {
+                        analysis
+                            .locals
+                            .record_uncertain_binding(node.start_byte()..scope.end_byte());
+                    }
+                    return Ok(WalkControl::Skip);
+                }
                 "package_clause" | "import_declaration" => return Ok(WalkControl::Skip),
                 "var_spec" | "const_spec" | "type_spec" | "type_alias" => {
                     if let Some(scope) = block_scope(parents) {
-                        for (index, name) in field_children(node, "name").into_iter().enumerate() {
+                        let mut cursor = node.walk();
+                        for (index, name) in node
+                            .children_by_field_name("name", &mut cursor)
+                            .filter(|name| name.is_named() && !name.is_extra())
+                            .enumerate()
+                        {
+                            if index & 255 == 0 {
+                                checkpoint(analysis.cancelled)?;
+                            }
                             let start = if matches!(kind, "type_spec" | "type_alias") {
                                 name.start_byte()
                             } else {
                                 node.end_byte()
                             };
                             let mut local = Local::new(name, node, start);
-                            (local.initializer, local.result_index) =
-                                initializer_at(node.child_by_field_name("value"), index);
-                            bind(analysis, scope, local, kind == "var_spec");
+                            if detailed {
+                                (local.initializer, local.result_index) =
+                                    initializer_at(node.child_by_field_name("value"), index);
+                            }
+                            bind(analysis, scope, local, kind == "var_spec", detailed);
                         }
                     }
                 }
@@ -139,14 +191,36 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                                 .child_by_field_name("body")
                                 .map_or(owner.end_byte(), |n| n.start_byte())
                         };
-                        for name in field_children(node, "name") {
-                            bind(analysis, owner, Local::new(name, node, start), false);
+                        let mut cursor = node.walk();
+                        for (i, name) in node
+                            .children_by_field_name("name", &mut cursor)
+                            .filter(|name| name.is_named() && !name.is_extra())
+                            .enumerate()
+                        {
+                            if i & 255 == 0 {
+                                checkpoint(analysis.cancelled)?;
+                            }
+                            bind(
+                                analysis,
+                                owner,
+                                Local::new(name, node, start),
+                                false,
+                                detailed,
+                            );
                         }
                     }
                 }
                 "method_declaration" => {
                     if let Some((_, arguments)) = receiver_type_parameters(node) {
-                        for arg in children(arguments) {
+                        let mut cursor = arguments.walk();
+                        for (i, arg) in arguments
+                            .named_children(&mut cursor)
+                            .filter(|arg| !arg.is_extra())
+                            .enumerate()
+                        {
+                            if i & 255 == 0 {
+                                checkpoint(analysis.cancelled)?;
+                            }
                             if let Some(name) =
                                 arg.named_child(0).filter(|n| n.kind() == "type_identifier")
                             {
@@ -155,6 +229,7 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                                     node,
                                     Local::new(name, arg, node.start_byte()),
                                     false,
+                                    detailed,
                                 );
                             }
                         }
@@ -168,7 +243,15 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                     ) {
                         let mut distinct = HashSet::new();
                         let mut new = false;
-                        for (index, name) in children(left).into_iter().enumerate() {
+                        let mut cursor = left.walk();
+                        for (index, name) in left
+                            .named_children(&mut cursor)
+                            .filter(|name| !name.is_extra())
+                            .enumerate()
+                        {
+                            if index & 255 == 0 {
+                                checkpoint(analysis.cancelled)?;
+                            }
                             let spelling = analysis.text(name);
                             analysis.locals.declarations.insert(name.id());
                             if spelling == "_" {
@@ -177,7 +260,7 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                             if !is_identifier(name) {
                                 return Ok(WalkControl::Children);
                             }
-                            if !distinct.insert(spelling) {
+                            if !distinct.insert(spelling) && detailed {
                                 redeclared(analysis, name);
                             } else if !analysis
                                 .locals
@@ -185,18 +268,22 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                                 .contains_key(&(scope.id(), spelling))
                             {
                                 let mut local = Local::new(name, node, node.end_byte());
-                                (local.initializer, local.result_index) = match kind {
-                                    "range_clause" => (Some(node), index),
-                                    "receive_statement" => {
-                                        (node.child_by_field_name("right"), index)
-                                    }
-                                    _ => initializer_at(node.child_by_field_name("right"), index),
-                                };
-                                bind(analysis, scope, local, true);
+                                if detailed {
+                                    (local.initializer, local.result_index) = match kind {
+                                        "range_clause" => (Some(node), index),
+                                        "receive_statement" => {
+                                            (node.child_by_field_name("right"), index)
+                                        }
+                                        _ => {
+                                            initializer_at(node.child_by_field_name("right"), index)
+                                        }
+                                    };
+                                }
+                                bind(analysis, scope, local, true, detailed);
                                 new = true;
                             }
                         }
-                        if !new {
+                        if !new && detailed {
                             let item = analysis.error(
                                 DiagnosticCode::ShortVarNoNewVars,
                                 operator,
@@ -213,7 +300,9 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                         && analysis.text(alias) != "_"
                     {
                         analysis.locals.declarations.insert(alias.id());
-                        analysis.locals.variables.push(alias);
+                        if detailed {
+                            analysis.locals.variables.push(alias);
+                        }
                     }
                 }
                 "type_case" | "default_case" => {
@@ -240,10 +329,10 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
                         if local.explicit_type.is_none() {
                             local.initializer = switch.child_by_field_name("value");
                         }
-                        bind(analysis, node, local, false);
+                        bind(analysis, node, local, false, detailed);
                     }
                 }
-                "field_declaration_list" | "interface_type" => {
+                "field_declaration_list" | "interface_type" if detailed => {
                     if member_declarations(analysis, node, kind, &mut member_names)? {
                         return Ok(WalkControl::Skip);
                     }
@@ -257,6 +346,77 @@ pub(super) fn collect<'s>(analysis: &mut Analysis<'s, '_, '_>) -> Result<()> {
             })
         },
     )
+}
+
+fn damaged_binding(root: Node<'_>, cancelled: Option<&AtomicBool>) -> Result<bool> {
+    let mut cursor = root.walk();
+    let mut visited = 0_u32;
+    loop {
+        if visited & 255 == 0 {
+            checkpoint(cancelled)?;
+        }
+        visited = visited.wrapping_add(1);
+        if matches!(cursor.node().kind(), ":=" | "var" | "const" | "type") {
+            return Ok(true);
+        }
+        if !cursor.goto_first_child() {
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn stage1_summaries(
+    snapshot: &EngineSnapshot<'_>,
+    document: &DocumentSnapshot<'_>,
+    view: &inputs::DiagnosticView<'_>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<Vec<Arc<EditorNames>>>> {
+    let Some(package) = view.package.filter(|package| !package.load_error) else {
+        return Ok(None);
+    };
+    let current = document.indexed();
+    if package_name(current) != Some(&package.name)
+        || !syntax::has_reliable_package_scope(document.root_node(), cancelled)?
+    {
+        return Ok(None);
+    }
+    let current_key = path_key(document.path());
+    let drafts = draft_files(view.graph, snapshot.docs(), snapshot.new_documents());
+    let mut summaries = vec![current.editor_names.clone()];
+    for path in package.files.iter().chain(
+        drafts
+            .get(&package.directory_and_name())
+            .into_iter()
+            .flatten()
+            .copied(),
+    ) {
+        checkpoint(cancelled)?;
+        let key = path_key(path);
+        if key == current_key {
+            continue;
+        }
+        let names = if let Some(sibling) = snapshot.docs().get(&key) {
+            if package_name(sibling) != Some(&package.name)
+                || !syntax::has_reliable_package_scope(sibling.tree.root_node(), cancelled)?
+            {
+                return Ok(None);
+            }
+            sibling.editor_names.clone()
+        } else {
+            let Some(names) =
+                snapshot.diagnostic_cached_package_names(view.graph, &key, &package.name)
+            else {
+                return Ok(None);
+            };
+            names
+        };
+        summaries.push(names);
+    }
+    Ok(Some(summaries))
 }
 
 pub(super) fn check_assignable(analysis: &mut Analysis<'_, '_, '_>, node: Node<'_>) -> Result<()> {
@@ -389,6 +549,7 @@ fn bind<'s>(
     scope: Node<'s>,
     local: Local<'s>,
     variable: bool,
+    detailed: bool,
 ) {
     let name = local.name;
     let spelling = analysis.text(name);
@@ -400,10 +561,10 @@ fn bind<'s>(
         analysis.locals.bindings.entry((scope.id(), spelling))
     {
         entry.insert(local);
-        if variable {
+        if variable && detailed {
             analysis.locals.variables.push(name);
         }
-    } else {
+    } else if detailed {
         redeclared(analysis, name);
     }
 }
@@ -432,7 +593,7 @@ fn member_declarations<'s>(
         .filter(|n| !n.is_extra())
         .enumerate()
     {
-        if i & 1023 == 0 {
+        if i & 255 == 0 {
             checkpoint(analysis.cancelled)?;
         }
         let ty = field.child_by_field_name("type");
@@ -494,7 +655,7 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
                 continue;
             };
             let source = source.as_ref();
-            if !syntax::has_reliable_declarations(source.tree.root_node()) {
+            if !syntax::has_reliable_declarations(source.tree.root_node(), analysis.cancelled)? {
                 analysis.locals.incomplete_package = true;
                 continue;
             }
@@ -511,7 +672,7 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
             continue;
         }
         for (i, symbol) in file_outline.symbols.iter().enumerate() {
-            if i & 1023 == 0 {
+            if i & 255 == 0 {
                 checkpoint(analysis.cancelled)?;
             }
             let owner = symbol.receiver.as_ref().map(|r| r.base.clone());
@@ -536,7 +697,7 @@ fn package_declarations(analysis: &mut Analysis<'_, '_, '_>) -> Result<()> {
         }
     }
     for (i, symbol) in outline.symbols.iter().enumerate() {
-        if i & 1023 == 0 {
+        if i & 255 == 0 {
             checkpoint(analysis.cancelled)?;
         }
         if symbol.name == "_" || (symbol.name == "init" && symbol.kind == OutlineKind::Function) {

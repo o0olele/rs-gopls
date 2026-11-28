@@ -33,11 +33,18 @@ $queries = $fixture.cases | ForEach-Object {
 }
 @($project) + @($queries) | Set-Content -LiteralPath (Join-Path $directory 'reference-queries.tsv') -Encoding utf8NoBOM
 $script = (Resolve-Path .\tools\capture_goland_references.groovy).Path
-Start-Process -FilePath $goland -ArgumentList @('ideScript', ('"{0}"' -f $script)) -WindowStyle Hidden -Wait
-Get-Content -LiteralPath (Join-Path $directory 'reference-locations.tsv') -Encoding utf8
+$started = [DateTime]::UtcNow
+$capture = Start-Process -FilePath $goland -ArgumentList @('ideScript', ('"{0}"' -f $script)) -WindowStyle Hidden -Wait -PassThru
+$locations = Get-Item -LiteralPath (Join-Path $directory 'reference-locations.tsv') -ErrorAction Stop
+if ($capture.ExitCode -ne 0 -or $locations.LastWriteTimeUtc -lt $started) {
+    throw 'GoLand reference capture did not produce a fresh result'
+}
+Get-Content -LiteralPath $locations.FullName -Encoding utf8
 ~~~
 
 输出首行为 GoLand 构建号。每个结果由类别、查询 ID、文件、起始行列、结束行列和源码记号组成。
+
+现场复查耗时时，将写入查询 TSV 的数组表达式改为 `` @($project, "# iterations`t30") + @($queries) ``。脚本在 Smart Mode 取得一份初始结果，然后按 `includeDeclaration` 两档各执行 30 次。每次核对完整的去重 UTF-16 集合与初始结果，采样输出为 `reference-timings.tsv`，包含查询 ID、声明选项、序号、毫秒耗时及源码、IDE 额外用法计数。用同轮产出的 `reference-locations.tsv` 核对同一构建和修订的历史集合，有集合差异的样本单列。计时从创建专用 Find Usages 搜索器开始，到去重结果枚举和坐标转换完成为止，包含相应的声明归并。这组数据对应索引就绪后的重复查询。启动和编辑到可见结果需另行计时。
 
 ## 检查源码引用
 

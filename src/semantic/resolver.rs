@@ -10,7 +10,6 @@ use super::index::IndexReader;
 use super::navigation_trace::record;
 use super::source::{
     Import, ReferenceQuery, Source, is_declaration_name, is_type_declaration, node_text,
-    read_navigation_source,
 };
 use crate::scope::{
     declaration_binding, lexical_binding, receiver_type_parameters, reference_binding,
@@ -541,7 +540,7 @@ impl<'w> Resolver<'w, '_> {
         if let Some((import, _)) = source.imported_package(self.workspace, from, identifier) {
             return Ok(Some((source.path.clone(), import.binding)));
         }
-        if let Some(location) = self.indexes.find(from, |index| {
+        if let Some(location) = self.indexes.find(from, identifier, |index| {
             index
                 .symbols
                 .declaration(identifier)
@@ -1258,6 +1257,22 @@ impl<'w> Resolver<'w, '_> {
         name: &str,
         receiver: Option<&str>,
     ) -> Result<Option<ResolvedSymbol<'w>>> {
+        if self.indexes.reference_dependencies.is_some() {
+            let match_ = self.indexes.find_reference_index(package, name, |index| {
+                match receiver {
+                    Some(ty) => index.symbols.member(ty, name),
+                    None => index.symbols.declaration(name),
+                }
+                .cloned()
+            })?;
+            return Ok(match_.map(|(file, symbol)| ResolvedSymbol {
+                package,
+                file,
+                symbol,
+                receiver: None,
+                method_receiver: None,
+            }));
+        }
         for file in self.indexes.files(package).iter() {
             let index =
                 if receiver.is_none() && self.indexes.completion.is_some() && !package.load_error {
@@ -2304,27 +2319,17 @@ impl<'w> Resolver<'w, '_> {
                 result_index,
             } => {
                 let documents = self.indexes.documents;
-                let disk_source;
                 let cached;
                 let source = if source.path == resolved.file {
                     source
                 } else if let Some(document) = documents.get(&path_key(&resolved.file)) {
                     document
-                } else if self.indexes.completion.is_some() {
+                } else {
                     cached = self
                         .indexes
                         .declaration_source(&resolved.file)?
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
                     cached.as_ref()
-                } else {
-                    let probe = self.indexes.navigation;
-                    record(probe, |counts| {
-                        counts.scanned_files += 1;
-                        counts.ast_access(false);
-                    });
-                    disk_source =
-                        read_navigation_source(self.indexes.parser, &resolved.file, probe)?;
-                    &disk_source
                 };
                 let Some(expression) = source
                     .tree

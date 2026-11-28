@@ -194,6 +194,10 @@ fn waits_for_latest_test_graph_and_preserves_pending_queries_across_edits() {
     let State::Running(server) = &mut state else {
         unreachable!()
     };
+    let deadline = server.scheduler.workspace_deadline().unwrap();
+    server
+        .advance_watched_files(session.server(), deadline)
+        .unwrap();
     let update = WorkspaceResult::for_test(
         &server.engine,
         old_test_graph,

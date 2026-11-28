@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
@@ -10,13 +11,15 @@ use tree_sitter::{Node, Parser};
 use super::completion::{InferredMemo, prefilter::FileNames};
 use super::diagnostics::DiagnosticKeys;
 use super::index::{
-    CompletionRead, DiskIndex, IndexReader, IndexedSource, NavigationText, active_package,
+    CachedNavigationText, CompletionRead, DiskIndex, IndexReader, IndexedSource, active_package,
     draft_files,
 };
 use super::navigation_trace::{NavigationProbe, record};
+use super::open_overlay::PendingOpen;
 use super::query::QueryProgress;
 use super::resolver::{Resolver, TypeIdentity};
-use super::source::{Import, Source, is_test_source, node_text, read_navigation_source};
+use super::shared_disk::SharedDiskCache;
+use super::source::{EditorNames, Import, Source, is_test_source, node_text};
 use super::{Engine, EngineState, GraphChanges};
 use crate::go_environment::GoEnvironment;
 use crate::scope::{Binding, lexical_binding};
@@ -31,15 +34,16 @@ pub(crate) struct EngineSnapshot<'a> {
     workspace: Option<&'a Workspace>,
     graph_changes: &'a GraphChanges,
     documents: &'a HashMap<PathBuf, IndexedSource>,
+    pending_documents: &'a HashMap<PathBuf, PendingOpen>,
     new_documents: &'a HashSet<PathBuf>,
     disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
-    navigation_texts: &'a mut HashMap<PathBuf, NavigationText>,
+    shared_disk: &'a Arc<SharedDiskCache>,
+    navigation_texts: &'a mut HashMap<PathBuf, CachedNavigationText>,
     disk_names: &'a mut HashMap<PathBuf, FileNames>,
     inferred_weights: &'a mut HashMap<InferredMemo, i32>,
     parser: &'a mut Parser,
     load: WorkspaceLoad,
     completion_source_generation: u64,
-    diagnostic_graph_epoch: u64,
     diagnostic_file_changes: &'a HashMap<PathBuf, DiagnosticFileObservation>,
     diagnostic_keys: &'a RefCell<DiagnosticKeys>,
 }
@@ -70,8 +74,10 @@ impl EngineState {
             workspace: self.workspace.as_deref(),
             graph_changes: &self.graph_changes,
             documents: &self.documents,
+            pending_documents: &self.pending_documents,
             new_documents: &self.new_documents,
             disk_index: &mut self.disk_index,
+            shared_disk: &self.shared_disk,
             navigation_texts: &mut self.navigation_texts,
             disk_names: &mut self.completion_names,
             inferred_weights: &mut self.completion_weights,
@@ -81,7 +87,6 @@ impl EngineState {
                 include_tests,
             },
             completion_source_generation: self.completion_source_generation,
-            diagnostic_graph_epoch: self.completion_graph_generation,
             diagnostic_file_changes: &self.diagnostic_file_changes,
             diagnostic_keys: &self.diagnostic_keys,
         }
@@ -108,7 +113,11 @@ impl<'a> EngineSnapshot<'a> {
     where
         'a: 'd,
     {
-        if let Some(source) = self.docs().get(&path_key(path)) {
+        let key = path_key(path);
+        if let Some(pending) = self.pending_documents.get(&key) {
+            return Err(pending.ready.pending().into());
+        }
+        if let Some(source) = self.docs().get(&key) {
             record(probe, |counts| {
                 counts.scanned_files += 1;
                 counts.ast_access(true);
@@ -122,10 +131,10 @@ impl<'a> EngineSnapshot<'a> {
             counts.scanned_files += 1;
             counts.ast_access(false);
         });
-        let source = read_navigation_source(self.parser, path, probe)?;
+        let source = self.shared_disk.load(self.parser, path, None, probe)?;
         Ok(Some(DocumentSnapshot {
             path,
-            source: DocumentSource::Disk(IndexedSource::new(source, None)),
+            source: DocumentSource::Disk(source.into_indexed()),
         }))
     }
 
@@ -256,15 +265,18 @@ impl<'a> EngineSnapshot<'a> {
         self.completion_source_generation
     }
 
-    pub(super) fn diagnostic_inputs_epoch(&self) -> (u64, u64) {
-        (
-            self.diagnostic_graph_epoch,
-            self.completion_source_generation,
-        )
-    }
-
     pub(super) fn diagnostic_file_change(&self, path: &Path) -> Option<&DiagnosticFileObservation> {
         self.diagnostic_file_changes.get(path)
+    }
+
+    pub(super) fn diagnostic_cached_package_names(
+        &self,
+        graph: &Workspace,
+        key: &Path,
+        package: &str,
+    ) -> Option<Arc<EditorNames>> {
+        let stamp = graph.diagnostic_disk_stamp(key, self.diagnostic_file_change(key));
+        self.shared_disk.cached_package_names(key, stamp?, package)
     }
 
     pub(super) fn diagnostic_keys(&self) -> &RefCell<DiagnosticKeys> {
@@ -317,11 +329,13 @@ impl<'a> EngineSnapshot<'a> {
         let indexes = IndexReader {
             workspace,
             parser: self.parser,
+            shared_disk: self.shared_disk,
             documents: self.documents,
             disk_index: self.disk_index,
             navigation_texts: self.navigation_texts,
+            owned_reference: None,
             navigation: None,
-            deferred_reference: None,
+            reference_dependencies: None,
             implementation_parse_time: None,
             drafts: draft_files(workspace, self.documents, self.new_documents),
             disk_names: self.disk_names,

@@ -1,6 +1,5 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read};
@@ -8,7 +7,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -19,14 +18,20 @@ use super::completion::{
     InferredMemo, Trace,
     prefilter::{BYTE_LIMIT, FileNames, SOURCE_LIMIT, Stamp},
     render::package_name,
+    sdk_names::scan_function_bodies,
 };
-use super::navigation_trace::{NavigationProbe, record, sample};
-use super::source::{
-    Import, Source, SourceRevision, TextEditDelta, check_cancelled, node_text,
-    parse_navigation_source,
-};
+use super::navigation_trace::{NavigationProbe, record};
+use super::references::{DependencySource, ReferenceDependencies};
+use super::shared_disk::{FileReadTicket, SharedDiskCache};
+use super::source::{Import, Source, SourceRevision, TextEditDelta, check_cancelled, node_text};
 use crate::symbols::{self, FileSymbols, TypeDetails};
 use crate::workspace::{Package, Workspace, path_key};
+
+mod declaration_summary;
+mod reference_identifiers;
+
+use declaration_summary::DeclarationSummary;
+pub(super) use reference_identifiers::ReferenceIdentifiers;
 
 pub(super) struct FileIndex {
     pub(super) symbols: FileSymbols,
@@ -40,17 +45,13 @@ impl FileIndex {
         let root = source.tree.root_node();
         let mut cursor = root.walk();
         let mut signature = DefaultHasher::new();
+        hash_build_constraints(&source.text, &mut signature);
         for node in root.named_children(&mut cursor) {
             match node.kind() {
                 "package_clause" | "import_declaration" => {
                     node_text(node, &source.text).hash(&mut signature)
                 }
-                "comment" => {
-                    let comment = node_text(node, &source.text);
-                    if comment.starts_with("//go:build") || comment.starts_with("// +build") {
-                        comment.hash(&mut signature);
-                    }
-                }
+                "comment" => {}
                 _ => break,
             }
         }
@@ -87,17 +88,85 @@ impl FileIndex {
     }
 }
 
+fn hash_build_constraints(text: &str, signature: &mut DefaultHasher) {
+    // go/build accepts legacy constraints in the leading run of line comments
+    // only through its last blank line. Modern directives take precedence.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut legacy = Vec::new();
+    let mut legacy_end = 0;
+    let mut modern = Vec::new();
+    let mut leading_line_comments = true;
+    let mut block_comment = false;
+    'lines: for line in text.lines() {
+        let mut line = line.trim();
+        if leading_line_comments {
+            if line.is_empty() {
+                legacy_end = legacy.len();
+                continue;
+            }
+            if let Some(comment) = line.strip_prefix("//") {
+                if let Some(expression) = build_expression(comment.trim_start(), "+build") {
+                    legacy.push(expression);
+                }
+            } else {
+                leading_line_comments = false;
+            }
+        }
+        if !block_comment && let Some(expression) = build_expression(line, "//go:build") {
+            modern.push(expression);
+        }
+        while !line.is_empty() {
+            if block_comment {
+                let Some((_, rest)) = line.split_once("*/") else {
+                    continue 'lines;
+                };
+                line = rest.trim_start();
+                block_comment = false;
+            } else if line.starts_with("//") {
+                continue 'lines;
+            } else if let Some(rest) = line.strip_prefix("/*") {
+                line = rest.trim_start();
+                block_comment = true;
+            } else {
+                break 'lines;
+            }
+        }
+    }
+    modern.hash(signature);
+    if modern.is_empty() {
+        legacy[..legacy_end].hash(signature);
+    }
+}
+
+fn build_expression<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
+    let suffix = line.strip_prefix(directive)?;
+    let expression = suffix.trim_start();
+    (suffix.is_empty() || suffix.len() != expression.len()).then_some(expression)
+}
+
 pub(super) struct IndexedSource {
     source: Source,
     declarations: Arc<OnceLock<Arc<FileIndex>>>,
+    declaration_summary: Arc<OnceLock<Option<Arc<DeclarationSummary>>>>,
+    reference_identifiers: Arc<OnceLock<Arc<ReferenceIdentifiers>>>,
     pub(super) document_version: Option<i32>,
+    pub(super) open_generation: u64,
+    pub(super) content_revision: u64,
+    pub(super) declaration_revision: u64,
     declarations_only: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct IndexedSourceRevision {
     source: SourceRevision,
     declarations: Arc<OnceLock<Arc<FileIndex>>>,
+    declaration_summary: Arc<OnceLock<Option<Arc<DeclarationSummary>>>>,
+    reference_identifiers: Arc<OnceLock<Arc<ReferenceIdentifiers>>>,
     document_version: Option<i32>,
+    open_generation: u64,
+    content_revision: u64,
+    declaration_revision: u64,
+    pub(super) declarations_only: bool,
 }
 
 impl IndexedSourceRevision {
@@ -105,8 +174,13 @@ impl IndexedSourceRevision {
         IndexedSource {
             source: self.source.into_source(),
             declarations: self.declarations,
+            declaration_summary: self.declaration_summary,
+            reference_identifiers: self.reference_identifiers,
             document_version: self.document_version,
-            declarations_only: false,
+            open_generation: self.open_generation,
+            content_revision: self.content_revision,
+            declaration_revision: self.declaration_revision,
+            declarations_only: self.declarations_only,
         }
     }
 }
@@ -116,9 +190,39 @@ impl IndexedSource {
         Self {
             source,
             declarations: Arc::default(),
+            declaration_summary: Arc::default(),
+            reference_identifiers: Arc::default(),
             document_version,
+            open_generation: 0,
+            content_revision: 0,
+            declaration_revision: 0,
             declarations_only: false,
         }
+    }
+
+    pub(super) fn declaration_summary(&self) -> Option<&Arc<DeclarationSummary>> {
+        self.declaration_summary
+            .get_or_init(|| DeclarationSummary::collect(&self.source).map(Arc::new))
+            .as_ref()
+    }
+
+    pub(super) fn reference_identifiers(
+        &self,
+        cancelled: &AtomicBool,
+    ) -> Result<Arc<ReferenceIdentifiers>> {
+        check_cancelled(cancelled)?;
+        if let Some(identifiers) = self.reference_identifiers.get() {
+            return Ok(Arc::clone(identifiers));
+        }
+        let identifiers = if self.tree.root_node().has_error() {
+            ReferenceIdentifiers::default()
+        } else {
+            ReferenceIdentifiers::scan(&self.text, cancelled)?
+        };
+        let identifiers = self
+            .reference_identifiers
+            .get_or_init(|| Arc::new(identifiers));
+        Ok(Arc::clone(identifiers))
     }
 
     pub(super) fn declarations(&self) -> &FileIndex {
@@ -145,7 +249,13 @@ impl IndexedSource {
         IndexedSourceRevision {
             source: self.source.revision(),
             declarations: self.declarations.clone(),
+            declaration_summary: Arc::clone(&self.declaration_summary),
+            reference_identifiers: Arc::clone(&self.reference_identifiers),
             document_version: self.document_version,
+            open_generation: self.open_generation,
+            content_revision: self.content_revision,
+            declaration_revision: self.declaration_revision,
+            declarations_only: self.declarations_only,
         }
     }
 
@@ -159,6 +269,8 @@ impl IndexedSource {
         self.source.edit(parser, changes, observe)?;
         self.document_version = Some(version);
         self.declarations = Arc::default();
+        self.declaration_summary = Arc::default();
+        self.reference_identifiers = Arc::default();
         Ok(())
     }
 }
@@ -182,16 +294,37 @@ pub(super) struct DiskIndex {
     pub(super) declarations: Arc<FileIndex>,
     pub(super) fingerprint: u64,
     pub(super) stamp: Option<Stamp>,
-    reference_source: Option<Rc<IndexedSource>>,
+    reference_source: Option<CachedReferenceSource>,
+}
+
+struct CachedReferenceSource {
+    revision: Weak<IndexedSourceRevision>,
+    text: CachedNavigationText,
+    path: PathBuf,
 }
 
 impl DiskIndex {
+    pub(super) fn from_prepared(prepared: &PreparedReferenceSource) -> Self {
+        Self {
+            declarations: prepared
+                .revision
+                .declarations
+                .get()
+                .expect("prepared source must have declarations")
+                .clone(),
+            fingerprint: prepared.fingerprint,
+            stamp: prepared.text.stamp,
+            reference_source: None,
+        }
+    }
+
     pub(super) fn references_text(&self, text: *const String) -> bool {
         self.reference_source
             .as_ref()
-            .is_some_and(|source| Arc::as_ptr(&source.text) == text)
+            .is_some_and(|source| source.text.text.as_ptr() == text)
     }
 
+    #[cfg(test)]
     pub(super) fn new(source: &Source) -> Self {
         Self {
             declarations: Arc::new(FileIndex::new(source)),
@@ -210,48 +343,6 @@ impl DiskIndex {
             reference_source: None,
         }
     }
-
-    fn from_cancellable_source(source: &IndexedSource, cancelled: &AtomicBool) -> Result<Self> {
-        source.cancellable_declarations(cancelled)?;
-        Ok(Self::from_indexed(source, source.fingerprint()))
-    }
-
-    pub(super) fn reference_metadata(&self) -> (Arc<FileIndex>, u64) {
-        (self.declarations.clone(), self.fingerprint)
-    }
-
-    pub(super) fn from_reference_metadata(
-        (declarations, fingerprint): (Arc<FileIndex>, u64),
-    ) -> Self {
-        Self {
-            declarations,
-            fingerprint,
-            stamp: None,
-            reference_source: None,
-        }
-    }
-
-    pub(super) fn with_reference_revision(
-        source: Rc<IndexedSource>,
-        cancelled: &AtomicBool,
-    ) -> Result<Self> {
-        let mut index = Self::from_cancellable_source(&source, cancelled)?;
-        index.reference_source = Some(source);
-        Ok(index)
-    }
-}
-
-pub(super) fn read_stamped_text(path: &Path) -> Result<(String, Option<Stamp>)> {
-    let mut file = fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-    let metadata = file.metadata().ok();
-    let length = metadata
-        .as_ref()
-        .and_then(|metadata| usize::try_from(metadata.len()).ok())
-        .unwrap_or_default();
-    let mut text = String::with_capacity(length);
-    file.read_to_string(&mut text)
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok((text, metadata.map(Stamp::from)))
 }
 
 pub(super) fn text_fingerprint(text: &str) -> u64 {
@@ -264,6 +355,42 @@ pub(super) fn text_fingerprint(text: &str) -> u64 {
 pub(super) struct NavigationText {
     pub(super) text: Arc<String>,
     pub(super) stamp: Option<Stamp>,
+    pub(super) read_ticket: Option<FileReadTicket>,
+}
+
+pub(super) struct CachedNavigationText {
+    pub(super) text: Weak<String>,
+    pub(super) stamp: Option<Stamp>,
+    ticket: Option<FileReadTicket>,
+}
+
+impl CachedNavigationText {
+    pub(super) fn same_revision(&self, text: &NavigationText) -> bool {
+        self.ticket
+            .as_ref()
+            .zip(text.read_ticket.as_ref())
+            .is_some_and(|(previous, next)| previous.same_revision(next))
+    }
+
+    pub(super) fn matches_disk(&self, path: &Path) -> bool {
+        self.ticket
+            .as_ref()
+            .is_some_and(|ticket| ticket.matches_disk(path))
+    }
+
+    pub(super) fn upgrade(&self) -> Option<NavigationText> {
+        Some(NavigationText {
+            text: self.text.upgrade()?,
+            stamp: self.stamp,
+            read_ticket: self.ticket.clone(),
+        })
+    }
+
+    pub(super) fn matches(&self, disk_text: Option<&str>) -> bool {
+        self.text
+            .upgrade()
+            .is_some_and(|text| Some(text.as_str()) == disk_text)
+    }
 }
 
 impl NavigationText {
@@ -296,11 +423,16 @@ impl NavigationText {
         Ok(Self {
             text: Arc::new(text),
             stamp: metadata.map(Stamp::from),
+            read_ticket: None,
         })
     }
 
-    pub(super) fn matches(&self, disk_text: Option<&str>) -> bool {
-        Some(self.text.as_str()) == disk_text
+    pub(super) fn downgrade(&self) -> CachedNavigationText {
+        CachedNavigationText {
+            text: Arc::downgrade(&self.text),
+            stamp: self.stamp,
+            ticket: self.read_ticket.clone(),
+        }
     }
 }
 
@@ -413,11 +545,13 @@ pub(super) fn draft_package<'w>(workspace: &'w Workspace, source: &Source) -> Op
 pub(super) struct IndexReader<'a> {
     pub(super) workspace: &'a Workspace,
     pub(super) parser: &'a mut Parser,
+    pub(super) shared_disk: &'a Arc<SharedDiskCache>,
     pub(super) documents: &'a HashMap<PathBuf, IndexedSource>,
     pub(super) disk_index: &'a mut HashMap<PathBuf, DiskIndex>,
-    pub(super) navigation_texts: &'a mut HashMap<PathBuf, NavigationText>,
+    pub(super) navigation_texts: &'a mut HashMap<PathBuf, CachedNavigationText>,
+    pub(super) owned_reference: Option<(&'a Path, Rc<IndexedSource>)>,
     pub(super) navigation: Option<&'a NavigationProbe>,
-    pub(super) deferred_reference: Option<&'a DeferredReferenceRead>,
+    pub(super) reference_dependencies: Option<&'a ReferenceDependencies<'a>>,
     pub(super) implementation_parse_time: Option<Duration>,
     pub(super) drafts: DraftFiles<'a>,
     pub(super) disk_names: &'a mut HashMap<PathBuf, FileNames>,
@@ -427,52 +561,10 @@ pub(super) struct IndexReader<'a> {
     pub(super) diagnostic_types: Option<HashMap<String, TypeDetailsMemo>>,
 }
 
-pub(super) enum ReferenceReadRequest {
-    Disk { key: PathBuf, path: PathBuf },
-    OpenDeclarations { revision: IndexedSourceRevision },
-}
-
-#[derive(Default)]
-pub(super) struct DeferredReferenceRead {
-    pending: RefCell<Option<ReferenceReadRequest>>,
-    failed: HashMap<PathBuf, ReferenceReadFailure>,
-}
-
-struct ReferenceReadFailure {
-    kind: Option<io::ErrorKind>,
-    message: String,
-}
-
-impl DeferredReferenceRead {
-    pub(super) fn take_pending(&self) -> Option<ReferenceReadRequest> {
-        self.pending.take()
-    }
-
-    pub(super) fn fail(&mut self, key: PathBuf, error: &anyhow::Error) {
-        self.failed.insert(
-            key,
-            ReferenceReadFailure {
-                kind: error.downcast_ref::<io::Error>().map(io::Error::kind),
-                message: format!("{error:#}"),
-            },
-        );
-    }
-
-    fn request_disk(&self, key: PathBuf, path: &Path) -> anyhow::Error {
-        if let Some(failure) = self.failed.get(&key) {
-            return match failure.kind {
-                Some(kind) => io::Error::new(kind, failure.message.clone()).into(),
-                None => anyhow::anyhow!(failure.message.clone()),
-            };
-        }
-        self.pending
-            .borrow_mut()
-            .get_or_insert_with(|| ReferenceReadRequest::Disk {
-                key,
-                path: path.to_owned(),
-            });
-        anyhow::anyhow!("waiting for reference source")
-    }
+enum ReferenceInput {
+    Indexed,
+    Absent,
+    Cold(Option<NavigationText>),
 }
 
 type TypeDetailsMemo = HashMap<String, Option<(PathBuf, TypeDetails)>>;
@@ -578,29 +670,64 @@ pub(super) enum ReferenceSource<'a> {
     Disk(Rc<IndexedSource>),
 }
 
+#[derive(Clone)]
 pub(super) struct PreparedReferenceSource {
-    revision: IndexedSourceRevision,
+    pub(super) revision: Arc<IndexedSourceRevision>,
+    pub(super) text: NavigationText,
     fingerprint: u64,
+    path: PathBuf,
 }
 
 impl PreparedReferenceSource {
-    pub(super) fn parse(
+    pub(super) fn new(
+        revision: Arc<IndexedSourceRevision>,
+        path: &Path,
+        text: NavigationText,
+        fingerprint: u64,
+    ) -> Self {
+        Self {
+            revision,
+            text,
+            fingerprint,
+            path: path.to_owned(),
+        }
+    }
+
+    pub(super) fn into_indexed(self) -> IndexedSource {
+        Self::indexed_at(self.revision, self.path)
+    }
+
+    fn indexed_at(revision: Arc<IndexedSourceRevision>, path: PathBuf) -> IndexedSource {
+        let mut indexed = revision.as_ref().clone().into_indexed();
+        indexed.source.path = path;
+        indexed
+    }
+}
+
+impl IndexedSourceRevision {
+    pub(super) fn parse_disk(
         parser: &mut Parser,
         path: &Path,
         text: Arc<String>,
         cancelled: &AtomicBool,
-    ) -> Result<Self> {
-        let source = IndexedSource::new(
-            Source::parse_cancellable(parser, path, text, cancelled)?,
-            None,
-        );
+        allow_elided: bool,
+    ) -> Result<(Self, usize)> {
+        let bodies = allow_elided.then(|| scan_function_bodies(&text)).flatten();
+        let (source, declarations_only) = if let Some(bodies) = bodies {
+            Source::parse_dependency_declarations(parser, path, text, &bodies, cancelled)?
+        } else {
+            (
+                Source::parse_cancellable(parser, path, text, cancelled)?,
+                false,
+            )
+        };
+        let source = IndexedSource {
+            declarations_only,
+            ..IndexedSource::new(source, None)
+        };
         source.cancellable_declarations(cancelled)?;
-        let fingerprint = source.fingerprint();
-        check_cancelled(cancelled)?;
-        Ok(Self {
-            revision: source.revision(),
-            fingerprint,
-        })
+        let nodes = source.tree.root_node().descendant_count();
+        Ok((source.revision(), nodes))
     }
 }
 
@@ -614,75 +741,20 @@ impl AsRef<IndexedSource> for ReferenceSource<'_> {
 }
 
 impl<'a> IndexReader<'a> {
-    pub(super) fn navigation_text(&mut self, path: &Path, key: &Path) -> Result<(&str, bool)> {
-        match self.navigation_texts.entry(key.to_owned()) {
-            Entry::Occupied(entry) => Ok((&entry.into_mut().text, false)),
-            Entry::Vacant(entry) => {
-                let (text, stamp) = read_stamped_text(path)?;
-                Ok((
-                    &entry
-                        .insert(NavigationText {
-                            text: Arc::new(text),
-                            stamp,
-                        })
-                        .text,
-                    true,
-                ))
-            }
+    pub(super) fn navigation_text(
+        &mut self,
+        path: &Path,
+        key: &Path,
+    ) -> Result<(Arc<String>, bool)> {
+        if let Some(text) = self.cached_navigation_text(key) {
+            return Ok((text.text, false));
         }
-    }
-
-    fn navigation_source(&mut self, path: &Path, key: &Path) -> Result<Source> {
-        if let Some(cancelled) = self.cancelled {
-            if self.diagnostic_types.is_some() {
-                return Source::read_cancellable(self.parser, path, cancelled);
-            }
-            let probe = self.navigation;
-            let text = match self.navigation_texts.get(key) {
-                Some(cached) => {
-                    record(probe, |counts| counts.text_hits += 1);
-                    cached.text.clone()
-                }
-                None => {
-                    let _read = sample(probe, |counts| &mut counts.read);
-                    record(probe, |counts| {
-                        counts.text_misses += 1;
-                        counts.disk_reads += 1;
-                    });
-                    let observed = NavigationText::read_cancellable(path, cancelled)?;
-                    let text = observed.text.clone();
-                    self.navigation_texts.insert(key.to_owned(), observed);
-                    text
-                }
-            };
-            record(probe, |counts| counts.ast_parses += 1);
-            let _parse = sample(probe, |counts| &mut counts.parse);
-            return Source::parse_cancellable(self.parser, path, text, cancelled);
-        }
-        let probe = self.navigation;
-        match self.navigation_texts.get(key) {
-            Some(cached) => {
-                record(probe, |counts| counts.text_hits += 1);
-                parse_navigation_source(self.parser, path, cached.text.clone(), probe)
-            }
-            None => {
-                {
-                    let _read = sample(probe, |counts| &mut counts.read);
-                    record(probe, |counts| {
-                        counts.text_misses += 1;
-                        counts.disk_reads += 1;
-                    });
-                    self.navigation_text(path, key)
-                        .with_context(|| format!("reading {}", path.display()))?;
-                }
-                parse_navigation_source(
-                    self.parser,
-                    path,
-                    self.navigation_texts[key].text.clone(),
-                    probe,
-                )
-            }
-        }
+        let text = self
+            .shared_disk
+            .read(path, self.cancelled, self.navigation)?;
+        self.navigation_texts
+            .insert(key.to_owned(), text.downgrade());
+        Ok((text.text, true))
     }
 
     pub(super) fn reference_source(&mut self, path: &Path) -> Result<Option<ReferenceSource<'a>>> {
@@ -693,48 +765,45 @@ impl<'a> IndexReader<'a> {
         if let Some(source) = self.documents.get(key) {
             return Some(ReferenceSource::Open(source));
         }
-        self.disk_index
-            .get(key)?
-            .reference_source
-            .as_ref()
-            .map(|source| ReferenceSource::Disk(Rc::clone(source)))
+        if let Some((origin, source)) = &self.owned_reference
+            && *origin == key
+        {
+            return Some(ReferenceSource::Disk(Rc::clone(source)));
+        }
+        let cached = self.disk_index.get(key)?.reference_source.as_ref()?;
+        let source = cached.revision.upgrade()?;
+        if self.reference_dependencies.is_none()
+            && !cached.text.ticket.as_ref().is_some_and(|ticket| {
+                self.shared_disk
+                    .validates_ticket(key, ticket, cached.text.text.upgrade().as_ref())
+            })
+        {
+            return None;
+        }
+        Some(ReferenceSource::Disk(Rc::new(
+            PreparedReferenceSource::indexed_at(source, cached.path.clone()),
+        )))
     }
 
-    pub(super) fn cached_reference_text(&self, key: &Path) -> Option<Arc<String>> {
-        self.cached_reference_source(key)
-            .map(|source| source.as_ref().text.clone())
-            .or_else(|| self.navigation_texts.get(key).map(|text| text.text.clone()))
-    }
-
-    pub(super) fn reference_revision_without_declarations(
-        &self,
-        key: &Path,
-    ) -> Option<IndexedSourceRevision> {
-        let document = self.documents.get(key)?;
-        document
-            .declarations
-            .get()
-            .is_none()
-            .then(|| document.revision())
+    pub(super) fn cached_navigation_text(&self, key: &Path) -> Option<NavigationText> {
+        let text = self.navigation_texts.get(key)?.upgrade()?;
+        self.shared_disk.validates_read(key, &text).then_some(text)
     }
 
     pub(super) fn install_reference_source(
         &mut self,
         key: PathBuf,
         prepared: PreparedReferenceSource,
-    ) {
-        if self.cached_reference_source(&key).is_some() {
-            return;
+    ) -> bool {
+        if self.documents.contains_key(&key)
+            || !self.shared_disk.validates_read(&key, &prepared.text)
+        {
+            return false;
         }
-        let source = Rc::new(prepared.revision.into_indexed());
-        let entry = self
-            .disk_index
-            .entry(key)
-            .or_insert_with(|| DiskIndex::from_indexed(&source, prepared.fingerprint));
-        if entry.fingerprint != prepared.fingerprint {
-            *entry = DiskIndex::from_indexed(&source, prepared.fingerprint);
-        }
-        entry.reference_source = Some(source);
+        self.navigation_texts
+            .insert(key.clone(), prepared.text.downgrade());
+        self.store_reference_index(key, &prepared);
+        true
     }
 
     pub(super) fn declaration_source(
@@ -756,14 +825,6 @@ impl<'a> IndexReader<'a> {
             record(probe, |counts| counts.ast_access(true));
             return Ok(Some(source));
         }
-        if let Some(deferred) = self.deferred_reference {
-            let error = deferred.request_disk(key, path);
-            return if missing_source(&error) {
-                Ok(None)
-            } else {
-                Err(error)
-            };
-        }
         record(probe, |counts| counts.ast_access(false));
         if let Some(request) = &mut self.completion {
             if let Some(source) = request.get(&key, allow_elided) {
@@ -776,39 +837,90 @@ impl<'a> IndexReader<'a> {
             };
         }
         let started = self.implementation_parse_time.map(|_| Instant::now());
-        let source = match self.navigation_source(path, &key) {
-            Ok(source) => Rc::new(IndexedSource::new(source, None)),
+        let prepared = match self.load_navigation_source(path, &key) {
+            Ok(prepared) => prepared,
             Err(error) if missing_source(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let fingerprint = source.fingerprint();
-        let index = || {
-            if let Some(cancelled) = self.cancelled {
-                DiskIndex::from_cancellable_source(&source, cancelled)
-            } else {
-                Ok(DiskIndex::from_indexed(&source, fingerprint))
-            }
-        };
-        let entry = match self.disk_index.entry(key) {
-            Entry::Occupied(mut entry) => {
-                if entry.get().fingerprint != fingerprint {
-                    record(probe, |counts| counts.declaration_misses += 1);
-                    entry.insert(index()?);
-                } else {
-                    record(probe, |counts| counts.declaration_hits += 1);
-                }
-                entry.into_mut()
-            }
-            Entry::Vacant(entry) => {
-                record(probe, |counts| counts.declaration_misses += 1);
-                entry.insert(index()?)
-            }
-        };
-        entry.reference_source = Some(Rc::clone(&source));
+        let source = self.store_disk_source(key, prepared);
         if let Some(started) = started {
             *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
         }
         Ok(Some(ReferenceSource::Disk(source)))
+    }
+
+    fn load_navigation_source(
+        &mut self,
+        path: &Path,
+        key: &Path,
+    ) -> Result<PreparedReferenceSource> {
+        if let Some(dependencies) = self.reference_dependencies {
+            let prefetched = dependencies
+                .observations
+                .cached_text(self.shared_disk, path, key);
+            if let Some(source) = prefetched
+                .as_ref()
+                .and_then(|text| self.shared_disk.cached_parse(path, text, false))
+            {
+                record(self.navigation, |counts| counts.text_hits += 1);
+                return Ok(source);
+            }
+            let prepared = self.shared_disk.load_prefetched(
+                self.parser,
+                path,
+                prefetched,
+                self.cancelled,
+                self.navigation,
+            )?;
+            dependencies
+                .observations
+                .remember(key, Some(&prepared.text));
+            return Ok(prepared);
+        }
+        let prefetched = self
+            .navigation_texts
+            .get(key)
+            .and_then(CachedNavigationText::upgrade);
+        match (prefetched, self.cancelled) {
+            (Some(text), None) => {
+                // Exact implementation matching follows the bytes used by
+                // candidate discovery even if the file changes mid-search.
+                self.shared_disk
+                    .parse_snapshot(self.parser, path, text, self.navigation)
+            }
+            (prefetched, cancelled) => self.shared_disk.load_prefetched(
+                self.parser,
+                path,
+                prefetched,
+                cancelled,
+                self.navigation,
+            ),
+        }
+    }
+
+    fn store_disk_source(
+        &mut self,
+        key: PathBuf,
+        prepared: PreparedReferenceSource,
+    ) -> Rc<IndexedSource> {
+        self.store_reference_index(key, &prepared);
+        Rc::new(prepared.into_indexed())
+    }
+
+    fn store_reference_index(&mut self, key: PathBuf, prepared: &PreparedReferenceSource) {
+        let mut index = DiskIndex::from_prepared(prepared);
+        index.reference_source =
+            (!prepared.revision.declarations_only).then(|| CachedReferenceSource {
+                revision: Arc::downgrade(&prepared.revision),
+                text: prepared.text.downgrade(),
+                path: prepared.path.clone(),
+            });
+        let hit = self
+            .disk_index
+            .get(&key)
+            .is_some_and(|disk| disk.fingerprint == index.fingerprint);
+        record(self.navigation, |counts| counts.declaration_access(hit));
+        self.disk_index.insert(key, index);
     }
 
     pub(super) fn files<'p>(&self, package: &'p Package) -> Cow<'p, [PathBuf]> {
@@ -827,16 +939,11 @@ impl<'a> IndexReader<'a> {
 
     pub(super) fn file_index(&mut self, file: &Path) -> Result<&FileIndex> {
         let key = path_key(file);
-        if let Some(source) = self.documents.get(&key) {
-            if let Some(deferred) = self.deferred_reference
-                && let Some(revision) = self.reference_revision_without_declarations(&key)
-            {
-                deferred
-                    .pending
-                    .borrow_mut()
-                    .get_or_insert(ReferenceReadRequest::OpenDeclarations { revision });
-                anyhow::bail!("waiting for reference declarations");
-            }
+        self.file_index_at(file, &key)
+    }
+
+    fn file_index_at(&mut self, file: &Path, key: &Path) -> Result<&FileIndex> {
+        if let Some(source) = self.documents.get(key) {
             record(self.navigation, |counts| {
                 counts.declaration_access(source.declarations.get().is_some());
             });
@@ -846,21 +953,18 @@ impl<'a> IndexReader<'a> {
                 Ok(source.declarations())
             };
         }
-        let indexed = self.disk_index.contains_key(&key);
-        if !indexed && let Some(deferred) = self.deferred_reference {
-            return Err(deferred.request_disk(key, file));
-        }
+        let indexed = self.disk_index.contains_key(key);
         record(self.navigation, |counts| counts.declaration_access(indexed));
         if self.completion.is_some() {
             if !indexed {
-                self.completion_source(file, &key, true)?;
+                self.completion_source(file, key, true)?;
             }
-            return Ok(&self.disk_index[&key].declarations);
+            return Ok(&self.disk_index[key].declarations);
         }
         if !indexed {
-            self.index_navigation_file(file, &key, false)?;
+            self.index_navigation_file(file, key, false)?;
         }
-        Ok(&self.disk_index[&key].declarations)
+        Ok(&self.disk_index[key].declarations)
     }
 
     pub(super) fn trace(&self) -> Option<&Trace> {
@@ -1014,6 +1118,11 @@ impl<'a> IndexReader<'a> {
             }
             return Ok(cached.clone());
         }
+        if self.reference_dependencies.is_some() {
+            return self.find_reference_index(package, name, |index| {
+                index.symbols.type_details(name).cloned()
+            });
+        }
         let mut result = None;
         for file in self.files(package).iter() {
             let index = if self.completion.is_some() && !package.load_error {
@@ -1075,11 +1184,115 @@ impl<'a> IndexReader<'a> {
         Ok(self.known_index(&key))
     }
 
+    pub(super) fn find_reference_index<T>(
+        &mut self,
+        package: &Package,
+        spelling: &str,
+        lookup: impl Fn(&FileIndex) -> Option<T>,
+    ) -> Result<Option<(PathBuf, T)>> {
+        const DEPENDENCY_BATCH_SIZE: usize = 16;
+        let dependencies = self.reference_dependencies.expect("reference resolver");
+        let files = self.files(package);
+        let mut files = files.iter();
+        while let Some(file) = files.next() {
+            let key = path_key(file);
+            match self.reference_input(file, &key, spelling, dependencies)? {
+                ReferenceInput::Indexed => {
+                    if let Some(value) = lookup(self.file_index_at(file, &key)?) {
+                        return Ok(Some((file.clone(), value)));
+                    }
+                }
+                ReferenceInput::Absent => {}
+                ReferenceInput::Cold(text) => {
+                    let mut batch = vec![(file, key, ReferenceInput::Cold(text))];
+                    for file in files.by_ref().take(DEPENDENCY_BATCH_SIZE - 1) {
+                        let key = path_key(file);
+                        let input = self.reference_input(file, &key, spelling, dependencies);
+                        batch.push((file, key, input?));
+                    }
+                    let cold: Vec<_> = batch
+                        .iter()
+                        .filter_map(|(file, _, input)| match input {
+                            ReferenceInput::Cold(text) => Some(((*file).clone(), text.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut loaded = dependencies
+                        .load(cold, spelling, self.navigation)?
+                        .into_iter();
+                    // Resolve in package file order even when loads complete out of order.
+                    for (file, key, input) in batch {
+                        match input {
+                            ReferenceInput::Absent => continue,
+                            ReferenceInput::Indexed => {}
+                            ReferenceInput::Cold(_) => {
+                                match loaded.next().expect("cold reference dependency")? {
+                                    DependencySource::Ready(source) => {
+                                        dependencies
+                                            .observations
+                                            .remember(&key, Some(&source.text));
+                                        self.store_reference_index(key.clone(), &source);
+                                    }
+                                    DependencySource::Absent(text) => {
+                                        dependencies.observations.remember(&key, Some(&text));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(value) = lookup(self.file_index_at(file, &key)?) {
+                            return Ok(Some((file.clone(), value)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn reference_input(
+        &mut self,
+        file: &Path,
+        key: &Path,
+        spelling: &str,
+        dependencies: &ReferenceDependencies<'_>,
+    ) -> Result<ReferenceInput> {
+        if self.documents.contains_key(key) || self.disk_index.contains_key(key) {
+            return Ok(ReferenceInput::Indexed);
+        }
+        let Some(text) = dependencies
+            .observations
+            .cached_text(self.shared_disk, file, key)
+        else {
+            return Ok(ReferenceInput::Cold(None));
+        };
+        if let Some(source) = self.shared_disk.cached_parse(file, &text, true) {
+            record(self.navigation, |counts| counts.text_hits += 1);
+            self.store_reference_index(key.to_owned(), &source);
+            return Ok(ReferenceInput::Indexed);
+        }
+        if self
+            .shared_disk
+            .cached_reference_identifiers(&text)
+            .and_then(|names| names.offsets(spelling).map(<[_]>::is_empty))
+            == Some(true)
+            || !super::references::contains_spelling(&text.text, spelling, dependencies.cancelled)?
+        {
+            record(self.navigation, |counts| counts.text_hits += 1);
+            return Ok(ReferenceInput::Absent);
+        }
+        Ok(ReferenceInput::Cold(Some(text)))
+    }
+
     pub(super) fn find(
         &mut self,
         package: &Package,
+        spelling: &str,
         lookup: impl Fn(&FileIndex) -> Option<Range>,
     ) -> Result<Option<(PathBuf, Range)>> {
+        if self.reference_dependencies.is_some() {
+            return self.find_reference_index(package, spelling, lookup);
+        }
         for file in self.files(package).iter() {
             if let Some(range) = lookup(self.file_index(file)?) {
                 return Ok(Some((file.clone(), range)));
@@ -1101,7 +1314,7 @@ impl<'a> IndexReader<'a> {
             .filter(|import| import.alias.as_deref() == Some("."))
         {
             if let Some(package) = workspace.resolve_import(from, &import.path)
-                && let Some(location) = self.find(package, |index| {
+                && let Some(location) = self.find(package, name, |index| {
                     index.symbols.declaration(name).map(|symbol| symbol.range)
                 })?
             {
@@ -1129,51 +1342,17 @@ pub(super) fn missing_source(error: &anyhow::Error) -> bool {
 
 impl IndexReader<'_> {
     fn index_navigation_file(&mut self, file: &Path, key: &Path, needs_type: bool) -> Result<()> {
-        if let Some(cancelled) = self.cancelled {
-            record(self.navigation, |counts| counts.ast_access(false));
-            let source = self.navigation_source(file, key)?;
-            let source = Rc::new(IndexedSource::new(source, None));
-            let index = DiskIndex::with_reference_revision(source, cancelled)?;
-            self.disk_index.insert(key.to_owned(), index);
-            return Ok(());
-        }
         let started = self.implementation_parse_time.map(|_| Instant::now());
         let probe = self.navigation;
-        let from_probe = self.navigation_texts.contains_key(key);
         record(probe, |counts| counts.ast_access(false));
-        let (source, stamp) = if from_probe {
-            if needs_type && !self.navigation_texts[key].text.contains("type") {
+        if needs_type {
+            let (text, _) = self.navigation_text(file, key)?;
+            if !text.contains("type") {
                 return Ok(());
             }
-            (
-                self.navigation_source(file, key)?,
-                self.navigation_texts[key].stamp,
-            )
-        } else {
-            let (text, stamp) = {
-                let _read = sample(probe, |counts| &mut counts.read);
-                record(probe, |counts| {
-                    counts.text_misses += 1;
-                    counts.disk_reads += 1;
-                });
-                read_stamped_text(file)?
-            };
-            if needs_type && !text.contains("type") {
-                return Ok(());
-            }
-            (
-                parse_navigation_source(self.parser, file, text, probe)?,
-                stamp,
-            )
-        };
-        let mut index = DiskIndex::new(&source);
-        index.stamp = stamp;
-        if from_probe {
-            let indexed = IndexedSource::new(source, None);
-            let _ = indexed.declarations.set(Arc::clone(&index.declarations));
-            index.reference_source = Some(Rc::new(indexed));
         }
-        self.disk_index.insert(key.to_owned(), index);
+        let prepared = self.load_navigation_source(file, key)?;
+        self.store_reference_index(key.to_owned(), &prepared);
         if let Some(started) = started {
             *self.implementation_parse_time.as_mut().unwrap() += started.elapsed();
         }
@@ -1200,6 +1379,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identifier_postings_follow_the_open_document_revision() {
+        let cancelled = AtomicBool::new(false);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let source = Source::parse(
+            &mut parser,
+            "sample.go".into(),
+            "package sample\nvar Before int\n".into(),
+            None,
+        )
+        .unwrap();
+        let mut document = IndexedSource::new(source, Some(1));
+        let snapshot = document.revision().into_indexed();
+        let before = document.reference_identifiers(&cancelled).unwrap();
+        assert!(Arc::ptr_eq(
+            &before,
+            &snapshot.reference_identifiers(&cancelled).unwrap(),
+        ));
+        document
+            .edit(
+                &mut parser,
+                &[TextDocumentContentChangeEvent {
+                    text: "package sample\nvar After int\n".into(),
+                    range: None,
+                    range_length: None,
+                }],
+                2,
+                None,
+            )
+            .unwrap();
+        let after = document.reference_identifiers(&cancelled).unwrap();
+        assert_eq!(before.offsets("Before").unwrap().len(), 1);
+        assert!(after.offsets("Before").unwrap().is_empty());
+        assert_eq!(after.offsets("After").unwrap().len(), 1);
+    }
+
+    #[test]
     fn an_index_built_after_snapshot_capture_is_shared_only_for_its_revision() {
         let mut parser = Parser::new();
         parser
@@ -1214,6 +1432,10 @@ mod tests {
         .unwrap();
         let mut document = IndexedSource::new(source, Some(1));
         let snapshot = document.revision().into_indexed();
+        assert!(Arc::ptr_eq(
+            document.declaration_summary().unwrap(),
+            snapshot.declaration_summary().unwrap()
+        ));
         assert!(snapshot.declarations.get().is_none());
         assert!(std::ptr::eq(
             document.declarations(),
@@ -1234,6 +1456,10 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert_ne!(
+            document.declaration_summary(),
+            snapshot.declaration_summary()
+        );
         assert!(
             document
                 .declarations()

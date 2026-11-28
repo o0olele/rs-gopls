@@ -259,7 +259,7 @@ pub(crate) struct FileOutline {
 }
 
 pub(crate) fn collect_outline(tree: &Tree, text: &str) -> FileOutline {
-    collect_outline_with(tree, text, true, None, None)
+    collect_outline_with(tree, text, true, None, None, || {})
 }
 
 pub(crate) type MethodNames = HashMap<String, HashSet<String>>;
@@ -278,8 +278,8 @@ pub(crate) fn diagnostic_method_names(
         cancelled,
     };
     let mut methods = MethodNames::new();
-    for (i, node) in root.named_children(&mut cursor).enumerate() {
-        if i & 1023 == 0 && is_cancelled(cancelled) {
+    for node in root.named_children(&mut cursor) {
+        if is_cancelled(cancelled) {
             break;
         }
         if node.kind() == "method_declaration"
@@ -302,7 +302,7 @@ pub(crate) fn collect_diagnostic_outline(
     methods: &MethodNames,
     cancelled: Option<&AtomicBool>,
 ) -> anyhow::Result<FileOutline> {
-    let outline = collect_outline_with(tree, text, false, Some(methods), cancelled);
+    let outline = collect_outline_with(tree, text, false, Some(methods), cancelled, || {});
     anyhow::ensure!(!is_cancelled(cancelled), "diagnostics cancelled");
     Ok(outline)
 }
@@ -313,6 +313,7 @@ fn collect_outline_with(
     details: bool,
     methods: Option<&MethodNames>,
     cancelled: Option<&AtomicBool>,
+    mut before_declaration: impl FnMut(),
 ) -> FileOutline {
     let mut outline = FileOutline {
         package: None,
@@ -327,12 +328,42 @@ fn collect_outline_with(
         cancelled,
     };
     for node in root.named_children(&mut cursor) {
+        before_declaration();
         if is_cancelled(cancelled) {
             break;
         }
         collector.top_level(node, &mut outline);
     }
     outline
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_declaration_collection_honors_cancellation_before_the_next_declaration() {
+    use std::time::{Duration, Instant};
+
+    let declarations = (0..1024)
+        .map(|i| format!("var value{i} int\n"))
+        .collect::<String>();
+    let text = format!("package sample\n{declarations}");
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(&text, None).unwrap();
+    let cancelled = AtomicBool::new(false);
+    let mut steps = 0;
+    let mut signalled = None;
+    let outline = collect_outline_with(&tree, &text, false, None, Some(&cancelled), || {
+        steps += 1;
+        if steps == 5 {
+            signalled = Some(Instant::now());
+            cancelled.store(true, Relaxed);
+        }
+    });
+    assert_eq!(steps, 5);
+    assert_eq!(outline.symbols.len(), 3);
+    assert!(signalled.unwrap().elapsed() <= Duration::from_millis(50));
 }
 
 struct OutlineCollector<'a> {

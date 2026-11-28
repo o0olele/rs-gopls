@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -9,7 +10,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     go_environment::GoEnvironment,
-    workspace::{CommandTrace, path_key},
+    workspace::{CommandTrace, check_load_cancelled, command_output, path_key},
 };
 
 pub(crate) struct FolderGroup {
@@ -28,11 +29,16 @@ impl FolderGroup {
     }
 }
 
-pub(crate) fn folder_groups(folders: &[PathBuf], environment: &GoEnvironment) -> Vec<FolderGroup> {
+pub(crate) fn folder_groups(
+    folders: &[PathBuf],
+    environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<FolderGroup>> {
     let mut unique = Vec::new();
     let mut failures = Vec::new();
     let mut seen = HashSet::new();
     for folder in folders {
+        check_load_cancelled(cancelled)?;
         let absolute = std::path::absolute(folder)
             .with_context(|| format!("locating Go workspace folder {}", folder.display()));
         if !seen.insert(path_key(absolute.as_deref().unwrap_or(folder))) {
@@ -50,32 +56,39 @@ pub(crate) fn folder_groups(folders: &[PathBuf], environment: &GoEnvironment) ->
         groups.insert(path_key(folder), unique);
     } else {
         for folder in unique {
-            match folder_context(&folder, environment) {
+            let context = folder_context(&folder, environment, cancelled);
+            check_load_cancelled(cancelled)?;
+            match context {
                 Ok(context) => groups.entry(context).or_default().push(folder),
                 Err(error) => failures.push(FolderGroup::failed(folder, error)),
             }
         }
     }
-    groups
-        .into_values()
-        .map(|folders| {
-            let mut member_scopes = Vec::new();
-            let roots = list_roots_for_folders(&folders, &mut member_scopes, environment);
-            FolderGroup {
-                folders,
-                member_scopes,
-                roots,
-            }
-        })
-        .chain(failures)
-        .collect()
+    let mut discovered = Vec::with_capacity(groups.len() + failures.len());
+    for folders in groups.into_values() {
+        let mut member_scopes = Vec::new();
+        let roots = list_roots_for_folders(&folders, &mut member_scopes, environment, cancelled);
+        check_load_cancelled(cancelled)?;
+        discovered.push(FolderGroup {
+            folders,
+            member_scopes,
+            roots,
+        });
+    }
+    discovered.extend(failures);
+    Ok(discovered)
 }
 
-fn folder_context(folder: &Path, environment: &GoEnvironment) -> Result<PathBuf> {
+fn folder_context(
+    folder: &Path,
+    environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PathBuf> {
     let build: GoBuildEnvironment = go_json(
         folder,
         &["env", "-json", "GO111MODULE", "GOWORK", "GOMOD"],
         environment,
+        cancelled,
     )?;
     let work = Path::new(&build.work_file);
     let module = Path::new(&build.module_file);
@@ -95,14 +108,15 @@ fn list_roots_for_folders(
     folders: &[PathBuf],
     member_scopes: &mut Vec<PathBuf>,
     environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<PathBuf>> {
     if let [folder] = folders {
-        return list_roots(folder, member_scopes, environment);
+        return list_roots(folder, member_scopes, environment, cancelled);
     }
     let mut seen = HashSet::new();
     let mut roots = Vec::new();
     for folder in folders {
-        for root in list_roots(folder, member_scopes, environment)? {
+        for root in list_roots(folder, member_scopes, environment, cancelled)? {
             if seen.insert(path_key(&canonical_directory(&root)?)) {
                 roots.push(root);
             }
@@ -115,7 +129,9 @@ fn list_roots(
     root: &Path,
     member_scopes: &mut Vec<PathBuf>,
     environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<PathBuf>> {
+    check_load_cancelled(cancelled)?;
     ensure!(
         root.is_dir(),
         "Go workspace root is not a directory: {}",
@@ -143,6 +159,7 @@ fn list_roots(
         root,
         &["env", "-json", "GO111MODULE", "GOWORK"],
         environment,
+        cancelled,
     )?;
     if build.module_mode == "off" || build.work_file.is_empty() || build.work_file == "off" {
         return Ok(single_root());
@@ -158,11 +175,12 @@ fn list_roots(
         return Ok(single_root());
     }
 
-    let workspace: GoWorkspace = go_json(root, &["work", "edit", "-json"], environment)?;
+    let workspace: GoWorkspace = go_json(root, &["work", "edit", "-json"], environment, cancelled)?;
     let mut seen = HashSet::new();
     let mut roots = Vec::new();
     let mut failure = None;
     for member in workspace.members.unwrap_or_default() {
+        check_load_cancelled(cancelled)?;
         let directory = work_dir.join(member.disk_path);
         let key = match canonical_directory(&directory) {
             Ok(key) => key,
@@ -202,7 +220,11 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("locating Go workspace directory {}", path.display()))
 }
 
-pub(crate) fn use_module_auto(root: &Path, environment: &GoEnvironment) -> Result<bool> {
+pub(crate) fn use_module_auto(
+    root: &Path,
+    environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
+) -> Result<bool> {
     if !environment.allows_module_auto() {
         return Ok(false);
     }
@@ -210,6 +232,7 @@ pub(crate) fn use_module_auto(root: &Path, environment: &GoEnvironment) -> Resul
         root,
         &["env", "-json", "GO111MODULE", "GOWORK", "GOMOD", "GOPATH"],
         environment,
+        cancelled,
     )?;
     Ok(build.use_module_auto(root))
 }
@@ -218,6 +241,7 @@ fn go_json<T: DeserializeOwned>(
     root: &Path,
     args: &[&str],
     environment: &GoEnvironment,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<T> {
     let command = format!("go {}", args.join(" "));
     let starting_go = || format!("starting {command} in {}", root.display());
@@ -231,7 +255,8 @@ fn go_json<T: DeserializeOwned>(
     );
     let mut process = environment.command("go").with_context(starting_go)?;
     process.args(args).current_dir(root).stdin(Stdio::null());
-    let output = CommandTrace::output(&mut process, trace.as_mut()).with_context(starting_go)?;
+    let output =
+        command_output(&mut process, trace.as_mut(), cancelled).with_context(starting_go)?;
     ensure!(
         output.status.success(),
         "{command} failed in {} ({}): {}",
@@ -336,7 +361,9 @@ mod tests {
                 member.clone(),
             ],
             &GoEnvironment::capture(),
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(groups.len(), 3);
 
         let group = |folder: &Path| {
@@ -421,7 +448,7 @@ mod tests {
             ("GOWORK".into(), "off".into()),
         ]));
         assert!(environment.allows_module_auto());
-        assert!(!use_module_auto(&project.root, &environment).unwrap());
+        assert!(!use_module_auto(&project.root, &environment, None).unwrap());
     }
 
     #[cfg(windows)]

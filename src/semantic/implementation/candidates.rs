@@ -199,11 +199,11 @@ impl InterfaceSources {
                                             self.stats.read(text.len());
                                         }
                                         if disk.is_some_and(|fingerprint| {
-                                            fingerprint != text_fingerprint(text)
+                                            fingerprint != text_fingerprint(&text)
                                         }) {
                                             return None;
                                         }
-                                        interface_spellings(text)
+                                        interface_spellings(&text)
                                     },
                                 )
                             }

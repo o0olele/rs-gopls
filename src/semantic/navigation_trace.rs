@@ -37,20 +37,16 @@ impl Drop for NavigationStep {
 }
 
 impl NavigationTrace {
-    pub(crate) fn new(request: &Request, received: Instant) -> Option<Self> {
+    pub(crate) fn new(
+        request: &Request,
+        received: Instant,
+        document: Option<String>,
+    ) -> Option<Self> {
         let kind = match request.method.as_str() {
             "textDocument/definition" | "textDocument/typeDefinition" => NavigationKind::Definition,
             "textDocument/references" => NavigationKind::References,
             _ => return None,
         };
-        let document = request
-            .params
-            .pointer("/textDocument/uri")
-            .and_then(Value::as_str)
-            .and_then(|uri| url::Url::parse(uri).ok())
-            .and_then(|uri| uri.to_file_path().ok())
-            .as_deref()
-            .map(telemetry::path);
         let position = &request.params["position"];
         Some(Self {
             kind,
@@ -146,11 +142,16 @@ fn millis(duration: Duration) -> f64 {
 pub(super) struct NavigationProbe(RefCell<NavigationCounts>);
 
 impl NavigationProbe {
+    pub(super) fn parse_count(&self) -> usize {
+        self.0.borrow().ast_parses
+    }
+
     pub(super) fn into_counts(self) -> NavigationCounts {
         self.0.into_inner()
     }
 }
 
+#[derive(Clone)]
 pub(super) struct NavigationCounts {
     pub(super) definition_route: &'static str,
     pub(super) reference_target: &'static str,
@@ -247,7 +248,10 @@ impl NavigationCounts {
         self.ast_hits += work.ast_hits;
         self.ast_misses += work.ast_misses;
         self.ast_parses += work.ast_parses;
-        self.reference_dependency_parses += work.ast_parses;
+        self.reference_dependency_parses += work.reference_dependency_parses;
+        self.reference_candidate_parses += work.reference_candidate_parses;
+        self.reference_anchor_parses += work.reference_anchor_parses;
+        self.prefilter_reads += work.prefilter_reads;
         self.declaration_hits += work.declaration_hits;
         self.declaration_misses += work.declaration_misses;
         self.ident_offsets_checked += work.ident_offsets_checked;
